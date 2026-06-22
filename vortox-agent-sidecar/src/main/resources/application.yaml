@@ -1,0 +1,19 @@
+server:
+  port: 7860
+
+sidecar:
+  skills-path: /app/skills
+  default-model: claude-sonnet-4-6
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: always
+
+logging:
+  level:
+    com.vortox: INFO

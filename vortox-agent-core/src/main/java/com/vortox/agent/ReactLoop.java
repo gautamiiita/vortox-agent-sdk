@@ -14,6 +14,7 @@ import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.LinkedHashSet;
 
 /**
  * Stateless ReAct (Reasoning + Acting) loop over the Anthropic Messages API.
@@ -96,6 +97,12 @@ public final class ReactLoop {
     public AgentResult resume(String userMessage, String runId,
                                List<Map<String, Object>> priorMessages) {
         return run(userMessage, runId, null, priorMessages, null);
+    }
+
+    /** Run with expectedOutcome verification and optional prior conversation snapshot. */
+    public AgentResult run(String userMessage, String runId,
+                           String expectedOutcome, List<Map<String, Object>> priorMessages) {
+        return run(userMessage, runId, expectedOutcome, priorMessages, null);
     }
 
     /**
@@ -476,15 +483,30 @@ public final class ReactLoop {
     // ── Tool list assembly ────────────────────────────────────────────────────
 
     private List<Map<String, Object>> buildAllTools() {
+        Set<String> seen = new LinkedHashSet<>();
         List<Map<String, Object>> all = new ArrayList<>();
-        if (config.isEnableTaskComplete())   all.add(taskCompleteToolDef());
-        if (config.isEnableClarification())  all.add(clarificationToolDef());
-        if (config.isEnableApproval())        all.add(approvalToolDef());
-        if (config.isEnableHandoff())         all.add(handoffToolDef());
-        if (config.isEnableMemoryTools())     all.addAll(memoryToolDefs());
-        if (config.isEnableExecuteCommand())  all.add(executeCommandToolDef());
-        if (config.isEnableSpawnTask() && config.getTaskSpawner() != null) all.add(spawnTaskToolDef());
-        all.addAll(config.getTools());
+
+        // Caller-provided tools take precedence — add them first
+        for (Map<String, Object> t : config.getTools()) {
+            String name = (String) t.get("name");
+            if (name != null && seen.add(name)) all.add(t);
+        }
+
+        // SDK built-ins added only if the caller did not already supply a same-named definition
+        if (config.isEnableTaskComplete()  && seen.add(TASK_COMPLETE_TOOL))   all.add(taskCompleteToolDef());
+        if (config.isEnableClarification() && seen.add(CLARIFICATION_TOOL))   all.add(clarificationToolDef());
+        if (config.isEnableApproval()      && seen.add(APPROVAL_TOOL))        all.add(approvalToolDef());
+        if (config.isEnableHandoff()       && seen.add(HANDOFF_TOOL))         all.add(handoffToolDef());
+        if (config.isEnableMemoryTools()) {
+            for (Map<String, Object> m : memoryToolDefs()) {
+                String name = (String) m.get("name");
+                if (seen.add(name)) all.add(m);
+            }
+        }
+        if (config.isEnableExecuteCommand() && seen.add(EXECUTE_COMMAND_TOOL)) all.add(executeCommandToolDef());
+        if (config.isEnableSpawnTask() && config.getTaskSpawner() != null && seen.add(SPAWN_TASK_TOOL))
+            all.add(spawnTaskToolDef());
+
         return all;
     }
 

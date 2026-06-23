@@ -3,13 +3,20 @@ FROM maven:3.9-eclipse-temurin-17-alpine AS build
 
 WORKDIR /app
 
-# Install SDK core first
-COPY vortox-agent-core/ ./vortox-agent-core/
+# Copy POMs first so Maven can validate the multi-module reactor
 COPY pom.xml .
+COPY vortox-agent-core/pom.xml ./vortox-agent-core/pom.xml
+COPY vortox-agent-sidecar/pom.xml ./vortox-agent-sidecar/pom.xml
+
+# Install parent POM into local .m2 (non-recursive — no module sources needed)
+RUN mvn -N install -DskipTests
+
+# Install SDK core (source follows POM for better layer caching)
+COPY vortox-agent-core/src ./vortox-agent-core/src
 RUN mvn -pl vortox-agent-core install -DskipTests
 
 # Build the sidecar
-COPY vortox-agent-sidecar/ ./vortox-agent-sidecar/
+COPY vortox-agent-sidecar/src ./vortox-agent-sidecar/src
 RUN mvn -pl vortox-agent-sidecar package -DskipTests
 
 # Runtime stage — needs bash, python3, node for skill execution

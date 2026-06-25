@@ -89,4 +89,41 @@ public class SkillRegistry {
     public int count() {
         return skills.size();
     }
+
+    /**
+     * Save a skill from raw SKILL.md content. Creates or replaces {skillsPath}/{name}/SKILL.md
+     * and reloads the registry entry. Used by the upload endpoint.
+     */
+    public SkillDefinition save(String name, String content) throws IOException {
+        if (name == null || name.isBlank()) throw new IllegalArgumentException("name is required");
+        if (content == null || content.isBlank()) throw new IllegalArgumentException("content is required");
+
+        Path skillDir = Path.of(skillsPath, name);
+        Files.createDirectories(skillDir);
+        Files.writeString(skillDir.resolve("SKILL.md"), content);
+        loadSkill(skillDir);
+
+        SkillDefinition saved = skills.get(name);
+        if (saved == null) throw new IllegalArgumentException("SKILL.md parsed but name/implementation missing");
+        log.info("Saved skill: {}", name);
+        return saved;
+    }
+
+    /**
+     * Delete a skill by name. Removes its directory and evicts it from the registry.
+     * Returns false if the skill was not found.
+     */
+    public boolean delete(String name) throws IOException {
+        Path skillDir = Path.of(skillsPath, name);
+        if (!Files.exists(skillDir)) return false;
+
+        try (Stream<Path> walker = Files.walk(skillDir)) {
+            walker.sorted(Comparator.reverseOrder())
+                  .map(Path::toFile)
+                  .forEach(java.io.File::delete);
+        }
+        skills.remove(name);
+        log.info("Deleted skill: {}", name);
+        return true;
+    }
 }

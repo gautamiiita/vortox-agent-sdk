@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Vortox Agent Sidecar</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0f1117;
+      color: #e2e8f0;
+      min-height: 100vh;
+    }
+
+    header {
+      background: #1a1d27;
+      border-bottom: 1px solid #2d3148;
+      padding: 16px 32px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    header h1 { font-size: 18px; font-weight: 600; color: #fff; }
+    header .subtitle { font-size: 13px; color: #6b7280; }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 20px;
+      font-size: 12px;
+      font-weight: 500;
+      margin-left: auto;
+    }
+    .badge.up   { background: #052e16; color: #4ade80; border: 1px solid #166534; }
+    .badge.down { background: #2d0a0a; color: #f87171; border: 1px solid #7f1d1d; }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+
+    main { max-width: 960px; margin: 0 auto; padding: 32px 24px; }
+
+    section { margin-bottom: 40px; }
+    section h2 {
+      font-size: 14px;
+      font-weight: 600;
+      color: #94a3b8;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      margin-bottom: 16px;
+    }
+
+    /* Skills table */
+    table { width: 100%; border-collapse: collapse; }
+    th {
+      text-align: left;
+      font-size: 12px;
+      font-weight: 500;
+      color: #6b7280;
+      padding: 8px 12px;
+      border-bottom: 1px solid #2d3148;
+    }
+    td {
+      padding: 12px;
+      border-bottom: 1px solid #1e2130;
+      font-size: 14px;
+      vertical-align: top;
+    }
+    tr:last-child td { border-bottom: none; }
+    .skill-name { font-weight: 600; color: #e2e8f0; font-family: monospace; font-size: 13px; }
+    .skill-desc { color: #94a3b8; font-size: 13px; max-width: 440px; }
+    .lang-tag {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 600;
+      font-family: monospace;
+      background: #1e2130;
+      color: #7c6ff7;
+      border: 1px solid #2d3148;
+    }
+    .btn-delete {
+      background: none;
+      border: 1px solid #3d1515;
+      color: #f87171;
+      padding: 4px 10px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 12px;
+      transition: background .15s;
+    }
+    .btn-delete:hover { background: #2d0a0a; }
+    .empty-row td { color: #4b5563; font-style: italic; text-align: center; padding: 32px; }
+
+    /* Upload card */
+    .card {
+      background: #1a1d27;
+      border: 1px solid #2d3148;
+      border-radius: 10px;
+      padding: 24px;
+    }
+    label { display: block; font-size: 13px; color: #94a3b8; margin-bottom: 6px; }
+    input[type=text], textarea {
+      width: 100%;
+      background: #0f1117;
+      border: 1px solid #2d3148;
+      border-radius: 6px;
+      color: #e2e8f0;
+      padding: 10px 12px;
+      font-size: 13px;
+      font-family: monospace;
+      outline: none;
+      transition: border-color .15s;
+    }
+    input[type=text]:focus, textarea:focus { border-color: #7c6ff7; }
+    textarea { resize: vertical; min-height: 220px; line-height: 1.5; }
+    .field { margin-bottom: 16px; }
+    .row { display: flex; gap: 12px; align-items: flex-end; }
+    .btn {
+      padding: 9px 18px;
+      border-radius: 7px;
+      border: none;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 600;
+      transition: opacity .15s;
+      white-space: nowrap;
+    }
+    .btn:hover { opacity: .85; }
+    .btn:disabled { opacity: .4; cursor: not-allowed; }
+    .btn-primary { background: #7c6ff7; color: #fff; }
+    .btn-secondary { background: #2d3148; color: #e2e8f0; }
+    .hint { font-size: 12px; color: #6b7280; margin-top: 6px; }
+
+    /* Test panel */
+    .test-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    @media (max-width: 640px) { .test-grid { grid-template-columns: 1fr; } }
+    .result-box {
+      background: #0f1117;
+      border: 1px solid #2d3148;
+      border-radius: 6px;
+      padding: 14px;
+      font-family: monospace;
+      font-size: 12px;
+      line-height: 1.6;
+      min-height: 120px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: #94a3b8;
+      margin-top: 16px;
+    }
+    .result-box.success { border-color: #166534; color: #4ade80; }
+    .result-box.error   { border-color: #7f1d1d; color: #f87171; }
+
+    .toast {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      background: #1a1d27;
+      border: 1px solid #2d3148;
+      border-radius: 8px;
+      padding: 12px 18px;
+      font-size: 13px;
+      box-shadow: 0 8px 24px rgba(0,0,0,.4);
+      transform: translateY(60px);
+      opacity: 0;
+      transition: all .25s ease;
+      z-index: 100;
+    }
+    .toast.show { transform: translateY(0); opacity: 1; }
+    .toast.ok   { border-color: #166534; color: #4ade80; }
+    .toast.err  { border-color: #7f1d1d; color: #f87171; }
+  </style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>Vortox Agent Sidecar</h1>
+    <div class="subtitle">Skill management &amp; agent runner</div>
+  </div>
+  <span id="statusBadge" class="badge down"><span class="dot"></span> checking…</span>
+</header>
+
+<main>
+
+  <!-- Skills list -->
+  <section>
+    <h2>Loaded Skills (<span id="skillCount">0</span>)</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Language</th>
+          <th>Description</th>
+          <th style="width:80px"></th>
+        </tr>
+      </thead>
+      <tbody id="skillsBody">
+        <tr class="empty-row"><td colspan="4">Loading…</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- Upload -->
+  <section>
+    <h2>Upload Skill</h2>
+    <div class="card">
+      <div class="field">
+        <label>Skill name (snake_case)</label>
+        <input type="text" id="uploadName" placeholder="e.g. generate_csv" />
+        <div class="hint">Must match the <code>name</code> field inside the SKILL.md content.</div>
+      </div>
+      <div class="field">
+        <label>SKILL.md content</label>
+        <textarea id="uploadContent" placeholder="name: generate_csv&#10;description: Generates a CSV file from JSON data&#10;language: python&#10;timeout_seconds: 30&#10;input_schema:&#10;  type: object&#10;  properties:&#10;    data:&#10;      type: array&#10;  required: [data]&#10;implementation: |&#10;  import sys, json, csv, io&#10;  params = json.load(open(sys.argv[1]))&#10;  ..."></textarea>
+      </div>
+      <button class="btn btn-primary" onclick="uploadSkill()">Upload skill</button>
+    </div>
+  </section>
+
+  <!-- Test run -->
+  <section>
+    <h2>Test Run</h2>
+    <div class="card">
+      <div class="test-grid">
+        <div class="field">
+          <label>API key</label>
+          <input type="text" id="apiKey" placeholder="sk-ant-…" />
+        </div>
+        <div class="field">
+          <label>Model</label>
+          <input type="text" id="model" value="claude-sonnet-4-6" />
+        </div>
+      </div>
+      <div class="field">
+        <label>Task</label>
+        <textarea id="taskInput" style="min-height:80px" placeholder="Describe what the agent should do…"></textarea>
+      </div>
+      <div class="field">
+        <label>Skills to enable (comma-separated, blank = all)</label>
+        <input type="text" id="skillsFilter" placeholder="search_code, run_sql_query" />
+      </div>
+      <div class="row">
+        <button class="btn btn-primary" id="runBtn" onclick="runAgent()">Run agent</button>
+        <button class="btn btn-secondary" onclick="clearResult()">Clear</button>
+      </div>
+      <div id="resultBox" class="result-box" style="display:none"></div>
+    </div>
+  </section>
+
+</main>
+
+<div id="toast" class="toast"></div>
+
+<script>
+  // ── helpers ────────────────────────────────────────────────────────────────
+  function toast(msg, type = 'ok') {
+    const el = document.getElementById('toast');
+    el.textContent = msg;
+    el.className = `toast show ${type}`;
+    setTimeout(() => el.classList.remove('show'), 3000);
+  }
+
+  async function api(method, path, body) {
+    const opts = { method, headers: { 'Content-Type': 'application/json' } };
+    if (body !== undefined) opts.body = JSON.stringify(body);
+    const r = await fetch(path, opts);
+    return { ok: r.ok, status: r.status, data: await r.json().catch(() => ({})) };
+  }
+
+  // ── health ─────────────────────────────────────────────────────────────────
+  async function checkHealth() {
+    try {
+      const r = await fetch('/actuator/health');
+      const badge = document.getElementById('statusBadge');
+      if (r.ok) {
+        badge.className = 'badge up';
+        badge.innerHTML = '<span class="dot"></span> Healthy';
+      } else {
+        badge.className = 'badge down';
+        badge.innerHTML = '<span class="dot"></span> Unhealthy';
+      }
+    } catch { /* ignore */ }
+  }
+
+  // ── skills list ─────────────────────────────────────────────────────────────
+  async function loadSkills() {
+    const r = await api('GET', '/agent/skills');
+    const skills = Array.isArray(r.data) ? r.data : [];
+    document.getElementById('skillCount').textContent = skills.length;
+
+    const tbody = document.getElementById('skillsBody');
+    if (!skills.length) {
+      tbody.innerHTML = '<tr class="empty-row"><td colspan="4">No skills loaded</td></tr>';
+      return;
+    }
+    tbody.innerHTML = skills.map(s => `
+      <tr>
+        <td><span class="skill-name">${esc(s.name)}</span></td>
+        <td><span class="lang-tag">${esc((s.language || '').toUpperCase())}</span></td>
+        <td><span class="skill-desc">${esc(s.description || '')}</span></td>
+        <td>
+          <button class="btn-delete" onclick="deleteSkill('${esc(s.name)}')">Delete</button>
+        </td>
+      </tr>`).join('');
+  }
+
+  function esc(s) {
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  // ── upload ─────────────────────────────────────────────────────────────────
+  async function uploadSkill() {
+    const name    = document.getElementById('uploadName').value.trim();
+    const content = document.getElementById('uploadContent').value.trim();
+    if (!name)    { toast('Enter a skill name', 'err'); return; }
+    if (!content) { toast('Paste SKILL.md content', 'err'); return; }
+
+    const r = await api('POST', '/agent/skills/upload', { name, content });
+    if (r.ok) {
+      toast(`Skill "${name}" uploaded`);
+      document.getElementById('uploadName').value    = '';
+      document.getElementById('uploadContent').value = '';
+      loadSkills();
+    } else {
+      toast(r.data.error || 'Upload failed', 'err');
+    }
+  }
+
+  // ── delete ─────────────────────────────────────────────────────────────────
+  async function deleteSkill(name) {
+    if (!confirm(`Delete skill "${name}"?`)) return;
+    const r = await api('DELETE', `/agent/skills/${encodeURIComponent(name)}`);
+    if (r.ok) { toast(`Skill "${name}" deleted`); loadSkills(); }
+    else toast(r.data.error || 'Delete failed', 'err');
+  }
+
+  // ── run agent ──────────────────────────────────────────────────────────────
+  async function runAgent() {
+    const apiKey = document.getElementById('apiKey').value.trim();
+    const task   = document.getElementById('taskInput').value.trim();
+    const model  = document.getElementById('model').value.trim() || 'claude-sonnet-4-6';
+    const filter = document.getElementById('skillsFilter').value.trim();
+    const skills = filter ? filter.split(',').map(s => s.trim()).filter(Boolean) : [];
+
+    if (!task) { toast('Enter a task', 'err'); return; }
+
+    const btn = document.getElementById('runBtn');
+    btn.disabled = true;
+    btn.textContent = 'Running…';
+
+    const box = document.getElementById('resultBox');
+    box.style.display = 'block';
+    box.className = 'result-box';
+    box.textContent = 'Waiting for agent response…';
+
+    const body = { task, skills, model, maxIterations: 20 };
+    if (apiKey) body.apiKey = apiKey;
+
+    try {
+      const r = await api('POST', '/agent/run', body);
+      const d = r.data;
+      const statusLabel = d.status || 'UNKNOWN';
+      const calls = (d.toolCalls || []).map(tc =>
+        `  [${tc.success ? '✓' : '✗'}] ${tc.toolName} (${tc.durationMs}ms)`).join('\n');
+
+      box.className = 'result-box ' + (d.status === 'SUCCESS' ? 'success' : 'error');
+      box.textContent =
+        `Status: ${statusLabel}\n` +
+        (calls ? `\nTool calls:\n${calls}\n` : '') +
+        `\nTokens: ${d.inputTokens} in / ${d.outputTokens} out\n\n` +
+        `─── Result ───\n${d.result || '(no result)'}`;
+    } catch (e) {
+      box.className = 'result-box error';
+      box.textContent = `Request failed: ${e.message}`;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Run agent';
+    }
+  }
+
+  function clearResult() {
+    const box = document.getElementById('resultBox');
+    box.style.display = 'none';
+    box.textContent = '';
+  }
+
+  // ── init ───────────────────────────────────────────────────────────────────
+  checkHealth();
+  loadSkills();
+  setInterval(checkHealth, 30000);
+</script>
+</body>
+</html>

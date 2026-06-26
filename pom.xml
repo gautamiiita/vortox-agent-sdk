@@ -15,6 +15,7 @@
     <modules>
         <module>vortox-agent-core</module>
         <module>vortox-agent-sidecar</module>
+        <module>vortox-agent-spring-boot-starter</module>
     </modules>
 
     <properties>

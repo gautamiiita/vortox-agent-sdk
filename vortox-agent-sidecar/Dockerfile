@@ -7,6 +7,7 @@ WORKDIR /app
 COPY pom.xml .
 COPY vortox-agent-core/pom.xml ./vortox-agent-core/pom.xml
 COPY vortox-agent-sidecar/pom.xml ./vortox-agent-sidecar/pom.xml
+COPY vortox-agent-spring-boot-starter/pom.xml ./vortox-agent-spring-boot-starter/pom.xml
 
 # Install parent POM into local .m2 (non-recursive — no module sources needed)
 RUN mvn -N install -DskipTests
@@ -34,6 +35,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     npm \
     curl \
     jq \
+    && pip3 install --no-cache-dir pymysql \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the sidecar JAR

@@ -86,7 +86,7 @@ public class AgentController {
         return ResponseEntity.ok(list);
     }
 
-    @PostMapping("/skills/reload")
+    @RequestMapping(value = "/skills/reload", method = {RequestMethod.GET, RequestMethod.POST})
     public ResponseEntity<Map<String, Object>> reloadSkills() {
         skillRegistry.load();
         return ResponseEntity.ok(Map.of("loaded", skillRegistry.count()));

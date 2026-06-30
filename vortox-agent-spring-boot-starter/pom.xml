@@ -32,6 +32,14 @@
     </dependencyManagement>
 
     <dependencies>
+        <!-- SDK core — ReAct loop, gateway, and SPI interfaces -->
+        <dependency>
+            <groupId>com.vortox</groupId>
+            <artifactId>vortox-agent-core</artifactId>
+            <version>1.0.0</version>
+            <optional>true</optional>
+        </dependency>
+
         <!-- Spring Boot autoconfigure — provided by the consuming app; optional here -->
         <dependency>
             <groupId>org.springframework.boot</groupId>

@@ -2,11 +2,14 @@
   'use strict';
 
   var cfg = window.VortoxAgent || {};
-  var ENDPOINT   = cfg.endpoint   || '/agent/chat';
-  var TITLE      = cfg.title      || 'PKP Assistant';
-  var SUGGESTIONS = cfg.suggestions || [];
-  var getContext = typeof cfg.context === 'function' ? cfg.context : function () { return {}; };
+  var ENDPOINT             = cfg.endpoint            || '/agent/chat';
+  var TITLE                = cfg.title               || 'AI Assistant';
+  var SUGGESTIONS          = cfg.suggestions          || [];
+  var ALLOW_PAGE_SCRIPTS   = cfg.allowPageScripts     === true;
+  var PAGE_API_DESCRIPTION = cfg.pageApiDescription   || '';
+  var getContext           = typeof cfg.context === 'function' ? cfg.context : function () { return {}; };
 
+  var _pageCtx   = {};
   var history    = [];
   var isOpen     = false;
   var isThinking = false;
@@ -109,7 +112,14 @@
     'cursor:pointer;padding:8px 16px;font-family:monospace;font-size:12px;font-weight:600;',
     'transition:background .15s;white-space:nowrap;}',
     '#vx-send:hover:not(:disabled){background:#2351a0;}',
-    '#vx-send:disabled{opacity:.4;cursor:default;}'
+    '#vx-send:disabled{opacity:.4;cursor:default;}',
+
+    /* Page-script execution feedback */
+    '.vx-executed-badge{display:inline-block;margin-top:6px;padding:2px 8px;background:#061a06;',
+    'border:1px solid #1a6b1a;border-radius:4px;color:#4ade80;font-family:monospace;font-size:10px;}',
+    '.vx-script-error{display:block;margin-top:6px;padding:4px 8px;background:#1a0606;',
+    'border:1px solid #6b1a1a;border-radius:4px;color:#f87171;font-family:monospace;font-size:10px;',
+    'white-space:pre-wrap;word-break:break-all;}'
   ].join('');
   document.head.appendChild(style);
 
@@ -239,6 +249,78 @@
     return out;
   }
 
+  // ── DOM introspection ─────────────────────────────────────────────────────────
+  // Automatically collects IDs, labelled form fields, and headings from the live
+  // page so the LLM knows what it can manipulate — no manual pageApiDescription
+  // needed from the host application.
+
+  function collectPageDom() {
+    var parts = [];
+
+    // Headings give the LLM a structural map of the page
+    var headings = [];
+    document.querySelectorAll('h1,h2,h3').forEach(function (el) {
+      var text = el.textContent.trim().replace(/\s+/g, ' ');
+      if (text) headings.push(el.tagName.toLowerCase() + ': ' + text);
+    });
+    if (headings.length) parts.push('### Page headings\n' + headings.join('\n'));
+
+    // All elements that have an id (excluding the widget itself)
+    var elements = [];
+    document.querySelectorAll('[id]').forEach(function (el) {
+      if (/^vx-/.test(el.id)) return;
+      var tag  = el.tagName.toLowerCase();
+      var type = el.getAttribute('type') ? ' type="' + el.getAttribute('type') + '"' : '';
+      // Short visible text hint (first 60 chars, collapsed whitespace)
+      var text = (el.getAttribute('placeholder') || el.textContent || '').trim()
+                   .replace(/\s+/g, ' ').substring(0, 60);
+      elements.push('#' + el.id + ' <' + tag + type + '>' + (text ? ' "' + text + '"' : ''));
+    });
+    if (elements.length) parts.push('### Elements with IDs\n' + elements.join('\n'));
+
+    // Labelled form inputs — especially useful for knowing editable field names
+    var fields = [];
+    document.querySelectorAll('input,select,textarea').forEach(function (el) {
+      if (!el.id || /^vx-/.test(el.id)) return;
+      var label = document.querySelector('label[for="' + el.id + '"]');
+      var labelText = label ? label.textContent.trim().replace(/\s+/g, ' ') : '';
+      var val = (el.type === 'password') ? '***' : String(el.value).substring(0, 40);
+      var checked = (el.type === 'checkbox' || el.type === 'radio') ? ' checked=' + el.checked : '';
+      fields.push('#' + el.id + ' (' + (el.type || el.tagName.toLowerCase()) + ')' +
+                  (labelText ? ' label:"' + labelText + '"' : '') +
+                  ' value:"' + val + '"' + checked);
+    });
+    if (fields.length) parts.push('### Form fields\n' + fields.join('\n'));
+
+    return parts.join('\n\n');
+  }
+
+  // ── Page-script execution ─────────────────────────────────────────────────────
+  // Scans raw LLM reply text for ```javascript blocks and executes the first one.
+  // On success appends a green badge; on error appends a red error message.
+  // Uses new Function(code)() so the script has access to window/document but NOT
+  // the widget's closure variables — intentional isolation.
+
+  function extractAndRunScripts(raw, containerEl) {
+    var re = /```javascript\s*([\s\S]*?)```/g;
+    var match = re.exec(raw);
+    if (!match) return;
+    var code = match[1].trim();
+    if (!code) return;
+    var badge;
+    try {
+      new Function(code)(); // eslint-disable-line no-new-func
+      badge = document.createElement('span');
+      badge.className = 'vx-executed-badge';
+      badge.textContent = '✓ Page updated';
+    } catch (err) {
+      badge = document.createElement('span');
+      badge.className = 'vx-script-error';
+      badge.textContent = '✗ Script error: ' + err.message;
+    }
+    containerEl.appendChild(badge);
+  }
+
   // ── DOM ───────────────────────────────────────────────────────────────────────
 
   var fab = document.createElement('button');
@@ -258,12 +340,12 @@
         '<div id="vx-header-dot"></div>' +
         '<span id="vx-header-title">' + esc(TITLE) + '</span>' +
       '</div>' +
-      '<button id="vx-close" aria-label="Close">×</button>' +
+      '<button id="vx-close" aria-label="Close">\xd7</button>' +
     '</div>' +
     '<div id="vx-messages" role="log" aria-live="polite"></div>' +
     '<div id="vx-suggestions"></div>' +
     '<div id="vx-form">' +
-      '<input id="vx-input" type="text" placeholder="Ask anything about PeakProtect…" autocomplete="off"/>' +
+      '<input id="vx-input" type="text" placeholder="Ask anything…" autocomplete="off"/>' +
       '<button id="vx-send">Send</button>' +
     '</div>';
 
@@ -288,8 +370,6 @@
       suggestionsEl.appendChild(chip);
     });
   }
-
-  renderSuggestions();
 
   // ── Messages ──────────────────────────────────────────────────────────────────
 
@@ -338,8 +418,18 @@
     var payload = {
       message: text,
       history: history.slice(0, -1),
-      context: getContext()
+      context: Object.assign({}, getContext(), _pageCtx)
     };
+
+    if (ALLOW_PAGE_SCRIPTS) {
+      payload.allowPageScripts = true;
+      // Auto-introspect the live DOM so the LLM knows what it can manipulate.
+      // PAGE_API_DESCRIPTION (set by host app) is appended as an optional supplement.
+      var domSnapshot = collectPageDom();
+      payload.pageApiDescription = PAGE_API_DESCRIPTION
+        ? domSnapshot + '\n\n### Host-provided notes\n' + PAGE_API_DESCRIPTION
+        : domSnapshot;
+    }
 
     var xhr = new XMLHttpRequest();
     xhr.open('POST', ENDPOINT, true);
@@ -354,8 +444,9 @@
       try {
         var data = JSON.parse(xhr.responseText);
         var reply = data.reply || 'No response from agent.';
-        appendMessage('agent', reply);
+        var msgEl = appendMessage('agent', reply);
         history.push({ role: 'assistant', content: reply });
+        if (ALLOW_PAGE_SCRIPTS) extractAndRunScripts(reply, msgEl);
       } catch (e) {
         appendMessage('agent', 'Unexpected response from agent.');
       }
@@ -383,7 +474,10 @@
   fab.addEventListener('click', function () {
     isOpen = !isOpen;
     panel.classList.toggle('vx-open', isOpen);
-    if (isOpen) setTimeout(function () { inputEl.focus(); }, 200);
+    if (isOpen) {
+      renderSuggestions();
+      setTimeout(function () { inputEl.focus(); }, 200);
+    }
   });
 
   document.getElementById('vx-close').addEventListener('click', function () {
@@ -406,5 +500,11 @@
       panel.classList.remove('vx-open');
     }
   });
+
+  // ── Public API ────────────────────────────────────────────────────────────────
+  // VortoxAgent.setContext('key', value) — inject page-specific context into every request
+  // VortoxAgent.setSuggestions([...])   — replace the suggestion chips
+  cfg.setContext    = function (key, value) { _pageCtx[key] = value; };
+  cfg.setSuggestions = function (suggestions) { SUGGESTIONS = suggestions; };
 
 })();

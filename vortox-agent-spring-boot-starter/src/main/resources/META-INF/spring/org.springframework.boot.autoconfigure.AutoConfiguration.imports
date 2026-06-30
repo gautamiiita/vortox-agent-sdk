@@ -1,1 +1,2 @@
 com.vortox.agent.starter.AgentSidecarAutoConfiguration
+com.vortox.agent.starter.VortoxGatewayConfig

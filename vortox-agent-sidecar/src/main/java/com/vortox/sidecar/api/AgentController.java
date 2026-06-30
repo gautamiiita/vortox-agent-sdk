@@ -11,6 +11,7 @@ import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 @RestController
 @RequestMapping("/agent")
@@ -70,6 +71,88 @@ public class AgentController {
             return ResponseEntity.badRequest().build();
         }
         return ResponseEntity.ok(agentService.run(request));
+    }
+
+    /**
+     * Widget-facing chat endpoint. Accepts the format sent by vortox-agent-widget.js:
+     * {message, history, context, allowPageScripts, pageApiDescription, systemPrompt, model}
+     * Returns: {reply: "..."}
+     *
+     * When allowPageScripts=true the system prompt instructs the LLM that it may include
+     * a ```javascript block which the widget will execute in the host page context.
+     */
+    @PostMapping("/chat")
+    public ResponseEntity<Map<String, Object>> chat(@RequestBody AgentChatRequest request) {
+        if (request.message() == null || request.message().isBlank()) {
+            return ResponseEntity.badRequest().body(Map.of("error", "message is required"));
+        }
+
+        // ── System prompt ────────────────────────────────────────────────────
+        StringBuilder systemPrompt = new StringBuilder();
+        if (request.systemPrompt() != null && !request.systemPrompt().isBlank()) {
+            systemPrompt.append(request.systemPrompt());
+        } else {
+            systemPrompt.append("You are a helpful AI assistant embedded in a web application. ")
+                        .append("Answer questions concisely and accurately. ")
+                        .append("Use available skills when you need live data from the application.");
+        }
+
+        if (Boolean.TRUE.equals(request.allowPageScripts())) {
+            systemPrompt.append("\n\n## Page Script Capability\n")
+                        .append("You can update the user's page directly by including a ```javascript code block in your response.\n")
+                        .append("The widget automatically executes it in the browser. Follow these rules:\n")
+                        .append("- Include at most ONE ```javascript block per response.\n")
+                        .append("- Prefer safe, reversible operations — add/remove CSS classes rather than direct style edits.\n")
+                        .append("- Never use alert(), confirm(), or prompt() — they block the browser.\n")
+                        .append("- Always explain what you are doing in plain text before the code block.\n")
+                        .append("- If the right DOM selectors are unclear, ask the user instead of guessing.");
+
+            if (request.pageApiDescription() != null && !request.pageApiDescription().isBlank()) {
+                systemPrompt.append("\n\n## Host Page Structure\n").append(request.pageApiDescription());
+            }
+        }
+
+        // ── Task: context + history + message ────────────────────────────────
+        StringBuilder task = new StringBuilder();
+
+        if (request.context() != null && !request.context().isEmpty()) {
+            task.append("## Current Page Context\n");
+            request.context().forEach((k, v) ->
+                    task.append("- ").append(k).append(": ").append(v).append("\n"));
+            task.append("\n");
+        }
+
+        if (request.history() != null && !request.history().isEmpty()) {
+            task.append("## Conversation History\n");
+            for (Map<String, Object> turn : request.history()) {
+                String role    = Objects.toString(turn.getOrDefault("role", "user"));
+                String content = Objects.toString(turn.getOrDefault("content", ""));
+                task.append("user".equals(role) ? "User: " : "Assistant: ")
+                    .append(content).append("\n");
+            }
+            task.append("\n");
+        }
+
+        task.append("## User Message\n").append(request.message());
+
+        AgentRunRequest runRequest = new AgentRunRequest(
+                task.toString(),
+                null,
+                systemPrompt.toString(),
+                request.model(),
+                30,
+                null
+        );
+
+        AgentRunResponse response = agentService.run(runRequest);
+        String reply = (response.result() != null && !response.result().isBlank())
+                       ? response.result()
+                       : "I couldn't generate a response. Please try again.";
+
+        log.info("Chat completed — status={} inputTokens={} outputTokens={}",
+                response.status(), response.inputTokens(), response.outputTokens());
+
+        return ResponseEntity.ok(Map.of("reply", reply));
     }
 
     @GetMapping("/skills")

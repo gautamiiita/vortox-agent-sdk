@@ -35,6 +35,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     npm \
     curl \
     jq \
+    git \
     && pip3 install --no-cache-dir pymysql \
     && rm -rf /var/lib/apt/lists/*
 

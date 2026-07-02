@@ -119,11 +119,12 @@
     '.vx-chip:hover{border-color:#2563eb;color:#2563eb;background:#eff6ff;}',
 
     /* Input row */
-    '#vx-form{padding:10px 14px 14px;border-top:1px solid #e2e8f0;display:flex;gap:8px;flex-shrink:0;background:#ffffff;',
+    '#vx-form{padding:10px 14px 14px;border-top:1px solid #e2e8f0;display:flex;align-items:flex-end;gap:8px;flex-shrink:0;background:#ffffff;',
     'border-radius:0 0 14px 14px;}',
     '#vx-input{flex:1;background:#f8faff !important;border:1px solid #e2e8f0 !important;border-radius:10px;',
     'color:#1e293b !important;font-family:' + VX_FONT + ' !important;font-size:13px;padding:9px 13px;outline:none;',
-    'transition:border-color .15s,box-shadow .15s;box-shadow:none !important;}',
+    'transition:border-color .15s,box-shadow .15s;box-shadow:none !important;',
+    'resize:none;overflow:hidden;min-height:38px;max-height:120px;line-height:1.5;display:block;}',
     '#vx-input:focus{border-color:#2563eb !important;box-shadow:0 0 0 3px rgba(37,99,235,0.1) !important;}',
     '#vx-input::placeholder{color:#94a3b8 !important;}',
     '#vx-send{background:#2563eb;border:none;border-radius:10px;color:#ffffff;',
@@ -364,7 +365,7 @@
     '<div id="vx-messages" role="log" aria-live="polite"></div>' +
     '<div id="vx-suggestions"></div>' +
     '<div id="vx-form">' +
-      '<input id="vx-input" type="text" placeholder="Ask anything…" autocomplete="off"/>' +
+      '<textarea id="vx-input" rows="1" placeholder="Ask anything… (Shift+Enter for new line)" autocomplete="off"></textarea>' +
       '<button id="vx-send">Send</button>' +
     '</div>';
 
@@ -432,6 +433,7 @@
     isThinking = true;
     sendBtn.disabled = true;
     inputEl.value = '';
+    inputEl.style.height = 'auto';
     showThinking();
 
     var payload = {
@@ -511,6 +513,11 @@
       e.preventDefault();
       sendMessage(inputEl.value);
     }
+  });
+
+  inputEl.addEventListener('input', function () {
+    inputEl.style.height = 'auto';
+    inputEl.style.height = Math.min(inputEl.scrollHeight, 120) + 'px';
   });
 
   document.addEventListener('keydown', function (e) {

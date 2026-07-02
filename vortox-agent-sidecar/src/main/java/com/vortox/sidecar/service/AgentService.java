@@ -71,16 +71,48 @@ public class AgentService {
     public AgentRunResponse run(AgentRunRequest request) {
         String runId = UUID.randomUUID().toString();
 
-        boolean isLocalLlm = "local".equalsIgnoreCase(request.llmProvider());
-        String apiKey = isLocalLlm ? request.apiKey() : resolveApiKey(request.apiKey());
+        // Agent config from vortox (linked via SDK key) provides defaults.
+        java.util.Map<String, Object> agentConfig = anthropicKeyRefreshService != null
+                ? anthropicKeyRefreshService.getAgentConfig() : null;
+
+        String llmProvider = firstNonBlank(request.llmProvider(),
+                agentConfig != null ? (String) agentConfig.get("provider") : null);
+        String llmBaseUrl = firstNonBlank(request.llmBaseUrl(),
+                agentConfig != null ? (String) agentConfig.get("llmBaseUrl") : null);
+        String model = firstNonBlank(request.model(),
+                agentConfig != null ? (String) agentConfig.get("model") : null,
+                defaultModel);
+        String systemPrompt = firstNonBlank(request.systemPrompt(),
+                agentConfig != null ? (String) agentConfig.get("systemPrompt") : null,
+                "You are an autonomous AI agent. Use the available skills to complete the task.");
+
+        boolean isLocalLlm = "local".equalsIgnoreCase(llmProvider);
+        String apiKey;
+        if (isLocalLlm) {
+            apiKey = firstNonBlank(request.apiKey(),
+                    agentConfig != null ? (String) agentConfig.get("apiKey") : null);
+        } else {
+            apiKey = firstNonBlank(request.apiKey(),
+                    agentConfig != null ? (String) agentConfig.get("apiKey") : null,
+                    resolveApiKey(null));
+        }
+
         if (apiKey == null || apiKey.isBlank()) {
             String hint = isLocalLlm
-                    ? "No API key provided for local LLM. Pass apiKey (Bearer token) in the request."
-                    : "No API key provided. Set ANTHROPIC_API_KEY or pass apiKey in the request.";
+                    ? "No API key provided for local LLM. Set it on the linked agent in Vortox or pass apiKey in the request."
+                    : "No API key provided. Set ANTHROPIC_API_KEY, configure the platform key in Vortox, or link an agent to this SDK app.";
             return errorResponse(runId, hint);
         }
 
-        List<SkillDefinition> activeSkills = skillRegistry.subset(request.skills());
+        // Skills: prefer explicit request list; fall back to agent's availableSkills from vortox.
+        List<String> skillNames = request.skills();
+        if ((skillNames == null || skillNames.isEmpty()) && agentConfig != null) {
+            @SuppressWarnings("unchecked")
+            List<String> agentSkills = (List<String>) agentConfig.get("availableSkills");
+            if (agentSkills != null && !agentSkills.isEmpty()) skillNames = agentSkills;
+        }
+
+        List<SkillDefinition> activeSkills = skillRegistry.subset(skillNames);
         List<java.util.Map<String, Object>> toolDefs = activeSkills.stream()
                 .map(SkillDefinition::toToolDefinition)
                 .toList();
@@ -89,10 +121,8 @@ public class AgentService {
         // to Vortox control plane and delegates all skill tools to ScriptToolExecutor locally.
         ToolExecutor activeExecutor = gatewayToolExecutor != null ? gatewayToolExecutor : scriptToolExecutor;
 
-        String model = request.model() != null ? request.model() : defaultModel;
-
-        log.info("Agent run {} — task='{}' model={} skills={} gateway={}", runId,
-                truncate(request.task(), 80), model,
+        log.info("Agent run {} — task='{}' model={} provider={} skills={} gateway={}", runId,
+                truncate(request.task(), 80), model, llmProvider,
                 activeSkills.stream().map(SkillDefinition::name).toList(),
                 gatewayToolExecutor != null ? "enabled" : "disabled");
 
@@ -104,12 +134,11 @@ public class AgentService {
                 .apiKey(apiKey)
                 .model(model)
                 .maxIterations(request.maxIterations() != null ? request.maxIterations() : 100)
-                .systemPrompt(request.systemPrompt() != null ? request.systemPrompt()
-                        : "You are an autonomous AI agent. Use the available skills to complete the task.")
+                .systemPrompt(systemPrompt)
                 .tools(toolDefs)
                 .toolExecutor(activeExecutor);
 
-        LlmClient llmClient = resolveLlmClient(request.llmProvider(), request.llmBaseUrl());
+        LlmClient llmClient = resolveLlmClient(llmProvider, llmBaseUrl);
         if (llmClient != null) {
             configBuilder.llmClient(llmClient);
         }
@@ -147,6 +176,14 @@ public class AgentService {
             if (vortoxKey != null && !vortoxKey.isBlank()) return vortoxKey;
         }
         return envApiKey;
+    }
+
+    /** Returns the first non-null, non-blank string from the candidates, or null if none. */
+    private static String firstNonBlank(String... candidates) {
+        for (String s : candidates) {
+            if (s != null && !s.isBlank()) return s;
+        }
+        return null;
     }
 
     /** Returns an LlmClient when provider is "local", null otherwise (ReactLoop uses AnthropicClient). */

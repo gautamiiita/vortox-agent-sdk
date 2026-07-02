@@ -30,6 +30,7 @@ public class AnthropicKeyRefreshService {
     private static final Logger log = LoggerFactory.getLogger(AnthropicKeyRefreshService.class);
 
     private final AtomicReference<String> cachedKey = new AtomicReference<>(null);
+    private final AtomicReference<Map<String, Object>> cachedAgentConfig = new AtomicReference<>(null);
 
     private final VortoxGateway gateway;
     private final ObjectMapper objectMapper = new ObjectMapper();
@@ -51,9 +52,8 @@ public class AnthropicKeyRefreshService {
         if (registrationKey != null && !registrationKey.isBlank()) {
             cachedKey.set(registrationKey);
             log.info("AnthropicKeyRefreshService: using key from registration response");
-            return;
         }
-        // Fallback: backend was restarted or key wasn't configured yet at registration time.
+        // Always fetch full config on startup to also get agentConfig.
         refresh();
     }
 
@@ -65,6 +65,11 @@ public class AnthropicKeyRefreshService {
     /** Returns the Anthropic API key fetched from Vortox, or null if not available. */
     public String getKey() {
         return cachedKey.get();
+    }
+
+    /** Returns the linked agent's config from Vortox, or null if no agent is linked. */
+    public Map<String, Object> getAgentConfig() {
+        return cachedAgentConfig.get();
     }
 
     @SuppressWarnings("unchecked")
@@ -100,6 +105,16 @@ public class AnthropicKeyRefreshService {
                     log.info("AnthropicKeyRefreshService: key removed from Vortox backend, clearing cache");
                     cachedKey.set(null);
                 }
+            }
+
+            @SuppressWarnings("unchecked")
+            Map<String, Object> agentConfig = (Map<String, Object>) config.get("agentConfig");
+            Map<String, Object> previous = cachedAgentConfig.getAndSet(agentConfig);
+            if (agentConfig != null && previous == null) {
+                log.info("AnthropicKeyRefreshService: agent config loaded — agentId='{}' model={}",
+                        agentConfig.get("agentId"), agentConfig.get("model"));
+            } else if (agentConfig == null && previous != null) {
+                log.info("AnthropicKeyRefreshService: agent config removed from Vortox backend");
             }
         } catch (Exception e) {
             log.warn("AnthropicKeyRefreshService: failed to fetch config from Vortox: {}", e.getMessage());

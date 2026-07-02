@@ -94,13 +94,11 @@ public class AgentController {
         }
 
         // ── System prompt ────────────────────────────────────────────────────
+        // Pass null when there's no explicit systemPrompt so AgentService can
+        // fall back to the linked agent's persona from Vortox.
         StringBuilder systemPrompt = new StringBuilder();
         if (request.systemPrompt() != null && !request.systemPrompt().isBlank()) {
             systemPrompt.append(request.systemPrompt());
-        } else {
-            systemPrompt.append("You are a helpful AI assistant embedded in a web application. ")
-                        .append("Answer questions concisely and accurately. ")
-                        .append("Use available skills when you need live data from the application.");
         }
 
         if (Boolean.TRUE.equals(request.allowPageScripts())) {
@@ -142,10 +140,11 @@ public class AgentController {
         task.append("## User Message\n").append(request.message());
 
         String apiKey = request.llmApiKey();  // explicit per-request key takes precedence
+        String resolvedSystemPrompt = systemPrompt.length() > 0 ? systemPrompt.toString() : null;
         AgentRunRequest runRequest = new AgentRunRequest(
                 task.toString(),
                 null,
-                systemPrompt.toString(),
+                resolvedSystemPrompt,
                 request.model(),
                 30,
                 apiKey,

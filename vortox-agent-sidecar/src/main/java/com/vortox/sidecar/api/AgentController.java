@@ -9,6 +9,12 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -135,13 +141,16 @@ public class AgentController {
 
         task.append("## User Message\n").append(request.message());
 
+        String apiKey = request.llmApiKey();  // explicit per-request key takes precedence
         AgentRunRequest runRequest = new AgentRunRequest(
                 task.toString(),
                 null,
                 systemPrompt.toString(),
                 request.model(),
                 30,
-                null
+                apiKey,
+                request.llmProvider(),
+                request.llmBaseUrl()
         );
 
         AgentRunResponse response = agentService.run(runRequest);
@@ -173,5 +182,38 @@ public class AgentController {
     public ResponseEntity<Map<String, Object>> reloadSkills() {
         skillRegistry.load();
         return ResponseEntity.ok(Map.of("loaded", skillRegistry.count()));
+    }
+
+    /**
+     * Proxy to a local LLM's model-listing endpoint.
+     * GET /agent/llm/models?baseUrl=https://ai.svc.elca.ch&apiKey=sk-...
+     */
+    @GetMapping("/llm/models")
+    public ResponseEntity<String> listLlmModels(
+            @RequestParam String baseUrl,
+            @RequestParam String apiKey) {
+        try {
+            String root = baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl;
+            HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
+            HttpResponse<String> res = http.send(
+                    HttpRequest.newBuilder()
+                            .uri(URI.create(root + "/api/models"))
+                            .timeout(Duration.ofSeconds(15))
+                            .GET()
+                            .headers("Authorization", "Bearer " + apiKey)
+                            .build(),
+                    HttpResponse.BodyHandlers.ofString());
+
+            if (res.statusCode() != 200) {
+                return ResponseEntity.status(res.statusCode()).body(res.body());
+            }
+            return ResponseEntity.ok()
+                    .header("Content-Type", "application/json")
+                    .body(res.body());
+        } catch (Exception e) {
+            log.error("Failed to list LLM models from {}: {}", baseUrl, e.getMessage());
+            return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
+                    .body("{\"error\":\"" + e.getMessage() + "\"}");
+        }
     }
 }

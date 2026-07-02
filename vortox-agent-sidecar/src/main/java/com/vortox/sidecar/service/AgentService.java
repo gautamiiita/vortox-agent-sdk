@@ -2,6 +2,8 @@ package com.vortox.sidecar.service;
 
 import com.vortox.agent.AgentConfig;
 import com.vortox.agent.AgentResult;
+import com.vortox.agent.LlmClient;
+import com.vortox.agent.OpenAiCompatibleLlmClient;
 import com.vortox.agent.ReactLoop;
 import com.vortox.agent.gateway.GatewayMemoryStore;
 import com.vortox.agent.gateway.GatewayToolExecutor;
@@ -19,6 +21,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.lang.Nullable;
 import org.springframework.stereotype.Service;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.List;
 import java.util.UUID;
 
@@ -33,8 +36,12 @@ public class AgentService {
     @Value("${ANTHROPIC_API_KEY:}")
     private String envApiKey;
 
+    @Value("${sidecar.max-tokens:4096}")
+    private int defaultMaxTokens;
+
     private final SkillRegistry skillRegistry;
     private final ScriptToolExecutor scriptToolExecutor;
+    private final ObjectMapper objectMapper = new ObjectMapper();
 
     /** Optional: present only when vortox.backend.url is configured. */
     @Nullable
@@ -64,9 +71,13 @@ public class AgentService {
     public AgentRunResponse run(AgentRunRequest request) {
         String runId = UUID.randomUUID().toString();
 
-        String apiKey = resolveApiKey(request.apiKey());
+        boolean isLocalLlm = "local".equalsIgnoreCase(request.llmProvider());
+        String apiKey = isLocalLlm ? request.apiKey() : resolveApiKey(request.apiKey());
         if (apiKey == null || apiKey.isBlank()) {
-            return errorResponse(runId, "No API key provided. Set ANTHROPIC_API_KEY or pass apiKey in the request.");
+            String hint = isLocalLlm
+                    ? "No API key provided for local LLM. Pass apiKey (Bearer token) in the request."
+                    : "No API key provided. Set ANTHROPIC_API_KEY or pass apiKey in the request.";
+            return errorResponse(runId, hint);
         }
 
         List<SkillDefinition> activeSkills = skillRegistry.subset(request.skills());
@@ -97,6 +108,11 @@ public class AgentService {
                         : "You are an autonomous AI agent. Use the available skills to complete the task.")
                 .tools(toolDefs)
                 .toolExecutor(activeExecutor);
+
+        LlmClient llmClient = resolveLlmClient(request.llmProvider(), request.llmBaseUrl());
+        if (llmClient != null) {
+            configBuilder.llmClient(llmClient);
+        }
 
         if (gatewayMemoryStore != null) {
             configBuilder.memoryStore(gatewayMemoryStore);
@@ -131,6 +147,14 @@ public class AgentService {
             if (vortoxKey != null && !vortoxKey.isBlank()) return vortoxKey;
         }
         return envApiKey;
+    }
+
+    /** Returns an LlmClient when provider is "local", null otherwise (ReactLoop uses AnthropicClient). */
+    private LlmClient resolveLlmClient(String llmProvider, String llmBaseUrl) {
+        if ("local".equalsIgnoreCase(llmProvider) && llmBaseUrl != null && !llmBaseUrl.isBlank()) {
+            return new OpenAiCompatibleLlmClient(objectMapper, defaultMaxTokens, llmBaseUrl);
+        }
+        return null;
     }
 
     private static String truncate(String s, int max) {

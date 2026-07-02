@@ -28,7 +28,7 @@ import java.util.stream.Collectors;
  *       exponential back-off.</li>
  * </ul>
  */
-public final class AnthropicClient {
+public final class AnthropicClient implements LlmClient {
 
     private static final Logger log = LoggerFactory.getLogger(AnthropicClient.class);
 

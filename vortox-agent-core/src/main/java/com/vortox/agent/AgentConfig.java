@@ -50,6 +50,10 @@ public final class AgentConfig {
     private final boolean enableExecuteCommand;
     private final boolean enableSpawnTask;
 
+    // ── LLM backend ───────────────────────────────────────────────────────────
+    /** When set, ReactLoop uses this instead of creating a default AnthropicClient. */
+    private final LlmClient llmClient;
+
     // ── SPI implementations ───────────────────────────────────────────────────
     private final MemoryStore memoryStore;
     private final ActivityListener activityListener;
@@ -70,6 +74,7 @@ public final class AgentConfig {
         this.enableMemoryTools   = b.enableMemoryTools;
         this.enableExecuteCommand = b.enableExecuteCommand;
         this.enableSpawnTask     = b.enableSpawnTask;
+        this.llmClient           = b.llmClient;
         this.memoryStore         = b.memoryStore;
         this.activityListener    = b.activityListener;
         this.taskSpawner         = b.taskSpawner;
@@ -93,6 +98,7 @@ public final class AgentConfig {
     public boolean isEnableMemoryTools()   { return enableMemoryTools; }
     public boolean isEnableExecuteCommand(){ return enableExecuteCommand; }
     public boolean isEnableSpawnTask()     { return enableSpawnTask; }
+    public LlmClient getLlmClient()        { return llmClient; }
     public MemoryStore getMemoryStore()    { return memoryStore; }
     public ActivityListener getActivityListener() { return activityListener; }
     public TaskSpawner getTaskSpawner()    { return taskSpawner; }
@@ -116,6 +122,7 @@ public final class AgentConfig {
         private boolean enableMemoryTools    = true;
         private boolean enableExecuteCommand = true;
         private boolean enableSpawnTask      = false;
+        private LlmClient llmClient          = null;
         private MemoryStore memoryStore      = new InMemoryStore();
         private ActivityListener activityListener = ActivityListener.NOOP;
         private TaskSpawner taskSpawner      = null;
@@ -148,6 +155,7 @@ public final class AgentConfig {
         public Builder enableHandoff(boolean v)        { this.enableHandoff = v; return this; }
         public Builder enableMemoryTools(boolean v)    { this.enableMemoryTools = v; return this; }
         public Builder enableExecuteCommand(boolean v) { this.enableExecuteCommand = v; return this; }
+        public Builder llmClient(LlmClient client)     { this.llmClient = client; return this; }
 
         public AgentConfig build() {
             if (apiKey == null || apiKey.isBlank()) {

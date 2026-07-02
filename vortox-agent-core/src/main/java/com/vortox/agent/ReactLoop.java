@@ -59,16 +59,19 @@ public final class ReactLoop {
     private static final int PRUNED_ASSISTANT_TEXT_MAX_CHARS = 200;
 
     private final AgentConfig config;
-    private final AnthropicClient client;
+    private final LlmClient client;
     private final ObjectMapper objectMapper;
     private final Executor executor;
 
     public ReactLoop(AgentConfig config) {
-        this(config, new AnthropicClient(new ObjectMapper(), config.getModel(), config.getMaxTokens()),
-                ForkJoinPool.commonPool());
+        this(config,
+             config.getLlmClient() != null ? config.getLlmClient()
+                 : new AnthropicClient(new ObjectMapper(), config.getModel(), config.getMaxTokens()),
+             ForkJoinPool.commonPool());
     }
 
-    public ReactLoop(AgentConfig config, AnthropicClient client, Executor executor) {
+    /** Kept for callers (e.g. AgentRunner) that inject an AnthropicClient Spring bean. */
+    public ReactLoop(AgentConfig config, LlmClient client, Executor executor) {
         this.config       = config;
         this.client       = client;
         this.objectMapper = new ObjectMapper();

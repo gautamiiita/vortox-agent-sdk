@@ -35,6 +35,7 @@ public class VortoxSkillSyncService {
 
     private final VortoxGateway gateway;
     private final SkillRegistry skillRegistry;
+    private final SkillEnvStore skillEnvStore;
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final HttpClient httpClient = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(10))
@@ -43,9 +44,11 @@ public class VortoxSkillSyncService {
     @Value("${vortox.backend.api-key:}")
     private String apiKey;
 
-    public VortoxSkillSyncService(VortoxGateway gateway, SkillRegistry skillRegistry) {
+    public VortoxSkillSyncService(VortoxGateway gateway, SkillRegistry skillRegistry,
+                                   SkillEnvStore skillEnvStore) {
         this.gateway = gateway;
         this.skillRegistry = skillRegistry;
+        this.skillEnvStore = skillEnvStore;
     }
 
     @PostConstruct
@@ -85,6 +88,7 @@ public class VortoxSkillSyncService {
 
             List<Map<String, Object>> skills = objectMapper.readValue(resp.body(), LIST_MAP);
             int saved = 0, failed = 0;
+            Map<String, Map<String, String>> newEnvVars = new java.util.HashMap<>();
             for (Map<String, Object> entry : skills) {
                 String name    = (String) entry.get("name");
                 String content = (String) entry.get("content");
@@ -95,10 +99,19 @@ public class VortoxSkillSyncService {
                 } catch (Exception e) {
                     log.warn("Failed to save synced skill '{}': {}", name, e.getMessage());
                     failed++;
+                    continue;
+                }
+                @SuppressWarnings("unchecked")
+                Map<String, String> envVars = (Map<String, String>) entry.get("envVars");
+                if (envVars != null && !envVars.isEmpty()) {
+                    newEnvVars.put(name, envVars);
                 }
             }
-            log.info("Skill sync [{}] complete: {} saved, {} failed, {} total from Vortox",
-                    trigger, saved, failed, skills.size());
+            // Replace the entire env store so deleted skills lose their secrets
+            // and updated values are picked up without a container restart.
+            skillEnvStore.reset(newEnvVars);
+            log.info("Skill sync [{}] complete: {} saved, {} failed, {} total, {} with env vars",
+                    trigger, saved, failed, skills.size(), newEnvVars.size());
 
         } catch (Exception e) {
             log.warn("Skill sync [{}] failed: {}", trigger, e.getMessage());

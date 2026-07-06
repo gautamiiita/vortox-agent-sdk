@@ -36,7 +36,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     jq \
     git \
-    && pip3 install --no-cache-dir pymysql \
+    && pip3 install --no-cache-dir pymysql oracledb \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the sidecar JAR

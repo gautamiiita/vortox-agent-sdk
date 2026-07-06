@@ -26,10 +26,12 @@ public class ScriptToolExecutor implements ToolExecutor {
     private static final Logger log = LoggerFactory.getLogger(ScriptToolExecutor.class);
 
     private final SkillRegistry registry;
+    private final SkillEnvStore skillEnvStore;
     private final ObjectMapper objectMapper;
 
-    public ScriptToolExecutor(SkillRegistry registry) {
+    public ScriptToolExecutor(SkillRegistry registry, SkillEnvStore skillEnvStore) {
         this.registry = registry;
+        this.skillEnvStore = skillEnvStore;
         this.objectMapper = new ObjectMapper();
     }
 
@@ -58,6 +60,13 @@ public class ScriptToolExecutor implements ToolExecutor {
                     .directory(workDir.toFile())
                     .redirectInput(ProcessBuilder.Redirect.from(
                             Path.of(System.getProperty("os.name", "").toLowerCase().contains("win") ? "NUL" : "/dev/null").toFile()));
+
+            // Inject skill-specific env vars resolved from Vortox secrets (in-memory, not on disk).
+            Map<String, String> envVars = skillEnvStore.get(toolName);
+            if (!envVars.isEmpty()) {
+                pb.environment().putAll(envVars);
+                log.debug("Injected {} env var(s) for skill '{}'", envVars.size(), toolName);
+            }
 
             Process process = pb.start();
 

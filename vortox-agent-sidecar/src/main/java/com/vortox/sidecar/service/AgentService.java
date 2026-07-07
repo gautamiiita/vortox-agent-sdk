@@ -22,13 +22,23 @@ import org.springframework.lang.Nullable;
 import org.springframework.stereotype.Service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Base64;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 
 @Service
 public class AgentService {
 
     private static final Logger log = LoggerFactory.getLogger(AgentService.class);
+
+    /** Skill names whose successful calls produce a file worth offering as a download. */
+    private static final Set<String> FILE_PRODUCING_SKILLS = Set.of("file_write");
+
+    /** Refuse to inline anything bigger than this into a JSON response. */
+    private static final long MAX_ARTIFACT_BYTES = 8L * 1024 * 1024;
 
     @Value("${sidecar.default-model:claude-sonnet-4-6}")
     private String defaultModel;
@@ -159,14 +169,57 @@ public class AgentService {
                 .map(tc -> new AgentRunResponse.ToolCallDto(tc.toolName(), tc.success(), tc.durationMs()))
                 .toList();
 
+        List<AgentRunResponse.ArtifactDto> artifacts = extractArtifacts(result.toolCalls(), runId);
+
         return new AgentRunResponse(
                 runId,
                 result.status().name(),
                 result.response() != null ? result.response() : result.error(),
                 calls,
                 result.inputTokens(),
-                result.outputTokens()
+                result.outputTokens(),
+                artifacts
         );
+    }
+
+    /**
+     * Reads back the bytes of any file a {@link #FILE_PRODUCING_SKILLS} call wrote, using the
+     * path already captured in the tool call's input — no extra skill/LLM round trip needed.
+     * The sidecar's local disk is ephemeral and not reachable from outside this process, so the
+     * bytes are inlined here and the file is deleted immediately after being read.
+     */
+    private List<AgentRunResponse.ArtifactDto> extractArtifacts(List<AgentResult.ToolCall> toolCalls, String runId) {
+        List<AgentRunResponse.ArtifactDto> artifacts = new java.util.ArrayList<>();
+        for (AgentResult.ToolCall tc : toolCalls) {
+            if (!tc.success() || !FILE_PRODUCING_SKILLS.contains(tc.toolName())) continue;
+
+            Object rawPath = tc.input() != null ? tc.input().get("path") : null;
+            if (!(rawPath instanceof String pathStr) || pathStr.isBlank()) continue;
+
+            try {
+                Path path = Path.of(pathStr);
+                if (!Files.isRegularFile(path)) continue;
+
+                long size = Files.size(path);
+                if (size > MAX_ARTIFACT_BYTES) {
+                    log.warn("Run {}: skipping artifact '{}' — {} bytes exceeds cap of {}",
+                            runId, path, size, MAX_ARTIFACT_BYTES);
+                    continue;
+                }
+
+                byte[] bytes = Files.readAllBytes(path);
+                String mimeType = firstNonBlank(Files.probeContentType(path), "application/octet-stream");
+                String filename = path.getFileName().toString();
+
+                artifacts.add(new AgentRunResponse.ArtifactDto(
+                        filename, mimeType, bytes.length, Base64.getEncoder().encodeToString(bytes)));
+
+                Files.deleteIfExists(path);
+            } catch (Exception e) {
+                log.warn("Run {}: failed to read artifact at '{}': {}", runId, rawPath, e.getMessage());
+            }
+        }
+        return artifacts;
     }
 
     private String resolveApiKey(String requestKey) {
@@ -200,6 +253,6 @@ public class AgentService {
     }
 
     private static AgentRunResponse errorResponse(String runId, String message) {
-        return new AgentRunResponse(runId, "FAILED", message, List.of(), 0, 0);
+        return new AgentRunResponse(runId, "FAILED", message, List.of(), 0, 0, List.of());
     }
 }

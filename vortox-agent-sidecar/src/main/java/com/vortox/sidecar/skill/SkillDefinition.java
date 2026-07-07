@@ -12,7 +12,8 @@ public record SkillDefinition(
         String language,
         int timeoutSeconds,
         Map<String, Object> inputSchema,
-        String implementation
+        String implementation,
+        String rawContent
 ) {
 
     /** Converts this skill into the tool definition format expected by the Anthropic API. */

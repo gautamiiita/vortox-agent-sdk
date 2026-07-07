@@ -1,6 +1,7 @@
 package com.vortox.sidecar.api;
 
 import com.vortox.sidecar.service.AgentService;
+import com.vortox.sidecar.service.ChatRunService;
 import com.vortox.sidecar.skill.SkillDefinition;
 import com.vortox.sidecar.skill.SkillRegistry;
 import org.slf4j.Logger;
@@ -15,6 +16,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -27,10 +29,12 @@ public class AgentController {
 
     private final AgentService agentService;
     private final SkillRegistry skillRegistry;
+    private final ChatRunService chatRunService;
 
-    public AgentController(AgentService agentService, SkillRegistry skillRegistry) {
-        this.agentService  = agentService;
-        this.skillRegistry = skillRegistry;
+    public AgentController(AgentService agentService, SkillRegistry skillRegistry, ChatRunService chatRunService) {
+        this.agentService   = agentService;
+        this.skillRegistry  = skillRegistry;
+        this.chatRunService = chatRunService;
     }
 
     // ── Skill upload / delete ─────────────────────────────────────────────────
@@ -82,8 +86,12 @@ public class AgentController {
     /**
      * Widget-facing chat endpoint. Accepts the format sent by vortox-agent-widget.js:
      * {message, history, context, allowPageScripts, pageApiDescription, systemPrompt, model}
-     * Returns: {reply: "..."}
-     *
+     * <p>
+     * Asynchronous: starts the agent run in the background and returns immediately with
+     * {runId, status: "RUNNING"}. The caller polls {@link #chatStatus} for the result — a
+     * single blocking HTTP request here would need to outlive the whole ReAct loop, which
+     * can run many minutes for multi-step tasks or long-running skills.
+     * <p>
      * When allowPageScripts=true the system prompt instructs the LLM that it may include
      * a ```javascript block which the widget will execute in the host page context.
      */
@@ -152,15 +160,22 @@ public class AgentController {
                 request.llmBaseUrl()
         );
 
-        AgentRunResponse response = agentService.run(runRequest);
-        String reply = (response.result() != null && !response.result().isBlank())
-                       ? response.result()
-                       : "I couldn't generate a response. Please try again.";
+        String runId = chatRunService.start(runRequest);
+        log.info("Chat run {} started", runId);
 
-        log.info("Chat completed — status={} inputTokens={} outputTokens={}",
-                response.status(), response.inputTokens(), response.outputTokens());
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("runId", runId);
+        body.put("status", "RUNNING");
+        return ResponseEntity.accepted().body(body);
+    }
 
-        return ResponseEntity.ok(Map.of("reply", reply));
+    /** Poll target for {@link #chat}. Returns {runId, status, reply?, artifacts?, error?}. */
+    @GetMapping("/chat/{runId}")
+    public ResponseEntity<Map<String, Object>> chatStatus(@PathVariable String runId) {
+        return chatRunService.status(runId)
+                .map(ResponseEntity::ok)
+                .orElse(ResponseEntity.status(HttpStatus.NOT_FOUND)
+                        .body(Map.of("status", "NOT_FOUND", "error", "Unknown or expired run")));
     }
 
     @GetMapping("/skills")
@@ -175,6 +190,17 @@ public class AgentController {
                 .sorted((a, b) -> a.get("name").toString().compareTo(b.get("name").toString()))
                 .toList();
         return ResponseEntity.ok(list);
+    }
+
+    /** Fetch a single skill's raw SKILL.md content, for editing in a form that re-uses /skills/upload to save. */
+    @GetMapping("/skills/{name}")
+    public ResponseEntity<Map<String, Object>> getSkill(@PathVariable String name) {
+        return skillRegistry.find(name)
+                .map(s -> ResponseEntity.ok(Map.<String, Object>of(
+                        "name", s.name(),
+                        "content", s.rawContent()
+                )))
+                .orElse(ResponseEntity.notFound().build());
     }
 
     @RequestMapping(value = "/skills/reload", method = {RequestMethod.GET, RequestMethod.POST})

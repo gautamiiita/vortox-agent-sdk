@@ -9,6 +9,14 @@
   var PAGE_API_DESCRIPTION = cfg.pageApiDescription   || '';
   var getContext           = typeof cfg.context === 'function' ? cfg.context : function () { return {}; };
 
+  // Chat runs asynchronously: POST starts the run and returns a runId immediately,
+  // then we poll GET {ENDPOINT}/{runId} until it's done. No single HTTP call needs to
+  // stay open for the whole agent run, so REQUEST_TIMEOUT_MS can stay short — MAX_WAIT_MS
+  // is the real, generous budget for how long we'll wait overall before giving up.
+  var REQUEST_TIMEOUT_MS = cfg.requestTimeoutMs || 20000;            // 20s per HTTP call
+  var POLL_INTERVAL_MS   = cfg.pollIntervalMs   || 2000;             // poll every 2s
+  var MAX_WAIT_MS        = cfg.maxWaitMs        || 20 * 60 * 1000;   // 20 minutes overall
+
   var _pageCtx   = {};
   var history    = [];
   var isOpen     = false;
@@ -139,7 +147,16 @@
     'color:#15803d;font-family:' + VX_FONT + ';font-size:11px;font-weight:500;}',
     '.vx-script-error{display:block;margin-top:8px;padding:6px 10px;',
     'background:#fef2f2;border:1px solid #fecaca;border-radius:8px;',
-    'color:#dc2626;font-family:ui-monospace,monospace;font-size:11px;white-space:pre-wrap;word-break:break-all;}'
+    'color:#dc2626;font-family:ui-monospace,monospace;font-size:11px;white-space:pre-wrap;word-break:break-all;}',
+
+    /* Downloadable artifact chip (files the agent generated, e.g. reports) */
+    '.vx-artifact{display:inline-flex;align-items:center;gap:6px;margin:8px 6px 0 0;padding:6px 10px;',
+    'background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;cursor:pointer;',
+    'color:#1d4ed8;font-family:' + VX_FONT + ';font-size:12px;font-weight:600;',
+    'transition:background .15s,border-color .15s;}',
+    '.vx-artifact:hover{background:#dbeafe;border-color:#93c5fd;}',
+    '.vx-artifact svg{stroke:#1d4ed8;flex-shrink:0;}',
+    '.vx-artifact-size{color:#64748b;font-weight:400;margin-left:2px;}'
   ].join('');
   document.head.appendChild(style);
 
@@ -341,6 +358,53 @@
     containerEl.appendChild(badge);
   }
 
+  // ── Downloadable artifacts ────────────────────────────────────────────────────
+  // Files the agent generated (e.g. reports) come back inlined as base64 on the
+  // chat response — no server-side storage involved, the bytes just live in this
+  // message's memory for as long as the widget session is open.
+
+  function fmtSize(n) {
+    if (n < 1024) return n + ' B';
+    if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+    return (n / 1048576).toFixed(1) + ' MB';
+  }
+
+  function downloadArtifact(artifact) {
+    try {
+      var binary = atob(artifact.base64);
+      var bytes = new Uint8Array(binary.length);
+      for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      var blob = new Blob([bytes], { type: artifact.mimeType || 'application/octet-stream' });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url;
+      a.download = artifact.filename || 'download';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+    } catch (err) {
+      /* eslint-disable-next-line no-console */
+      console.error('Vortox widget: failed to download artifact', err);
+    }
+  }
+
+  function renderArtifacts(artifacts, containerEl) {
+    if (!artifacts || !artifacts.length) return;
+    artifacts.forEach(function (artifact) {
+      var chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'vx-artifact';
+      chip.innerHTML =
+        '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke-width="2" ' +
+        'stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14"/></svg>' +
+        '<span>' + esc(artifact.filename || 'download') + '</span>' +
+        '<span class="vx-artifact-size">' + fmtSize(artifact.sizeBytes || 0) + '</span>';
+      chip.addEventListener('click', function () { downloadArtifact(artifact); });
+      containerEl.appendChild(chip);
+    });
+  }
+
   // ── DOM ───────────────────────────────────────────────────────────────────────
 
   var fab = document.createElement('button');
@@ -452,42 +516,93 @@
         : domSnapshot;
     }
 
+    postJson(ENDPOINT, payload, function (err, data) {
+      if (err) { finishWithError(err); return; }
+      if (!data || !data.runId) {
+        finishWithError((data && data.error) || 'Could not start the agent.');
+        return;
+      }
+      pollRun(data.runId, Date.now());
+    });
+  }
+
+  // ── Poll for completion ─────────────────────────────────────────────────────────
+
+  function pollRun(runId, startedAt) {
+    if (Date.now() - startedAt > MAX_WAIT_MS) {
+      finishWithError('The agent took too long to respond. Try a simpler query.');
+      return;
+    }
+    getJson(ENDPOINT + '/' + encodeURIComponent(runId), function (err, data) {
+      if (err) {
+        // Transient network hiccup while polling — keep trying until MAX_WAIT_MS.
+        setTimeout(function () { pollRun(runId, startedAt); }, POLL_INTERVAL_MS);
+        return;
+      }
+      if (!data || data.status === 'NOT_FOUND') {
+        finishWithError('Lost track of the agent run (the sidecar may have restarted). Please try again.');
+        return;
+      }
+      if (data.status === 'RUNNING') {
+        setTimeout(function () { pollRun(runId, startedAt); }, POLL_INTERVAL_MS);
+        return;
+      }
+      if (data.status === 'ERROR') {
+        finishWithError(data.error || 'The agent hit an error.');
+        return;
+      }
+      finishWithReply(data.reply || 'No response from agent.', data.artifacts);
+    });
+  }
+
+  function finishWithReply(reply, artifacts) {
+    hideThinking();
+    isThinking = false;
+    sendBtn.disabled = false;
+    var msgEl = appendMessage('agent', reply);
+    history.push({ role: 'assistant', content: reply });
+    if (ALLOW_PAGE_SCRIPTS) extractAndRunScripts(reply, msgEl);
+    renderArtifacts(artifacts, msgEl);
+  }
+
+  function finishWithError(message) {
+    hideThinking();
+    isThinking = false;
+    sendBtn.disabled = false;
+    appendMessage('agent', message);
+  }
+
+  // ── Small XHR helpers (each call is short-lived — the run itself is polled) ────
+
+  function postJson(url, body, cb) {
     var xhr = new XMLHttpRequest();
-    xhr.open('POST', ENDPOINT, true);
+    xhr.open('POST', url, true);
     xhr.setRequestHeader('Content-Type', 'application/json');
     xhr.setRequestHeader('Accept', 'application/json');
-    xhr.timeout = 120000;
+    xhr.timeout = REQUEST_TIMEOUT_MS;
+    xhr.onload    = function () { parseJsonResponse(xhr, cb); };
+    xhr.onerror   = function () { cb('Could not reach the agent. Check that the sidecar container is running.'); };
+    xhr.ontimeout = function () { cb('The agent did not respond in time.'); };
+    xhr.send(JSON.stringify(body));
+  }
 
-    xhr.onload = function () {
-      hideThinking();
-      isThinking = false;
-      sendBtn.disabled = false;
-      try {
-        var data = JSON.parse(xhr.responseText);
-        var reply = data.reply || 'No response from agent.';
-        var msgEl = appendMessage('agent', reply);
-        history.push({ role: 'assistant', content: reply });
-        if (ALLOW_PAGE_SCRIPTS) extractAndRunScripts(reply, msgEl);
-      } catch (e) {
-        appendMessage('agent', 'Unexpected response from agent.');
-      }
-    };
+  function getJson(url, cb) {
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', url, true);
+    xhr.setRequestHeader('Accept', 'application/json');
+    xhr.timeout = REQUEST_TIMEOUT_MS;
+    xhr.onload    = function () { parseJsonResponse(xhr, cb); };
+    xhr.onerror   = function () { cb('network error'); };
+    xhr.ontimeout = function () { cb('timeout'); };
+    xhr.send();
+  }
 
-    xhr.onerror = function () {
-      hideThinking();
-      isThinking = false;
-      sendBtn.disabled = false;
-      appendMessage('agent', 'Could not reach the agent. Check that the sidecar container is running.');
-    };
-
-    xhr.ontimeout = function () {
-      hideThinking();
-      isThinking = false;
-      sendBtn.disabled = false;
-      appendMessage('agent', 'The agent took too long to respond. Try a simpler query.');
-    };
-
-    xhr.send(JSON.stringify(payload));
+  function parseJsonResponse(xhr, cb) {
+    try {
+      cb(null, JSON.parse(xhr.responseText));
+    } catch (e) {
+      cb('Unexpected response from agent.');
+    }
   }
 
   // ── Events ────────────────────────────────────────────────────────────────────

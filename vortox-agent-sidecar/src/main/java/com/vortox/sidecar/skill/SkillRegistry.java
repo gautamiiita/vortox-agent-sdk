@@ -44,33 +44,52 @@ public class SkillRegistry {
         }
     }
 
-    @SuppressWarnings("unchecked")
     private void loadSkill(Path skillDir) {
         Path skillFile = skillDir.resolve("SKILL.md");
         if (!Files.exists(skillFile)) return;
 
         try {
             String content = Files.readString(skillFile);
-            Yaml yaml = new Yaml();
-            Map<String, Object> parsed = yaml.load(content);
+            ParsedSkill p = parse(content);
 
-            String name           = (String) parsed.get("name");
-            String description    = (String) parsed.getOrDefault("description", "");
-            String language       = (String) parsed.getOrDefault("language", "bash");
-            int    timeout        = ((Number) parsed.getOrDefault("timeout_seconds", 60)).intValue();
-            Map<String, Object> schema = (Map<String, Object>) parsed.get("input_schema");
-            String implementation = (String) parsed.get("implementation");
-
-            if (name == null || implementation == null) {
+            if (p.name() == null || p.implementation() == null) {
                 log.warn("Skipping {}: missing 'name' or 'implementation'", skillFile);
                 return;
             }
 
-            skills.put(name, new SkillDefinition(name, description, language, timeout, schema, implementation));
-            log.debug("Loaded skill: {}", name);
+            String dirName = skillDir.getFileName().toString();
+            if (!dirName.equals(p.name())) {
+                log.warn("Skill directory '{}' contains a SKILL.md whose name is '{}' — loading under '{}'. " +
+                        "Rename the directory or fix the 'name' field to avoid this drift.",
+                        dirName, p.name(), p.name());
+            }
+
+            skills.put(p.name(), new SkillDefinition(
+                    p.name(), p.description(), p.language(), p.timeoutSeconds(), p.inputSchema(), p.implementation(), content));
+            log.debug("Loaded skill: {}", p.name());
         } catch (Exception e) {
             log.error("Failed to load skill from {}: {}", skillFile, e.getMessage());
         }
+    }
+
+    /** Parsed-but-not-yet-registered view of a SKILL.md — lets save() validate before writing anything. */
+    private record ParsedSkill(String name, String description, String language, int timeoutSeconds,
+                                Map<String, Object> inputSchema, String implementation) {}
+
+    @SuppressWarnings("unchecked")
+    private ParsedSkill parse(String content) {
+        Yaml yaml = new Yaml();
+        Map<String, Object> parsed = yaml.load(content);
+        if (parsed == null) parsed = Map.of();
+
+        String name           = (String) parsed.get("name");
+        String description    = (String) parsed.getOrDefault("description", "");
+        String language       = (String) parsed.getOrDefault("language", "bash");
+        int    timeout        = ((Number) parsed.getOrDefault("timeout_seconds", 60)).intValue();
+        Map<String, Object> schema = (Map<String, Object>) parsed.get("input_schema");
+        String implementation = (String) parsed.get("implementation");
+
+        return new ParsedSkill(name, description, language, timeout, schema, implementation);
     }
 
     public Optional<SkillDefinition> find(String name) {
@@ -93,18 +112,33 @@ public class SkillRegistry {
     /**
      * Save a skill from raw SKILL.md content. Creates or replaces {skillsPath}/{name}/SKILL.md
      * and reloads the registry entry. Used by the upload endpoint.
+     * <p>
+     * Validates the content — and that its {@code name:} field matches {@code name} — before
+     * writing anything to disk. Without this check a mismatch would still get written under
+     * {@code name}'s directory while the registry entry ends up keyed by the content's own
+     * {@code name:} field, silently orphaning the directory and confusing later edits/deletes.
      */
     public SkillDefinition save(String name, String content) throws IOException {
         if (name == null || name.isBlank()) throw new IllegalArgumentException("name is required");
         if (content == null || content.isBlank()) throw new IllegalArgumentException("content is required");
 
+        ParsedSkill p = parse(content);
+        if (p.name() == null || p.implementation() == null) {
+            throw new IllegalArgumentException("SKILL.md must define both 'name' and 'implementation'");
+        }
+        if (!p.name().equals(name)) {
+            throw new IllegalArgumentException(
+                    "Name mismatch: requested to save as '" + name + "' but the SKILL.md content declares name '"
+                            + p.name() + "'. They must match.");
+        }
+
         Path skillDir = Path.of(skillsPath, name);
         Files.createDirectories(skillDir);
         Files.writeString(skillDir.resolve("SKILL.md"), content);
-        loadSkill(skillDir);
 
-        SkillDefinition saved = skills.get(name);
-        if (saved == null) throw new IllegalArgumentException("SKILL.md parsed but name/implementation missing");
+        SkillDefinition saved = new SkillDefinition(
+                p.name(), p.description(), p.language(), p.timeoutSeconds(), p.inputSchema(), p.implementation(), content);
+        skills.put(p.name(), saved);
         log.info("Saved skill: {}", name);
         return saved;
     }

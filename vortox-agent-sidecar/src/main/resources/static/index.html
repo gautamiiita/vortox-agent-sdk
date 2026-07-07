@@ -79,7 +79,7 @@
       color: #7c6ff7;
       border: 1px solid #2d3148;
     }
-    .btn-delete {
+    .btn-delete, .btn-edit {
       background: none;
       border: 1px solid #3d1515;
       color: #f87171;
@@ -88,8 +88,32 @@
       cursor: pointer;
       font-size: 12px;
       transition: background .15s;
+      margin-right: 6px;
     }
     .btn-delete:hover { background: #2d0a0a; }
+    .btn-edit { border-color: #2d3148; color: #a5a9c7; }
+    .btn-edit:hover { background: #1e2130; }
+    .edit-banner {
+      display: none;
+      align-items: center;
+      justify-content: space-between;
+      background: #1e2130;
+      border: 1px solid #7c6ff7;
+      border-radius: 8px;
+      padding: 10px 14px;
+      margin-bottom: 16px;
+      font-size: 13px;
+      color: #c4befa;
+    }
+    .edit-banner.show { display: flex; }
+    .edit-banner button {
+      background: none;
+      border: none;
+      color: #94a3b8;
+      cursor: pointer;
+      font-size: 12px;
+      text-decoration: underline;
+    }
     .empty-row td { color: #4b5563; font-style: italic; text-align: center; padding: 32px; }
 
     /* Upload card */
@@ -113,6 +137,8 @@
       transition: border-color .15s;
     }
     input[type=text]:focus, textarea:focus { border-color: #7c6ff7; }
+    input[type=text][readonly] { color: #94a3b8; cursor: not-allowed; }
+    input[type=text][readonly].name-missing { color: #f87171; border-color: #7f1d1d; }
     textarea { resize: vertical; min-height: 220px; line-height: 1.5; }
     .field { margin-bottom: 16px; }
     .row { display: flex; gap: 12px; align-items: flex-end; }
@@ -202,20 +228,24 @@
     </table>
   </section>
 
-  <!-- Upload -->
+  <!-- Upload / Edit -->
   <section>
-    <h2>Upload Skill</h2>
+    <h2 id="uploadHeading">Upload Skill</h2>
     <div class="card">
+      <div class="edit-banner" id="editBanner">
+        <span>Editing <strong id="editBannerName"></strong> — saving will overwrite it.</span>
+        <button onclick="cancelEdit()">Cancel, create new instead</button>
+      </div>
       <div class="field">
-        <label>Skill name (snake_case)</label>
-        <input type="text" id="uploadName" placeholder="e.g. generate_csv" />
-        <div class="hint">Must match the <code>name</code> field inside the SKILL.md content.</div>
+        <label>Skill name (derived from content)</label>
+        <input type="text" id="uploadName" placeholder="detected from the name: field below" readonly />
+        <div class="hint">Read-only — taken from the <code>name:</code> field in the SKILL.md content. This is what it will be saved/updated as.</div>
       </div>
       <div class="field">
         <label>SKILL.md content</label>
-        <textarea id="uploadContent" placeholder="name: generate_csv&#10;description: Generates a CSV file from JSON data&#10;language: python&#10;timeout_seconds: 30&#10;input_schema:&#10;  type: object&#10;  properties:&#10;    data:&#10;      type: array&#10;  required: [data]&#10;implementation: |&#10;  import sys, json, csv, io&#10;  params = json.load(open(sys.argv[1]))&#10;  ..."></textarea>
+        <textarea id="uploadContent" oninput="deriveNameFromContent()" placeholder="name: generate_csv&#10;description: Generates a CSV file from JSON data&#10;language: python&#10;timeout_seconds: 30&#10;input_schema:&#10;  type: object&#10;  properties:&#10;    data:&#10;      type: array&#10;  required: [data]&#10;implementation: |&#10;  import sys, json, csv, io&#10;  params = json.load(open(sys.argv[1]))&#10;  ..."></textarea>
       </div>
-      <button class="btn btn-primary" onclick="uploadSkill()">Upload skill</button>
+      <button class="btn btn-primary" id="uploadBtn" onclick="uploadSkill()">Upload skill</button>
     </div>
   </section>
 
@@ -301,6 +331,7 @@
         <td><span class="lang-tag">${esc((s.language || '').toUpperCase())}</span></td>
         <td><span class="skill-desc">${esc(s.description || '')}</span></td>
         <td>
+          <button class="btn-edit" onclick="editSkill('${esc(s.name)}')">Edit</button>
           <button class="btn-delete" onclick="deleteSkill('${esc(s.name)}')">Delete</button>
         </td>
       </tr>`).join('');
@@ -310,29 +341,81 @@
     return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
 
-  // ── upload ─────────────────────────────────────────────────────────────────
+  // ── upload / edit ────────────────────────────────────────────────────────────
+  let editingName = null;
+
+  // The name field is display-only — always derived from the content's own
+  // top-level `name:` field, so the two can never drift apart in this UI.
+  function extractNameFromContent(content) {
+    const m = content.match(/^\s*name:\s*["']?([^"'\r\n#]+?)["']?\s*(#.*)?$/m);
+    return m ? m[1].trim() : null;
+  }
+
+  function deriveNameFromContent() {
+    const content    = document.getElementById('uploadContent').value;
+    const nameInput  = document.getElementById('uploadName');
+    const detected   = extractNameFromContent(content);
+    nameInput.value  = detected || '';
+    nameInput.classList.toggle('name-missing', content.trim().length > 0 && !detected);
+  }
+
   async function uploadSkill() {
-    const name    = document.getElementById('uploadName').value.trim();
     const content = document.getElementById('uploadContent').value.trim();
-    if (!name)    { toast('Enter a skill name', 'err'); return; }
     if (!content) { toast('Paste SKILL.md content', 'err'); return; }
+
+    const name = extractNameFromContent(content);
+    if (!name) { toast("SKILL.md content must have a top-level 'name:' field", 'err'); return; }
+
+    if (editingName && name !== editingName) {
+      const proceed = confirm(
+        `This content now declares name "${name}", not "${editingName}".\n\n` +
+        `Saving will create/overwrite "${name}" as a SEPARATE skill and leave "${editingName}" untouched.\n\n` +
+        `Continue?`);
+      if (!proceed) return;
+    }
 
     const r = await api('POST', '/agent/skills/upload', { name, content });
     if (r.ok) {
-      toast(`Skill "${name}" uploaded`);
-      document.getElementById('uploadName').value    = '';
-      document.getElementById('uploadContent').value = '';
+      toast(editingName ? `Skill "${name}" updated` : `Skill "${name}" uploaded`);
+      cancelEdit();
       loadSkills();
     } else {
       toast(r.data.error || 'Upload failed', 'err');
     }
   }
 
+  async function editSkill(name) {
+    const r = await api('GET', `/agent/skills/${encodeURIComponent(name)}`);
+    if (!r.ok) { toast(r.data.error || 'Could not load skill', 'err'); return; }
+
+    editingName = name;
+    document.getElementById('uploadContent').value = r.data.content;
+    deriveNameFromContent();
+    document.getElementById('uploadHeading').textContent = 'Edit Skill';
+    document.getElementById('uploadBtn').textContent     = 'Save changes';
+    document.getElementById('editBannerName').textContent = name;
+    document.getElementById('editBanner').classList.add('show');
+    document.getElementById('uploadContent').scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+
+  function cancelEdit() {
+    editingName = null;
+    document.getElementById('uploadContent').value = '';
+    deriveNameFromContent();
+    document.getElementById('uploadHeading').textContent = 'Upload Skill';
+    document.getElementById('uploadBtn').textContent     = 'Upload skill';
+    document.getElementById('editBanner').classList.remove('show');
+  }
+
   // ── delete ─────────────────────────────────────────────────────────────────
   async function deleteSkill(name) {
     if (!confirm(`Delete skill "${name}"?`)) return;
     const r = await api('DELETE', `/agent/skills/${encodeURIComponent(name)}`);
-    if (r.ok) { toast(`Skill "${name}" deleted`); loadSkills(); }
+    if (r.ok) {
+      toast(`Skill "${name}" deleted`);
+      if (editingName === name) cancelEdit();
+      loadSkills();
+    }
     else toast(r.data.error || 'Delete failed', 'err');
   }
 

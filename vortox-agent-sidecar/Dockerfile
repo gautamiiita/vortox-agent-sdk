@@ -3,11 +3,15 @@ FROM maven:3.9-eclipse-temurin-17-alpine AS build
 
 WORKDIR /app
 
-# Copy POMs first so Maven can validate the multi-module reactor
+# Copy POMs first so Maven can validate the multi-module reactor — every module listed in the
+# parent pom.xml's <modules> must have its pom.xml present here, even ones (like
+# vortox-agent-spring-boot-starter and vortox-agent-classic-mvc-proxy) this image never builds,
+# or reactor resolution fails for every mvn invocation below, not just a full build.
 COPY pom.xml .
 COPY vortox-agent-core/pom.xml ./vortox-agent-core/pom.xml
 COPY vortox-agent-sidecar/pom.xml ./vortox-agent-sidecar/pom.xml
 COPY vortox-agent-spring-boot-starter/pom.xml ./vortox-agent-spring-boot-starter/pom.xml
+COPY vortox-agent-classic-mvc-proxy/pom.xml ./vortox-agent-classic-mvc-proxy/pom.xml
 
 # Install parent POM into local .m2 (non-recursive — no module sources needed)
 RUN mvn -N install -DskipTests

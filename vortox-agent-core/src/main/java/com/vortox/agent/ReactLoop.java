@@ -350,7 +350,7 @@ public final class ReactLoop {
                 }
 
                 toolCalls.add(new AgentResult.ToolCall(
-                        toolUse.getToolName(), toolUse.getToolInput(),
+                        toolUse.getToolName(), toolUse.getToolInput(), outcome.result(),
                         outcome.success(), outcome.durationMs()));
 
                 Map<String, Object> tr = new HashMap<>();

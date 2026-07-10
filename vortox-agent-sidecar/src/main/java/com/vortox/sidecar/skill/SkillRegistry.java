@@ -65,7 +65,8 @@ public class SkillRegistry {
             }
 
             skills.put(p.name(), new SkillDefinition(
-                    p.name(), p.description(), p.language(), p.timeoutSeconds(), p.inputSchema(), p.implementation(), content));
+                    p.name(), p.description(), p.language(), p.timeoutSeconds(), p.inputSchema(),
+                    p.implementation(), content, p.producesArtifact()));
             log.debug("Loaded skill: {}", p.name());
         } catch (Exception e) {
             log.error("Failed to load skill from {}: {}", skillFile, e.getMessage());
@@ -74,7 +75,8 @@ public class SkillRegistry {
 
     /** Parsed-but-not-yet-registered view of a SKILL.md — lets save() validate before writing anything. */
     private record ParsedSkill(String name, String description, String language, int timeoutSeconds,
-                                Map<String, Object> inputSchema, String implementation) {}
+                                Map<String, Object> inputSchema, String implementation,
+                                SkillDefinition.ProducesArtifact producesArtifact) {}
 
     @SuppressWarnings("unchecked")
     private ParsedSkill parse(String content) {
@@ -88,8 +90,22 @@ public class SkillRegistry {
         int    timeout        = ((Number) parsed.getOrDefault("timeout_seconds", 60)).intValue();
         Map<String, Object> schema = (Map<String, Object>) parsed.get("input_schema");
         String implementation = (String) parsed.get("implementation");
+        SkillDefinition.ProducesArtifact producesArtifact = parseProducesArtifact(
+                (Map<String, Object>) parsed.get("produces_artifact"));
 
-        return new ParsedSkill(name, description, language, timeout, schema, implementation);
+        return new ParsedSkill(name, description, language, timeout, schema, implementation, producesArtifact);
+    }
+
+    /** Reads the optional {@code produces_artifact: {path_field, source}} declaration off a SKILL.md. */
+    private static SkillDefinition.ProducesArtifact parseProducesArtifact(Map<String, Object> raw) {
+        if (raw == null) return null;
+        Object pathField = raw.get("path_field");
+        if (!(pathField instanceof String pf) || pf.isBlank()) {
+            log.warn("Skill declares 'produces_artifact' without a 'path_field' — ignoring it");
+            return null;
+        }
+        String source = raw.get("source") instanceof String s && !s.isBlank() ? s : "output";
+        return new SkillDefinition.ProducesArtifact(pf, source);
     }
 
     public Optional<SkillDefinition> find(String name) {
@@ -137,7 +153,8 @@ public class SkillRegistry {
         Files.writeString(skillDir.resolve("SKILL.md"), content);
 
         SkillDefinition saved = new SkillDefinition(
-                p.name(), p.description(), p.language(), p.timeoutSeconds(), p.inputSchema(), p.implementation(), content);
+                p.name(), p.description(), p.language(), p.timeoutSeconds(), p.inputSchema(),
+                p.implementation(), content, p.producesArtifact());
         skills.put(p.name(), saved);
         log.info("Saved skill: {}", name);
         return saved;

@@ -9,13 +9,34 @@
   var PAGE_API_DESCRIPTION = cfg.pageApiDescription   || '';
   var getContext           = typeof cfg.context === 'function' ? cfg.context : function () { return {}; };
 
-  // Chat runs asynchronously: POST starts the run and returns a runId immediately,
-  // then we poll GET {ENDPOINT}/{runId} until it's done. No single HTTP call needs to
-  // stay open for the whole agent run, so REQUEST_TIMEOUT_MS can stay short — MAX_WAIT_MS
-  // is the real, generous budget for how long we'll wait overall before giving up.
+  // Chat normally runs asynchronously against the sidecar directly: POST starts the run and
+  // returns a runId immediately, then we poll GET {ENDPOINT}/{runId} until it's done. No single
+  // HTTP call needs to stay open for the whole agent run, so REQUEST_TIMEOUT_MS can stay short —
+  // MAX_WAIT_MS is the real, generous budget for how long we'll wait overall before giving up.
+  //
+  // ENDPOINT may instead be a same-origin proxy in front of the sidecar (e.g. a server-side
+  // controller that injects auth/context and strips client-supplied LLM overrides). Such a proxy
+  // may choose to absorb the polling itself and return the finished {reply, artifacts} directly
+  // from the POST instead of {runId, status} — see the `data.runId` check below, which handles
+  // both shapes. If a proxy does this, its own wait budget can exceed REQUEST_TIMEOUT_MS's
+  // default, so the host page should raise cfg.requestTimeoutMs to match (e.g. slightly above
+  // the proxy's own timeout) rather than this file being changed per deployment.
   var REQUEST_TIMEOUT_MS = cfg.requestTimeoutMs || 20000;            // 20s per HTTP call
   var POLL_INTERVAL_MS   = cfg.pollIntervalMs   || 2000;             // poll every 2s
   var MAX_WAIT_MS        = cfg.maxWaitMs        || 20 * 60 * 1000;   // 20 minutes overall
+
+  // Poll/stream URLs default to path-append (ENDPOINT + '/' + runId), which fits a REST-ish
+  // async proxy (e.g. the sidecar's own /agent/chat/{runId}). A same-origin proxy built on a
+  // routing scheme that can't add path segments (e.g. a classic Spring MVC bean-name-per-URL
+  // app, which can only branch on query parameters) can override these to build query-param
+  // URLs instead — e.g. cfg.buildPollUrl = function (runId) { return '/agentChat.htm?runId=' +
+  // encodeURIComponent(runId); }. Every existing consumer that doesn't set these is unaffected.
+  var buildPollUrl = typeof cfg.buildPollUrl === 'function' ? cfg.buildPollUrl : function (runId) {
+    return ENDPOINT + '/' + encodeURIComponent(runId);
+  };
+  var buildStreamUrl = typeof cfg.buildStreamUrl === 'function' ? cfg.buildStreamUrl : function (runId) {
+    return ENDPOINT + '/' + encodeURIComponent(runId) + '/stream';
+  };
 
   var _pageCtx   = {};
   var history    = [];
@@ -112,12 +133,15 @@
     '.vx-msg-agent em{color:#475569;font-style:italic;}',
 
     /* Thinking indicator */
-    '.vx-thinking{align-self:flex-start;display:flex;gap:5px;align-items:center;',
+    '.vx-thinking{align-self:flex-start;display:flex;gap:8px;align-items:center;',
     'padding:10px 14px;background:#f1f5f9;border-radius:4px 14px 14px 14px;}',
-    '.vx-dot{width:6px;height:6px;border-radius:50%;background:#94a3b8;',
+    '.vx-dot{width:6px;height:6px;border-radius:50%;background:#94a3b8;flex-shrink:0;',
     'animation:vx-bounce 1.2s ease-in-out infinite;}',
     '.vx-dot:nth-child(2){animation-delay:.18s}.vx-dot:nth-child(3){animation-delay:.36s}',
     '@keyframes vx-bounce{0%,80%,100%{transform:translateY(0)}40%{transform:translateY(-5px)}}',
+    /* Live progress label shown next to the bouncing dots while SSE events arrive */
+    '.vx-thinking-label{color:#64748b;font-family:' + VX_FONT + ';font-size:12px;',
+    'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:340px;}',
 
     /* Suggestion chips */
     '#vx-suggestions{padding:0 14px 10px;display:flex;flex-wrap:wrap;gap:6px;flex-shrink:0;}',
@@ -484,6 +508,20 @@
     if (el) el.parentNode.removeChild(el);
   }
 
+  /** Updates (or creates) the live progress label next to the bouncing dots. No-op if the
+   *  thinking bubble isn't showing (e.g. it already got hidden by the time a late event arrives). */
+  function updateThinking(text) {
+    var el = document.getElementById('vx-thinking');
+    if (!el) return;
+    var label = el.querySelector('.vx-thinking-label');
+    if (!label) {
+      label = document.createElement('div');
+      label.className = 'vx-thinking-label';
+      el.appendChild(label);
+    }
+    label.textContent = text;
+  }
+
   // ── Send ──────────────────────────────────────────────────────────────────────
 
   function sendMessage(text) {
@@ -518,11 +556,109 @@
 
     postJson(ENDPOINT, payload, function (err, data) {
       if (err) { finishWithError(err); return; }
-      if (!data || !data.runId) {
-        finishWithError((data && data.error) || 'Could not start the agent.');
+      if (!data) { finishWithError('Could not start the agent.'); return; }
+      if (data.runId) {
+        var startedAt = Date.now();
+        // Prefer live progress over blind polling when the browser supports it. Any failure to
+        // establish or maintain the stream falls back to the exact same pollRun() used when
+        // EventSource isn't available at all — polling remains the source of truth either way.
+        if (typeof window.EventSource === 'function') {
+          openStream(data.runId, startedAt);
+        } else {
+          pollRun(data.runId, startedAt);
+        }
         return;
       }
-      pollRun(data.runId, Date.now());
+      // A same-origin proxy (e.g. a server-side controller sitting between this widget and the
+      // sidecar) may absorb the polling itself and hand back the finished {reply, artifacts} in
+      // this one response instead of {runId, status}. Render immediately in that case — there's
+      // nothing to poll. (If the proxy's own wait budget can exceed REQUEST_TIMEOUT_MS, the host
+      // page should raise cfg.requestTimeoutMs accordingly.)
+      if (data.reply !== undefined || data.artifacts !== undefined) {
+        finishWithReply(data.reply || 'No response from agent.', data.artifacts);
+        return;
+      }
+      finishWithError(data.error || 'Could not start the agent.');
+    });
+  }
+
+  // ── Live progress via SSE, with polling fallback ─────────────────────────────────
+  // Opens GET {ENDPOINT}/{runId}/stream and renders iteration/tool events into the
+  // thinking bubble in place. Falls back to pollRun() — reusing the same startedAt so
+  // MAX_WAIT_MS is one continuous ceiling regardless of which transport ends up serving
+  // the request — if: EventSource throws on construction, a transport-level error fires
+  // before a 'done' event is seen, or MAX_WAIT_MS elapses with no 'done' yet.
+
+  function openStream(runId, startedAt) {
+    var es;
+    try {
+      es = new EventSource(buildStreamUrl(runId));
+    } catch (e) {
+      pollRun(runId, startedAt);
+      return;
+    }
+
+    var settled = false;
+
+    var watchdog = setTimeout(function () {
+      if (settled) return;
+      fallBackToPoll();
+    }, Math.max(0, startedAt + MAX_WAIT_MS - Date.now()));
+
+    function fallBackToPoll() {
+      if (settled) return;
+      settled = true;
+      clearTimeout(watchdog);
+      try { es.close(); } catch (e) { /* ignore */ }
+      pollRun(runId, startedAt);
+    }
+
+    es.addEventListener('iteration', function (ev) {
+      try {
+        var d = JSON.parse(ev.data);
+        updateThinking('Step ' + d.iteration + ' of ' + d.maxIterations + '…');
+      } catch (e) { /* ignore malformed event */ }
+    });
+
+    es.addEventListener('tool_call', function (ev) {
+      try {
+        var d = JSON.parse(ev.data);
+        updateThinking('Running ' + d.tool + '…');
+      } catch (e) { /* ignore malformed event */ }
+    });
+
+    es.addEventListener('tool_result', function (ev) {
+      try {
+        var d = JSON.parse(ev.data);
+        updateThinking(d.tool + (d.success ? ' done' : ' failed') + ' — continuing…');
+      } catch (e) { /* ignore malformed event */ }
+    });
+
+    // A server-pushed application-level error (has ev.data, e.g. a tool timeout) is just
+    // informational — the run is still going, so leave the stream open. Only the browser's
+    // own transport-level error (no ev.data at all) means the connection itself broke.
+    es.addEventListener('error', function (ev) {
+      if (ev && ev.data) return;
+      fallBackToPoll();
+    });
+
+    es.addEventListener('done', function () {
+      if (settled) return;
+      settled = true;
+      clearTimeout(watchdog);
+      try { es.close(); } catch (e) { /* ignore */ }
+      // One authoritative GET for the final result — keeps the existing poll endpoint as the
+      // single source of truth for {reply, artifacts} instead of duplicating that (potentially
+      // large, base64-artifact-bearing) payload through the SSE channel too.
+      getJson(buildPollUrl(runId), function (err, data) {
+        if (err) { finishWithError('Lost track of the agent run.'); return; }
+        if (!data || data.status === 'NOT_FOUND') {
+          finishWithError('Lost track of the agent run (the sidecar may have restarted). Please try again.');
+          return;
+        }
+        if (data.status === 'ERROR') { finishWithError(data.error || 'The agent hit an error.'); return; }
+        finishWithReply(data.reply || 'No response from agent.', data.artifacts);
+      });
     });
   }
 
@@ -533,7 +669,7 @@
       finishWithError('The agent took too long to respond. Try a simpler query.');
       return;
     }
-    getJson(ENDPOINT + '/' + encodeURIComponent(runId), function (err, data) {
+    getJson(buildPollUrl(runId), function (err, data) {
       if (err) {
         // Transient network hiccup while polling — keep trying until MAX_WAIT_MS.
         setTimeout(function () { pollRun(runId, startedAt); }, POLL_INTERVAL_MS);

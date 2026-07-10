@@ -1,5 +1,6 @@
 package com.vortox.sidecar.service;
 
+import com.vortox.agent.spi.ActivityListener;
 import com.vortox.sidecar.api.AgentRunRequest;
 import com.vortox.sidecar.api.AgentRunResponse;
 import jakarta.annotation.PreDestroy;
@@ -51,9 +52,11 @@ public class ChatRunService {
     });
 
     private final AgentService agentService;
+    private final AgentStreamRegistry streamRegistry;
 
-    public ChatRunService(AgentService agentService) {
-        this.agentService = agentService;
+    public ChatRunService(AgentService agentService, AgentStreamRegistry streamRegistry) {
+        this.agentService   = agentService;
+        this.streamRegistry = streamRegistry;
     }
 
     /** Starts the run in the background and returns immediately with a runId to poll. */
@@ -61,9 +64,13 @@ public class ChatRunService {
         String runId = UUID.randomUUID().toString();
         runs.put(runId, new RunState(Status.RUNNING, null, null, null, System.currentTimeMillis()));
 
+        // Must be created before the run starts so no early progress event is dropped —
+        // the queue buffers events regardless of whether a stream consumer has connected yet.
+        ActivityListener listener = streamRegistry.listenerFor(runId);
+
         executor.submit(() -> {
             try {
-                AgentRunResponse response = agentService.run(runRequest);
+                AgentRunResponse response = agentService.run(runRequest, runId, listener);
                 String reply = (response.result() != null && !response.result().isBlank())
                         ? response.result()
                         : "I couldn't generate a response. Please try again.";
@@ -77,6 +84,10 @@ public class ChatRunService {
                 log.error("Chat run {} failed: {}", runId, e.getMessage(), e);
                 runs.put(runId, new RunState(Status.ERROR, null, null,
                         "Internal error: " + e.getMessage(), System.currentTimeMillis()));
+            } finally {
+                // Always releases a blocked stream reader, including when agentService.run(...)
+                // throws before ReactLoop ever reaches a callback that would signal completion.
+                streamRegistry.complete(runId);
             }
         });
 

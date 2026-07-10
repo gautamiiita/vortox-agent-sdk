@@ -227,8 +227,9 @@ public final class AnthropicClient implements LlmClient {
                 "type", "text", "text", sysText,
                 "cache_control", Map.of("type", "ephemeral"))));
 
-        b.put("messages", (oauth && !blank(systemPrompt))
-                ? oauthMessages(messages, systemPrompt) : messages);
+        List<Map<String, Object>> effectiveMessages = (oauth && !blank(systemPrompt))
+                ? oauthMessages(messages, systemPrompt) : messages;
+        b.put("messages", withCacheBreakpoint(effectiveMessages));
 
         if (tools != null && !tools.isEmpty()) {
             List<Map<String, Object>> cached = new ArrayList<>(tools);
@@ -288,6 +289,52 @@ public final class AnthropicClient implements LlmClient {
             modified.put("content", blocks);
         }
         result.set(0, modified);
+        return result;
+    }
+
+    /**
+     * Marks the last content block of the last message with an ephemeral cache breakpoint.
+     * <p>
+     * A ReAct loop only ever appends to {@code messages} — each iteration resends the entire
+     * growing history. Without this, only the system prompt and tool definitions (fixed-size)
+     * are cached, so a 20-iteration run pays full fresh-input price for the accumulated
+     * conversation on every single call. Marking the tail of the current messages array means
+     * the *next* call — which extends from here — gets a cache hit for everything up to this
+     * point, turning most of a long run's history cost into ~90%-cheaper cache reads instead of
+     * fresh input tokens. (Anthropic allows up to 4 cache_control breakpoints per request; this
+     * is the 3rd, alongside the system prompt and last tool definition.)
+     */
+    /** Package-visible for tests. */
+    @SuppressWarnings("unchecked")
+    static List<Map<String, Object>> withCacheBreakpoint(List<Map<String, Object>> messages) {
+        if (messages == null || messages.isEmpty()) return messages;
+
+        int lastIdx = messages.size() - 1;
+        Map<String, Object> lastMessage = new LinkedHashMap<>(messages.get(lastIdx));
+        Object content = lastMessage.get("content");
+
+        List<Map<String, Object>> blocks;
+        if (content instanceof String s) {
+            blocks = new ArrayList<>();
+            blocks.add(new LinkedHashMap<>(Map.of("type", "text", "text", s)));
+        } else if (content instanceof List<?> list) {
+            blocks = new ArrayList<>();
+            for (Object item : list) {
+                blocks.add(item instanceof Map<?, ?> m
+                        ? new LinkedHashMap<>((Map<String, Object>) m)
+                        : new LinkedHashMap<>());
+            }
+        } else {
+            return messages; // unknown content shape — leave untouched rather than risk a bad request
+        }
+        if (blocks.isEmpty()) return messages;
+
+        Map<String, Object> lastBlock = blocks.get(blocks.size() - 1);
+        lastBlock.put("cache_control", Map.of("type", "ephemeral"));
+        lastMessage.put("content", blocks);
+
+        List<Map<String, Object>> result = new ArrayList<>(messages);
+        result.set(lastIdx, lastMessage);
         return result;
     }
 

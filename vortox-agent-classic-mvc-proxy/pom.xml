@@ -1,0 +1,122 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.vortox</groupId>
+        <artifactId>vortox-agent-sdk</artifactId>
+        <version>1.0.0</version>
+    </parent>
+
+    <artifactId>vortox-agent-classic-mvc-proxy</artifactId>
+    <packaging>jar</packaging>
+    <name>Vortox Agent Classic MVC Proxy</name>
+    <description>
+        Drop-in same-origin chat proxy for pre-Boot, classic Spring MVC applications (javax.servlet,
+        XML bean wiring — e.g. Spring Framework 4.x). Register VortoxChatProxyController as a single
+        bean pointing at a running vortox-agent-sidecar and the browser widget gets the full
+        start/poll/stream contract (including live SSE progress) without hand-rolling a proxy.
+
+        Deliberately self-contained — does NOT depend on vortox-agent-core, since that module is
+        compiled to Java 17 bytecode (records, etc.) which cannot be loaded by the older JVMs this
+        module targets. Its own copies of the small relay/context types are Java 8 source.
+    </description>
+
+    <properties>
+        <!-- This module's own compiled classes must run on whatever old JVM the integrating legacy
+             app uses — do not assume Java 17 like the rest of the reactor. Test sources are still
+             compiled/run at the reactor's normal level (see testRelease below); only the shipped
+             main classes are constrained to Java 8 bytecode. -->
+        <maven.compiler.release>8</maven.compiler.release>
+    </properties>
+
+    <dependencies>
+        <!-- Classic Spring MVC — provided: the integrating app already has this on its classpath
+             (compiled here against TNAM's confirmed version so signatures line up exactly). -->
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-webmvc</artifactId>
+            <version>4.3.26.RELEASE</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- javax.servlet — provided: supplied by the container/app, never bundled. -->
+        <dependency>
+            <groupId>javax.servlet</groupId>
+            <artifactId>javax.servlet-api</artifactId>
+            <version>3.1.0</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- Apache HttpClient 4.x — provided: matches what TNAM's existing hand-rolled proxy
+             controller already depends on; let the host app's own resolved version win. -->
+        <dependency>
+            <groupId>org.apache.httpcomponents</groupId>
+            <artifactId>httpclient</artifactId>
+            <version>4.5.13</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- JSON — provided: TNAM's own AgentChatController already uses Jackson directly. -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <scope>provided</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- Test only — the reactor's normal JUnit 5 / Java 17 test tooling; see testRelease below. -->
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-test</artifactId>
+            <version>4.3.26.RELEASE</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-core</artifactId>
+            <version>5.11.0</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.assertj</groupId>
+            <artifactId>assertj-core</artifactId>
+            <version>3.25.3</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-simple</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <!-- Overrides the parent's hardcoded <source>17</source>/<target>17</target> —
+                         main sources must produce Java 8 bytecode; test sources can use the
+                         reactor's normal modern tooling since tests never run inside the
+                         integrating app's own (possibly old) JVM. -->
+                    <release>8</release>
+                    <testRelease>17</testRelease>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>

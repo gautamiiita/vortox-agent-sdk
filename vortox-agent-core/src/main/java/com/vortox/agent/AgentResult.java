@@ -51,8 +51,8 @@ public record AgentResult(
         SUCCESS, PARTIAL, CLARIFICATION_NEEDED, APPROVAL_NEEDED, HANDOFF, ERROR
     }
 
-    /** Immutable record of one tool invocation. */
-    public record ToolCall(String toolName, Map<String, Object> input, boolean success, long durationMs) {}
+    /** Immutable record of one tool invocation. {@code output} is the tool's raw (untruncated) result string. */
+    public record ToolCall(String toolName, Map<String, Object> input, String output, boolean success, long durationMs) {}
 
     // ── Factory helpers ───────────────────────────────────────────────────────
 

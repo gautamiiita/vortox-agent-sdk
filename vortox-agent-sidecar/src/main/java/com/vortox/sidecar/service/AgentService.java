@@ -8,6 +8,7 @@ import com.vortox.agent.ReactLoop;
 import com.vortox.agent.gateway.GatewayMemoryStore;
 import com.vortox.agent.gateway.GatewayToolExecutor;
 import com.vortox.agent.gateway.VortoxGateway;
+import com.vortox.agent.spi.ActivityListener;
 import com.vortox.agent.spi.ToolExecutor;
 import com.vortox.sidecar.api.AgentRunRequest;
 import com.vortox.sidecar.api.AgentRunResponse;
@@ -26,16 +27,12 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Base64;
 import java.util.List;
-import java.util.Set;
 import java.util.UUID;
 
 @Service
 public class AgentService {
 
     private static final Logger log = LoggerFactory.getLogger(AgentService.class);
-
-    /** Skill names whose successful calls produce a file worth offering as a download. */
-    private static final Set<String> FILE_PRODUCING_SKILLS = Set.of("file_write");
 
     /** Refuse to inline anything bigger than this into a JSON response. */
     private static final long MAX_ARTIFACT_BYTES = 8L * 1024 * 1024;
@@ -79,8 +76,16 @@ public class AgentService {
     }
 
     public AgentRunResponse run(AgentRunRequest request) {
-        String runId = UUID.randomUUID().toString();
+        return run(request, UUID.randomUUID().toString(), ActivityListener.NOOP);
+    }
 
+    /**
+     * Runs the agent under a caller-supplied runId with an {@link ActivityListener} wired in —
+     * used by {@link ChatRunService} so its runId (already returned to the widget/poller) is the
+     * exact same id {@link com.vortox.agent.ReactLoop} fires progress events under, letting a
+     * stream registry keyed by that runId receive them.
+     */
+    public AgentRunResponse run(AgentRunRequest request, String runId, ActivityListener listener) {
         // Agent config from vortox (linked via SDK key) provides defaults.
         java.util.Map<String, Object> agentConfig = anthropicKeyRefreshService != null
                 ? anthropicKeyRefreshService.getAgentConfig() : null;
@@ -95,6 +100,14 @@ public class AgentService {
         String systemPrompt = firstNonBlank(request.systemPrompt(),
                 agentConfig != null ? (String) agentConfig.get("systemPrompt") : null,
                 "You are an autonomous AI agent. Use the available skills to complete the task.");
+
+        // Explicit request value wins; otherwise defer to the linked agent's own cap (set from
+        // Vortox, so it's controllable centrally per agent); otherwise a generous sidecar default.
+        Integer maxIterations = request.maxIterations();
+        if (maxIterations == null && agentConfig != null && agentConfig.get("maxIterations") instanceof Number n) {
+            maxIterations = n.intValue();
+        }
+        if (maxIterations == null) maxIterations = 75;
 
         boolean isLocalLlm = "local".equalsIgnoreCase(llmProvider);
         String apiKey;
@@ -143,10 +156,11 @@ public class AgentService {
         AgentConfig.Builder configBuilder = AgentConfig.builder()
                 .apiKey(apiKey)
                 .model(model)
-                .maxIterations(request.maxIterations() != null ? request.maxIterations() : 100)
+                .maxIterations(maxIterations)
                 .systemPrompt(systemPrompt)
                 .tools(toolDefs)
-                .toolExecutor(activeExecutor);
+                .toolExecutor(activeExecutor)
+                .activityListener(listener);
 
         LlmClient llmClient = resolveLlmClient(llmProvider, llmBaseUrl);
         if (llmClient != null) {
@@ -183,18 +197,26 @@ public class AgentService {
     }
 
     /**
-     * Reads back the bytes of any file a {@link #FILE_PRODUCING_SKILLS} call wrote, using the
-     * path already captured in the tool call's input — no extra skill/LLM round trip needed.
-     * The sidecar's local disk is ephemeral and not reachable from outside this process, so the
-     * bytes are inlined here and the file is deleted immediately after being read.
+     * Reads back the bytes of any file written by a skill that declares {@code produces_artifact}
+     * in its SKILL.md, using the path it reports (either in its input or its output, per that
+     * declaration) — no extra skill/LLM round trip needed, and no sidecar code change needed to
+     * support a new file-producing skill. The sidecar's local disk is ephemeral and not reachable
+     * from outside this process, so the bytes are inlined here and the file is deleted immediately
+     * after being read.
      */
     private List<AgentRunResponse.ArtifactDto> extractArtifacts(List<AgentResult.ToolCall> toolCalls, String runId) {
         List<AgentRunResponse.ArtifactDto> artifacts = new java.util.ArrayList<>();
         for (AgentResult.ToolCall tc : toolCalls) {
-            if (!tc.success() || !FILE_PRODUCING_SKILLS.contains(tc.toolName())) continue;
+            if (!tc.success()) continue;
+            SkillDefinition.ProducesArtifact declaration = skillRegistry.find(tc.toolName())
+                    .map(SkillDefinition::producesArtifact)
+                    .orElse(null);
+            if (declaration == null) continue;
 
-            Object rawPath = tc.input() != null ? tc.input().get("path") : null;
-            if (!(rawPath instanceof String pathStr) || pathStr.isBlank()) continue;
+            String pathStr = declaration.isInputSourced()
+                    ? asString(tc.input() != null ? tc.input().get(declaration.pathField()) : null)
+                    : jsonStringField(tc.output(), declaration.pathField());
+            if (pathStr == null || pathStr.isBlank()) continue;
 
             try {
                 Path path = Path.of(pathStr);
@@ -216,10 +238,25 @@ public class AgentService {
 
                 Files.deleteIfExists(path);
             } catch (Exception e) {
-                log.warn("Run {}: failed to read artifact at '{}': {}", runId, rawPath, e.getMessage());
+                log.warn("Run {}: failed to read artifact at '{}': {}", runId, pathStr, e.getMessage());
             }
         }
         return artifacts;
+    }
+
+    private static String asString(Object v) {
+        return v instanceof String s ? s : null;
+    }
+
+    /** Parses {@code json} as an object and returns the string value at {@code key}, or null on any failure. */
+    private String jsonStringField(String json, String key) {
+        if (json == null || json.isBlank()) return null;
+        try {
+            java.util.Map<?, ?> parsed = objectMapper.readValue(json, java.util.Map.class);
+            return asString(parsed.get(key));
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     private String resolveApiKey(String requestKey) {

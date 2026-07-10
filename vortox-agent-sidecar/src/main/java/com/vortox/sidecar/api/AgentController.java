@@ -1,19 +1,23 @@
 package com.vortox.sidecar.api;
 
 import com.vortox.sidecar.service.AgentService;
+import com.vortox.sidecar.service.AgentStreamRegistry;
 import com.vortox.sidecar.service.ChatRunService;
 import com.vortox.sidecar.skill.SkillDefinition;
 import com.vortox.sidecar.skill.SkillRegistry;
+import jakarta.servlet.http.HttpServletResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
 
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 
 import java.util.LinkedHashMap;
@@ -30,11 +34,14 @@ public class AgentController {
     private final AgentService agentService;
     private final SkillRegistry skillRegistry;
     private final ChatRunService chatRunService;
+    private final AgentStreamRegistry streamRegistry;
 
-    public AgentController(AgentService agentService, SkillRegistry skillRegistry, ChatRunService chatRunService) {
+    public AgentController(AgentService agentService, SkillRegistry skillRegistry,
+                            ChatRunService chatRunService, AgentStreamRegistry streamRegistry) {
         this.agentService   = agentService;
         this.skillRegistry  = skillRegistry;
         this.chatRunService = chatRunService;
+        this.streamRegistry = streamRegistry;
     }
 
     // ── Skill upload / delete ─────────────────────────────────────────────────
@@ -154,7 +161,7 @@ public class AgentController {
                 null,
                 resolvedSystemPrompt,
                 request.model(),
-                30,
+                75,
                 apiKey,
                 request.llmProvider(),
                 request.llmBaseUrl()
@@ -176,6 +183,66 @@ public class AgentController {
                 .map(ResponseEntity::ok)
                 .orElse(ResponseEntity.status(HttpStatus.NOT_FOUND)
                         .body(Map.of("status", "NOT_FOUND", "error", "Unknown or expired run")));
+    }
+
+    /**
+     * Live progress stream for {@link #chat} — emits {@code iteration}/{@code tool_call}/
+     * {@code tool_result}/{@code error} events as the ReAct loop runs, then a signal-only
+     * {@code done} event. Coexists with {@link #chatStatus}, which remains the source of truth
+     * for the final {reply, artifacts} — the stream consumer is expected to make one follow-up
+     * GET to that endpoint after {@code done} rather than have the final payload duplicated here.
+     * <p>
+     * Mirrors the Vortox backend's {@code PlannerChatController.connectStream} pattern: a 15s
+     * poll loop with a heartbeat comment on idle ticks (keeps proxies/browsers from timing out
+     * on idle), and a brief pause after the terminal event before closing so nginx can flush its
+     * buffer before Tomcat sends the TCP FIN (avoids {@code ERR_INCOMPLETE_CHUNKED_ENCODING}).
+     */
+    @GetMapping(value = "/chat/{runId}/stream", produces = "text/event-stream;charset=UTF-8")
+    public StreamingResponseBody chatStream(@PathVariable String runId, HttpServletResponse response) {
+        response.setContentType("text/event-stream;charset=UTF-8");
+        response.setHeader("Cache-Control", "no-cache");
+        response.setHeader("X-Accel-Buffering", "no");
+
+        if (!streamRegistry.exists(runId)) {
+            return out -> {
+                out.write(("event: error\ndata: {\"message\":\"Unknown or expired run\"}\n\n")
+                        .getBytes(StandardCharsets.UTF_8));
+                out.flush();
+            };
+        }
+
+        return out -> {
+            final byte[] heartbeat = ": heartbeat\n\n".getBytes(StandardCharsets.UTF_8);
+            try {
+                while (true) {
+                    AgentStreamRegistry.Evt evt;
+                    try {
+                        evt = streamRegistry.poll(runId, 15_000);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+
+                    if (evt == null) {
+                        if (!streamRegistry.exists(runId)) break;
+                        out.write(heartbeat);
+                        out.flush();
+                        continue;
+                    }
+                    if (streamRegistry.isDone(evt)) {
+                        out.write("event: done\ndata: {}\n\n".getBytes(StandardCharsets.UTF_8));
+                        out.flush();
+                        try { Thread.sleep(150); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                        break;
+                    }
+                    out.write(("event: " + evt.name() + "\ndata: " + evt.json() + "\n\n")
+                            .getBytes(StandardCharsets.UTF_8));
+                    out.flush();
+                }
+            } finally {
+                streamRegistry.remove(runId);
+            }
+        };
     }
 
     @GetMapping("/skills")

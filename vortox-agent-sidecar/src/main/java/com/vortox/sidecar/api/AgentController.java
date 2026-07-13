@@ -2,14 +2,17 @@ package com.vortox.sidecar.api;
 
 import com.vortox.sidecar.service.AgentService;
 import com.vortox.sidecar.service.AgentStreamRegistry;
+import com.vortox.sidecar.service.AnthropicKeyRefreshService;
 import com.vortox.sidecar.service.ChatRunService;
 import com.vortox.sidecar.skill.SkillDefinition;
 import com.vortox.sidecar.skill.SkillRegistry;
 import jakarta.servlet.http.HttpServletResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.lang.Nullable;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
 
@@ -35,6 +38,14 @@ public class AgentController {
     private final SkillRegistry skillRegistry;
     private final ChatRunService chatRunService;
     private final AgentStreamRegistry streamRegistry;
+
+    /** Optional: present only when vortox.backend.url is configured (i.e. this container is
+     *  linked to a Vortox agent). Used by /agent/link-status to tell the skills UI whether
+     *  uploading here would actually have any effect, or whether skill access is instead
+     *  gated by the linked agent's own availableSkills configured in Vortox. */
+    @Nullable
+    @Autowired(required = false)
+    private AnthropicKeyRefreshService anthropicKeyRefreshService;
 
     public AgentController(AgentService agentService, SkillRegistry skillRegistry,
                             ChatRunService chatRunService, AgentStreamRegistry streamRegistry) {
@@ -257,6 +268,31 @@ public class AgentController {
                 .sorted((a, b) -> a.get("name").toString().compareTo(b.get("name").toString()))
                 .toList();
         return ResponseEntity.ok(list);
+    }
+
+    /**
+     * Tells the bundled skills UI (see {@code static/index.html}) whether this container is
+     * linked to a Vortox agent, and if so, that agent's {@code availableSkills} — the list that
+     * actually gates which loaded skills the LLM gets to see (per {@code AgentService.run()}).
+     * Skills uploaded here are always loaded into the registry regardless of this link, but a
+     * linked agent's own configuration in Vortox — not this container — decides which of them
+     * are actually reachable, so the UI uses this to show "available" vs "loaded, not granted"
+     * and to switch itself to read-only when a link is present.
+     */
+    @GetMapping("/link-status")
+    public ResponseEntity<Map<String, Object>> linkStatus() {
+        Map<String, Object> agentConfig = anthropicKeyRefreshService != null
+                ? anthropicKeyRefreshService.getAgentConfig() : null;
+
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("linked", agentConfig != null);
+        if (agentConfig != null) {
+            body.put("agentId", agentConfig.get("agentId"));
+            body.put("agentName", agentConfig.get("name"));
+            Object availableSkills = agentConfig.get("availableSkills");
+            body.put("availableSkills", availableSkills instanceof List ? availableSkills : List.of());
+        }
+        return ResponseEntity.ok(body);
     }
 
     /** Fetch a single skill's raw SKILL.md content, for editing in a form that re-uses /skills/upload to save. */

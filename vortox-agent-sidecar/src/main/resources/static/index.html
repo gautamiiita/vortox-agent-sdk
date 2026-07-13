@@ -196,6 +196,36 @@
     .toast.show { transform: translateY(0); opacity: 1; }
     .toast.ok   { border-color: #166534; color: #4ade80; }
     .toast.err  { border-color: #7f1d1d; color: #f87171; }
+
+    /* Linked-agent banner + availability badges */
+    .link-banner {
+      display: none;
+      align-items: center;
+      gap: 10px;
+      background: #1e2130;
+      border: 1px solid #3d3a1a;
+      border-radius: 8px;
+      padding: 12px 16px;
+      margin-bottom: 20px;
+      font-size: 13px;
+      color: #d4c88a;
+    }
+    .link-banner.show { display: flex; }
+    .link-banner strong { color: #f2e6a0; }
+    .avail-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 8px;
+      border-radius: 10px;
+      font-size: 11px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+    .avail-badge.yes { background: #052e16; color: #4ade80; border: 1px solid #166534; }
+    .avail-badge.no  { background: #2d2410; color: #d4a94a; border: 1px solid #4a3a12; }
+    .btn-edit:disabled, .btn-delete:disabled { opacity: .35; cursor: not-allowed; }
+    .btn-edit:disabled:hover, .btn-delete:disabled:hover { background: none; }
   </style>
 </head>
 <body>
@@ -210,6 +240,13 @@
 
 <main>
 
+  <div class="link-banner" id="linkBanner">
+    <span>🔒 <strong>Linked to agent "<span id="linkedAgentName"></span>"</strong> in Vortox — the
+    <strong>Available</strong> column below reflects that agent's own skill configuration. Skills
+    are managed there, not uploaded directly to this container, so upload/edit/delete are
+    disabled here.</span>
+  </div>
+
   <!-- Skills list -->
   <section>
     <h2>Loaded Skills (<span id="skillCount">0</span>)</h2>
@@ -219,6 +256,7 @@
           <th>Name</th>
           <th>Language</th>
           <th>Description</th>
+          <th id="availHeader" style="display:none">Available</th>
           <th style="width:80px"></th>
         </tr>
       </thead>
@@ -314,6 +352,37 @@
     } catch { /* ignore */ }
   }
 
+  // ── link status (is this container gated by a Vortox agent's availableSkills?) ──────
+  let linkStatus = { linked: false };
+
+  async function loadLinkStatus() {
+    const r = await api('GET', '/agent/link-status');
+    linkStatus = r.ok ? r.data : { linked: false };
+
+    const banner = document.getElementById('linkBanner');
+    const readOnly = !!linkStatus.linked;
+    banner.classList.toggle('show', readOnly);
+    if (readOnly) {
+      document.getElementById('linkedAgentName').textContent = linkStatus.agentName || linkStatus.agentId || 'unknown';
+    }
+    document.getElementById('availHeader').style.display = readOnly ? '' : 'none';
+
+    // Upload form: disabled entirely when read-only, since anything uploaded here would be
+    // loaded into the registry but not actually reachable unless also granted in Vortox.
+    document.getElementById('uploadContent').disabled = readOnly;
+    document.getElementById('uploadBtn').disabled = readOnly;
+    document.getElementById('uploadBtn').title = readOnly
+      ? 'Read-only: manage this agent\'s skills in Vortox, not here' : '';
+  }
+
+  // A skill is "available" if it's in the linked agent's availableSkills list, OR that list is
+  // empty (documented as "empty = all" in AgentConfigModal.jsx / AgentService.run()).
+  function isAvailable(skillName) {
+    if (!linkStatus.linked) return true; // no gating concept for a standalone (unlinked) sidecar
+    const list = linkStatus.availableSkills || [];
+    return list.length === 0 || list.includes(skillName);
+  }
+
   // ── skills list ─────────────────────────────────────────────────────────────
   async function loadSkills() {
     const r = await api('GET', '/agent/skills');
@@ -321,20 +390,29 @@
     document.getElementById('skillCount').textContent = skills.length;
 
     const tbody = document.getElementById('skillsBody');
+    const colspan = linkStatus.linked ? 5 : 4;
     if (!skills.length) {
-      tbody.innerHTML = '<tr class="empty-row"><td colspan="4">No skills loaded</td></tr>';
+      tbody.innerHTML = `<tr class="empty-row"><td colspan="${colspan}">No skills loaded</td></tr>`;
       return;
     }
-    tbody.innerHTML = skills.map(s => `
+    const readOnly = !!linkStatus.linked;
+    tbody.innerHTML = skills.map(s => {
+      const available = isAvailable(s.name);
+      const availCell = readOnly
+        ? `<td><span class="avail-badge ${available ? 'yes' : 'no'}">${available ? '✓ Available' : '— Not granted'}</span></td>`
+        : '';
+      return `
       <tr>
         <td><span class="skill-name">${esc(s.name)}</span></td>
         <td><span class="lang-tag">${esc((s.language || '').toUpperCase())}</span></td>
         <td><span class="skill-desc">${esc(s.description || '')}</span></td>
+        ${availCell}
         <td>
-          <button class="btn-edit" onclick="editSkill('${esc(s.name)}')">Edit</button>
-          <button class="btn-delete" onclick="deleteSkill('${esc(s.name)}')">Delete</button>
+          <button class="btn-edit" onclick="editSkill('${esc(s.name)}')" ${readOnly ? 'disabled title="Read-only: manage this agent\'s skills in Vortox"' : ''}>Edit</button>
+          <button class="btn-delete" onclick="deleteSkill('${esc(s.name)}')" ${readOnly ? 'disabled title="Read-only: manage this agent\'s skills in Vortox"' : ''}>Delete</button>
         </td>
-      </tr>`).join('');
+      </tr>`;
+    }).join('');
   }
 
   function esc(s) {
@@ -360,6 +438,7 @@
   }
 
   async function uploadSkill() {
+    if (linkStatus.linked) { toast('Read-only: manage this agent\'s skills in Vortox', 'err'); return; }
     const content = document.getElementById('uploadContent').value.trim();
     if (!content) { toast('Paste SKILL.md content', 'err'); return; }
 
@@ -385,6 +464,7 @@
   }
 
   async function editSkill(name) {
+    if (linkStatus.linked) { toast('Read-only: manage this agent\'s skills in Vortox', 'err'); return; }
     const r = await api('GET', `/agent/skills/${encodeURIComponent(name)}`);
     if (!r.ok) { toast(r.data.error || 'Could not load skill', 'err'); return; }
 
@@ -409,6 +489,7 @@
 
   // ── delete ─────────────────────────────────────────────────────────────────
   async function deleteSkill(name) {
+    if (linkStatus.linked) { toast('Read-only: manage this agent\'s skills in Vortox', 'err'); return; }
     if (!confirm(`Delete skill "${name}"?`)) return;
     const r = await api('DELETE', `/agent/skills/${encodeURIComponent(name)}`);
     if (r.ok) {
@@ -471,7 +552,7 @@
 
   // ── init ───────────────────────────────────────────────────────────────────
   checkHealth();
-  loadSkills();
+  loadLinkStatus().then(loadSkills); // link status must resolve first — it drives availability/read-only rendering
   setInterval(checkHealth, 30000);
 </script>
 </body>

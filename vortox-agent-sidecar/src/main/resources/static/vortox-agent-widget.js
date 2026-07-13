@@ -38,10 +38,31 @@
     return ENDPOINT + '/' + encodeURIComponent(runId) + '/stream';
   };
 
-  var _pageCtx   = {};
-  var history    = [];
-  var isOpen     = false;
-  var isThinking = false;
+  // Friendly labels for known skills in the live step trace (see showThinking/addStep below).
+  // Host pages can extend/override via cfg.toolLabels; unknown tool names fall back to a
+  // humanized version of their raw name rather than showing nothing.
+  var DEFAULT_TOOL_LABELS = {
+    file_read: 'Reading file',
+    file_write: 'Writing file',
+    http_request: 'Making HTTP request',
+    oracle_to_studio: 'Querying database',
+    s360_db_guide: 'Reviewing database schema',
+    docker_build_and_run: 'Building & running container',
+    run_sql_query: 'Running SQL query',
+    search_code: 'Searching code'
+  };
+  var TOOL_LABELS = Object.assign({}, DEFAULT_TOOL_LABELS, cfg.toolLabels || {});
+  function humanizeTool(tool) {
+    if (TOOL_LABELS[tool]) return TOOL_LABELS[tool];
+    return String(tool).replace(/_/g, ' ').replace(/\b\w/g, function (c) { return c.toUpperCase(); });
+  }
+
+  var _pageCtx      = {};
+  var history       = [];
+  var isOpen        = false;
+  var isThinking    = false;
+  var steps         = [];   // live step trace for the run currently in flight (see addStep/resolveStep)
+  var runStartedAt  = 0;
 
   // ── Styles ────────────────────────────────────────────────────────────────────
 
@@ -132,16 +153,40 @@
     '.vx-msg-agent strong{color:#0f172a;font-weight:700;}',
     '.vx-msg-agent em{color:#475569;font-style:italic;}',
 
-    /* Thinking indicator */
-    '.vx-thinking{align-self:flex-start;display:flex;gap:8px;align-items:center;',
+    /* Thinking indicator — header (dots + status) plus a live-growing step trace below it */
+    '.vx-thinking{align-self:flex-start;max-width:100%;display:flex;flex-direction:column;gap:6px;',
     'padding:10px 14px;background:#f1f5f9;border-radius:4px 14px 14px 14px;}',
+    '.vx-thinking-header{display:flex;gap:8px;align-items:center;}',
     '.vx-dot{width:6px;height:6px;border-radius:50%;background:#94a3b8;flex-shrink:0;',
     'animation:vx-bounce 1.2s ease-in-out infinite;}',
     '.vx-dot:nth-child(2){animation-delay:.18s}.vx-dot:nth-child(3){animation-delay:.36s}',
     '@keyframes vx-bounce{0%,80%,100%{transform:translateY(0)}40%{transform:translateY(-5px)}}',
-    /* Live progress label shown next to the bouncing dots while SSE events arrive */
+    '@keyframes vx-step-pulse{0%,100%{opacity:1}50%{opacity:.35}}',
     '.vx-thinking-label{color:#64748b;font-family:' + VX_FONT + ';font-size:12px;',
     'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:340px;}',
+
+    /* Live step trace — one row per tool call, appended as SSE events arrive */
+    '.vx-steps{display:flex;flex-direction:column;gap:3px;max-height:160px;overflow-y:auto;}',
+    '.vx-step{display:flex;gap:7px;align-items:center;font-family:' + VX_FONT + ';font-size:12px;',
+    'color:#475569;line-height:1.4;}',
+    '.vx-step-icon{width:12px;flex-shrink:0;text-align:center;font-size:11px;}',
+    '.vx-step-running .vx-step-icon{color:#f59e0b;animation:vx-step-pulse 1.3s ease-in-out infinite;}',
+    '.vx-step-done .vx-step-icon{color:#22c55e;}',
+    '.vx-step-failed .vx-step-icon{color:#ef4444;}',
+    '.vx-step-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
+
+    /* Collapsed step summary — rendered above the final reply once the run completes;
+       click to expand/collapse the full trace (Claude Desktop's "Thought for Xs" pattern) */
+    '.vx-summary{align-self:flex-start;display:inline-flex;align-items:center;gap:6px;',
+    'padding:5px 10px;background:#f8faff;border:1px solid #e2e8f0;border-radius:20px;cursor:pointer;',
+    'color:#64748b;font-family:' + VX_FONT + ';font-size:11px;font-weight:600;transition:background .15s;}',
+    '.vx-summary:hover{background:#eff6ff;}',
+    '.vx-summary-chevron{display:inline-block;transition:transform .15s;font-size:9px;}',
+    '.vx-summary.vx-summary-open .vx-summary-chevron{transform:rotate(90deg);}',
+    '.vx-summary-detail{display:none;align-self:flex-start;max-width:100%;background:#f8faff;',
+    'border:1px solid #e2e8f0;border-radius:10px;padding:8px 12px;margin:4px 0 0;}',
+    '.vx-summary-detail.vx-summary-detail-open{display:flex;flex-direction:column;gap:3px;}',
+    '.vx-summary-wrap{display:flex;flex-direction:column;align-self:flex-start;max-width:100%;}',
 
     /* Suggestion chips */
     '#vx-suggestions{padding:0 14px 10px;display:flex;flex-wrap:wrap;gap:6px;flex-shrink:0;}',
@@ -495,10 +540,16 @@
   }
 
   function showThinking() {
+    steps = [];
     var div = document.createElement('div');
     div.className = 'vx-thinking';
     div.id = 'vx-thinking';
-    div.innerHTML = '<div class="vx-dot"></div><div class="vx-dot"></div><div class="vx-dot"></div>';
+    div.innerHTML =
+      '<div class="vx-thinking-header">' +
+        '<div class="vx-dot"></div><div class="vx-dot"></div><div class="vx-dot"></div>' +
+        '<span class="vx-thinking-label" id="vx-thinking-label">Thinking…</span>' +
+      '</div>' +
+      '<div class="vx-steps" id="vx-steps"></div>';
     messagesEl.appendChild(div);
     messagesEl.scrollTop = messagesEl.scrollHeight;
   }
@@ -508,18 +559,96 @@
     if (el) el.parentNode.removeChild(el);
   }
 
-  /** Updates (or creates) the live progress label next to the bouncing dots. No-op if the
-   *  thinking bubble isn't showing (e.g. it already got hidden by the time a late event arrives). */
-  function updateThinking(text) {
-    var el = document.getElementById('vx-thinking');
-    if (!el) return;
-    var label = el.querySelector('.vx-thinking-label');
-    if (!label) {
-      label = document.createElement('div');
-      label.className = 'vx-thinking-label';
-      el.appendChild(label);
+  /** Updates the short status text next to the bouncing dots (e.g. "Thinking…" / "Working…").
+   *  No-op if the thinking bubble isn't showing (e.g. a late event arrives after completion). */
+  function setThinkingHeader(text) {
+    var label = document.getElementById('vx-thinking-label');
+    if (label) label.textContent = text;
+  }
+
+  /** Appends a new "in progress" row to the live step trace for a tool that just started. */
+  function addStep(tool) {
+    var step = { tool: tool, label: humanizeTool(tool), status: 'running' };
+    var stepsEl = document.getElementById('vx-steps');
+    if (stepsEl) {
+      var row = document.createElement('div');
+      row.className = 'vx-step vx-step-running';
+      var icon = document.createElement('span');
+      icon.className = 'vx-step-icon';
+      icon.textContent = '●';
+      var text = document.createElement('span');
+      text.className = 'vx-step-text';
+      text.textContent = step.label + '…';
+      row.appendChild(icon);
+      row.appendChild(text);
+      stepsEl.appendChild(row);
+      stepsEl.scrollTop = stepsEl.scrollHeight;
+      step.rowEl = row; step.iconEl = icon; step.textEl = text;
     }
-    label.textContent = text;
+    steps.push(step);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+
+  /** Resolves the most recent still-running step for this tool to done/failed. */
+  function resolveStep(tool, success) {
+    for (var i = steps.length - 1; i >= 0; i--) {
+      if (steps[i].tool === tool && steps[i].status === 'running') {
+        steps[i].status = success ? 'done' : 'failed';
+        if (steps[i].rowEl) {
+          steps[i].rowEl.className = 'vx-step ' + (success ? 'vx-step-done' : 'vx-step-failed');
+          steps[i].iconEl.textContent = success ? '✓' : '✗';
+          steps[i].textEl.textContent = steps[i].label;
+        }
+        return;
+      }
+    }
+  }
+
+  function fmtElapsed(ms) {
+    var s = Math.round(ms / 1000);
+    if (s < 60) return s + 's';
+    return Math.floor(s / 60) + 'm ' + (s % 60) + 's';
+  }
+
+  /** Renders the collapsed "✓ N steps · Xs" pill above the reply once a run completes — click
+   *  to expand and review the full trace (Claude Desktop's "Thought for Xs" pattern). No-op for
+   *  runs with no recorded steps (trivial single-shot replies, or transports with no SSE trace). */
+  function renderStepSummary(elapsedMs) {
+    if (!steps.length) return;
+
+    var failedCount = steps.filter(function (s) { return s.status === 'failed'; }).length;
+    var label = steps.length + (steps.length === 1 ? ' step' : ' steps');
+    if (failedCount) label += ', ' + failedCount + ' failed';
+
+    var wrap = document.createElement('div');
+    wrap.className = 'vx-summary-wrap';
+
+    var pill = document.createElement('button');
+    pill.type = 'button';
+    pill.className = 'vx-summary';
+    pill.innerHTML = '<span class="vx-summary-chevron">▶</span><span>' +
+      (failedCount ? '⚠' : '✓') + ' ' + esc(label) + ' · ' + fmtElapsed(elapsedMs) + '</span>';
+
+    var detail = document.createElement('div');
+    detail.className = 'vx-summary-detail';
+    steps.forEach(function (s) {
+      var row = document.createElement('div');
+      row.className = 'vx-step vx-step-' + s.status;
+      var iconChar = s.status === 'failed' ? '✗' : (s.status === 'running' ? '•' : '✓');
+      row.innerHTML = '<span class="vx-step-icon">' + iconChar + '</span><span class="vx-step-text">' +
+        esc(s.label) + '</span>';
+      detail.appendChild(row);
+    });
+
+    pill.addEventListener('click', function () {
+      var open = detail.classList.toggle('vx-summary-detail-open');
+      pill.classList.toggle('vx-summary-open', open);
+    });
+
+    wrap.appendChild(pill);
+    wrap.appendChild(detail);
+    messagesEl.appendChild(wrap);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
   }
 
   // ── Send ──────────────────────────────────────────────────────────────────────
@@ -536,6 +665,7 @@
     sendBtn.disabled = true;
     inputEl.value = '';
     inputEl.style.height = 'auto';
+    runStartedAt = Date.now();
     showThinking();
 
     var payload = {
@@ -613,24 +743,26 @@
       pollRun(runId, startedAt);
     }
 
-    es.addEventListener('iteration', function (ev) {
-      try {
-        var d = JSON.parse(ev.data);
-        updateThinking('Step ' + d.iteration + ' of ' + d.maxIterations + '…');
-      } catch (e) { /* ignore malformed event */ }
+    // Raw iteration counts ("step 3 of 75") are internal loop-budget noise, not something an
+    // end user should have to make sense of — Claude Code/Desktop don't surface that either.
+    // The header just alternates between the two phases of a ReAct step; the actual visible
+    // trail of what happened is the growing step list (addStep/resolveStep) below it.
+    es.addEventListener('iteration', function () {
+      setThinkingHeader('Thinking…');
     });
 
     es.addEventListener('tool_call', function (ev) {
       try {
         var d = JSON.parse(ev.data);
-        updateThinking('Running ' + d.tool + '…');
+        setThinkingHeader('Working…');
+        addStep(d.tool);
       } catch (e) { /* ignore malformed event */ }
     });
 
     es.addEventListener('tool_result', function (ev) {
       try {
         var d = JSON.parse(ev.data);
-        updateThinking(d.tool + (d.success ? ' done' : ' failed') + ' — continuing…');
+        resolveStep(d.tool, d.success);
       } catch (e) { /* ignore malformed event */ }
     });
 
@@ -693,6 +825,7 @@
 
   function finishWithReply(reply, artifacts) {
     hideThinking();
+    renderStepSummary(Date.now() - runStartedAt);
     isThinking = false;
     sendBtn.disabled = false;
     var msgEl = appendMessage('agent', reply);
@@ -703,6 +836,7 @@
 
   function finishWithError(message) {
     hideThinking();
+    renderStepSummary(Date.now() - runStartedAt);
     isThinking = false;
     sendBtn.disabled = false;
     appendMessage('agent', message);

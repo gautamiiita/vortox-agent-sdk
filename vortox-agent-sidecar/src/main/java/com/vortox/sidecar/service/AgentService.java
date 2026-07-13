@@ -203,9 +203,17 @@ public class AgentService {
      * support a new file-producing skill. The sidecar's local disk is ephemeral and not reachable
      * from outside this process, so the bytes are inlined here and the file is deleted immediately
      * after being read.
+     * <p>
+     * Keeps only the <em>last</em> successful call per skill. Some artifact-producing skills
+     * (e.g. a SQL-to-CSV export) write a file as a side effect of every successful call, not just
+     * a final "save my result" action — if the agent calls the same skill several times while
+     * exploring or retrying (wrong column names, refining a query), only the last, presumably
+     * correct result should be surfaced as a download; earlier attempts' files are deleted here
+     * rather than left to accumulate or all shown to the user as if each were a separate result.
      */
-    private List<AgentRunResponse.ArtifactDto> extractArtifacts(List<AgentResult.ToolCall> toolCalls, String runId) {
-        List<AgentRunResponse.ArtifactDto> artifacts = new java.util.ArrayList<>();
+    /* package-private for testability */
+    List<AgentRunResponse.ArtifactDto> extractArtifacts(List<AgentResult.ToolCall> toolCalls, String runId) {
+        java.util.Map<String, String> latestPathByTool = new java.util.LinkedHashMap<>();
         for (AgentResult.ToolCall tc : toolCalls) {
             if (!tc.success()) continue;
             SkillDefinition.ProducesArtifact declaration = skillRegistry.find(tc.toolName())
@@ -218,6 +226,19 @@ public class AgentService {
                     : jsonStringField(tc.output(), declaration.pathField());
             if (pathStr == null || pathStr.isBlank()) continue;
 
+            String supersededPath = latestPathByTool.put(tc.toolName(), pathStr);
+            if (supersededPath != null && !supersededPath.equals(pathStr)) {
+                try {
+                    Files.deleteIfExists(Path.of(supersededPath));
+                } catch (Exception e) {
+                    log.warn("Run {}: failed to clean up superseded artifact '{}': {}",
+                            runId, supersededPath, e.getMessage());
+                }
+            }
+        }
+
+        List<AgentRunResponse.ArtifactDto> artifacts = new java.util.ArrayList<>();
+        for (String pathStr : latestPathByTool.values()) {
             try {
                 Path path = Path.of(pathStr);
                 if (!Files.isRegularFile(path)) continue;

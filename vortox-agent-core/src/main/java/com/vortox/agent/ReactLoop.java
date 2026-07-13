@@ -52,7 +52,18 @@ public final class ReactLoop {
     static final String SPAWN_TASK_TOOL         = "spawn_task";
 
     // ── Conversation pruning constants ────────────────────────────────────────
-    private static final int MAX_TOOL_RESULT_CHARS         = 1_500;
+    // Plain-text (non-JSON) tool results were previously capped at 1,500 chars — fine for most
+    // skill output, but it silently gutted reference-doc-style skills (e.g. a ~30K-char database
+    // schema guide meant to be read BEFORE writing SQL) down to just their first ~20 lines,
+    // forcing agents to blindly probe the database's own metadata tables instead — which is both
+    // slower and, for skills that export a CSV as a side effect of every query, needlessly
+    // generates one throwaway file per exploratory probe. 40,000 comfortably covers that guide
+    // with room for it to grow (its own header calls it an "append-only living doc"). This is
+    // safe to raise now: pruneConversationHistory() still shrinks anything older than the most
+    // recent PRUNE_KEEP_RECENT_ROUNDS down to PRUNED_RESULT_MAX_CHARS regardless, and prompt
+    // caching (see AnthropicClient.withCacheBreakpoint) means resending this larger content
+    // across iterations mostly hits cheap cache reads rather than fresh full-price tokens.
+    private static final int MAX_TOOL_RESULT_CHARS         = 40_000;
     private static final int MAX_REPORT_CHARS              = 12_000;
     private static final int PRUNE_KEEP_RECENT_ROUNDS      = 5;
     private static final int PRUNED_RESULT_MAX_CHARS       = 400;

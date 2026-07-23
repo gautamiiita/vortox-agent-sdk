@@ -2,6 +2,7 @@ package com.vortox.agent;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.vortox.agent.spi.ActivityListener;
+import com.vortox.agent.spi.ControlHook;
 import com.vortox.agent.spi.MemoryStore;
 import com.vortox.agent.spi.TaskSpawner;
 import com.vortox.agent.spi.ToolExecutor;
@@ -133,7 +134,7 @@ public final class ReactLoop {
                                             String toolUseId,
                                             String decisionMessage) {
         log.info("ReactLoop: resuming after approval for run {}", runId);
-        List<Map<String, Object>> messages = new ArrayList<>(conversationSnapshot);
+        List<Map<String, Object>> messages = new ArrayList<>(sanitizeMessages(conversationSnapshot));
         messages.add(Map.of("role", "assistant", "content", assistantContent));
 
         Map<String, Object> toolResult = new HashMap<>();
@@ -143,6 +144,25 @@ public final class ReactLoop {
         messages.add(Map.of("role", "user", "content", List.of(toolResult)));
 
         return run(null, runId, null, messages, null);
+    }
+
+    /**
+     * The Anthropic Messages API rejects any message object with keys other than "role"/"content" —
+     * a resumed/persisted conversation snapshot may carry extra metadata (e.g. a "timestamp" added
+     * by an unrelated persistence path) that was never part of what the API itself returned. Strip
+     * anything but role/content before such a snapshot re-enters an API-bound message list.
+     */
+    private static List<Map<String, Object>> sanitizeMessages(List<Map<String, Object>> raw) {
+        if (raw == null) return List.of();
+        List<Map<String, Object>> clean = new ArrayList<>(raw.size());
+        for (Map<String, Object> m : raw) {
+            if (m == null) continue;
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("role", m.get("role"));
+            entry.put("content", m.get("content"));
+            clean.add(entry);
+        }
+        return clean;
     }
 
     // ── Core loop ─────────────────────────────────────────────────────────────
@@ -156,6 +176,7 @@ public final class ReactLoop {
         List<Map<String, Object>> tools    = buildAllTools();
         String                    sysPrompt = config.getSystemPrompt();
         ActivityListener          listener  = config.getActivityListener();
+        ControlHook               control   = config.getControlHook() != null ? config.getControlHook() : ControlHook.NOOP;
         MemoryStore               memory    = config.getMemoryStore();
 
         // Initialise conversation
@@ -163,7 +184,7 @@ public final class ReactLoop {
         boolean isContinuation = priorMessages != null && !priorMessages.isEmpty();
 
         if (isContinuation) {
-            messages.addAll(priorMessages);
+            messages.addAll(sanitizeMessages(priorMessages));
             if (userMessage != null && !userMessage.isBlank()) {
                 messages.add(Map.of("role", "user", "content", userMessage));
             } else {
@@ -188,6 +209,18 @@ public final class ReactLoop {
 
         while (iterations < maxIterations) {
             iterations++;
+
+            // Human control checkpoint: may block (pause), splice guidance into `messages`,
+            // or return false to cancel. Executor-agnostic — see ControlHook.
+            if (!control.beforeIteration(runId, iterations, messages)) {
+                log.info("ReactLoop [{}] cancelled by control channel at iteration {}", runId, iterations);
+                AgentResult r = AgentResult.cancelled(
+                        "Run cancelled by operator at iteration " + iterations,
+                        iterations, toolCalls, messages, totalIn, totalOut, totalCC, totalCR);
+                listener.onComplete(runId, r);
+                return r;
+            }
+
             log.info("ReactLoop [{}] iteration {}/{}", runId, iterations, maxIterations);
             listener.onIteration(runId, iterations, maxIterations, "LLM call");
 
@@ -206,6 +239,7 @@ public final class ReactLoop {
             totalOut += response.getOutputTokens();
             totalCC  += response.getCacheCreationInputTokens();
             totalCR  += response.getCacheReadInputTokens();
+            listener.onTokens(runId, iterations, totalIn, totalOut);
 
             if (!response.hasToolUse()) {
                 // LLM returned plain text — task complete

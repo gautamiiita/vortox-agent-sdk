@@ -48,7 +48,7 @@ public record AgentResult(
 ) {
 
     public enum Status {
-        SUCCESS, PARTIAL, CLARIFICATION_NEEDED, APPROVAL_NEEDED, HANDOFF, ERROR
+        SUCCESS, PARTIAL, CLARIFICATION_NEEDED, APPROVAL_NEEDED, HANDOFF, ERROR, CANCELLED
     }
 
     /** Immutable record of one tool invocation. {@code output} is the tool's raw (untruncated) result string. */
@@ -69,6 +69,15 @@ public record AgentResult(
                                        List<Map<String, Object>> history,
                                        int in, int out, int cacheCreate, int cacheRead) {
         return new AgentResult(Status.PARTIAL, response, null, null, null, null, null,
+                null, null, null, iterations, toolCalls, in, out, cacheCreate, cacheRead, history);
+    }
+
+    /** Run stopped by a human via the control channel (see ControlHook). Preserves work + history. */
+    public static AgentResult cancelled(String response, int iterations,
+                                        List<ToolCall> toolCalls,
+                                        List<Map<String, Object>> history,
+                                        int in, int out, int cacheCreate, int cacheRead) {
+        return new AgentResult(Status.CANCELLED, response, null, null, null, null, null,
                 null, null, null, iterations, toolCalls, in, out, cacheCreate, cacheRead, history);
     }
 
@@ -111,4 +120,5 @@ public record AgentResult(
     public boolean needsClarification()    { return status == Status.CLARIFICATION_NEEDED; }
     public boolean needsApproval()         { return status == Status.APPROVAL_NEEDED; }
     public boolean isHandoff()             { return status == Status.HANDOFF; }
+    public boolean isCancelled()           { return status == Status.CANCELLED; }
 }

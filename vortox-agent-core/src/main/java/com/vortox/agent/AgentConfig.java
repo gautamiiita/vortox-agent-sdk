@@ -1,6 +1,7 @@
 package com.vortox.agent;
 
 import com.vortox.agent.spi.ActivityListener;
+import com.vortox.agent.spi.ControlHook;
 import com.vortox.agent.spi.MemoryStore;
 import com.vortox.agent.spi.InMemoryStore;
 import com.vortox.agent.spi.TaskSpawner;
@@ -57,6 +58,7 @@ public final class AgentConfig {
     // ── SPI implementations ───────────────────────────────────────────────────
     private final MemoryStore memoryStore;
     private final ActivityListener activityListener;
+    private final ControlHook controlHook;
     private final TaskSpawner taskSpawner;
 
     private AgentConfig(Builder b) {
@@ -77,6 +79,7 @@ public final class AgentConfig {
         this.llmClient           = b.llmClient;
         this.memoryStore         = b.memoryStore;
         this.activityListener    = b.activityListener;
+        this.controlHook         = b.controlHook;
         this.taskSpawner         = b.taskSpawner;
     }
 
@@ -101,6 +104,7 @@ public final class AgentConfig {
     public LlmClient getLlmClient()        { return llmClient; }
     public MemoryStore getMemoryStore()    { return memoryStore; }
     public ActivityListener getActivityListener() { return activityListener; }
+    public ControlHook getControlHook()    { return controlHook; }
     public TaskSpawner getTaskSpawner()    { return taskSpawner; }
 
     // ── Builder ───────────────────────────────────────────────────────────────
@@ -125,6 +129,7 @@ public final class AgentConfig {
         private LlmClient llmClient          = null;
         private MemoryStore memoryStore      = new InMemoryStore();
         private ActivityListener activityListener = ActivityListener.NOOP;
+        private ControlHook controlHook      = ControlHook.NOOP;
         private TaskSpawner taskSpawner      = null;
 
         public Builder apiKey(String apiKey)                   { this.apiKey = apiKey; return this; }
@@ -135,6 +140,7 @@ public final class AgentConfig {
         public Builder toolExecutor(ToolExecutor executor)     { this.toolExecutor = executor; return this; }
         public Builder memoryStore(MemoryStore store)          { this.memoryStore = store; return this; }
         public Builder activityListener(ActivityListener l)    { this.activityListener = l; return this; }
+        public Builder controlHook(ControlHook h)              { this.controlHook = h; return this; }
         public Builder taskSpawner(TaskSpawner spawner)        { this.taskSpawner = spawner; this.enableSpawnTask = true; return this; }
 
         /** Register a single tool definition (Claude {@code tool_use} format). */

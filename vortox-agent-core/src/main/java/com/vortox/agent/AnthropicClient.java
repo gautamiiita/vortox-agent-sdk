@@ -44,7 +44,11 @@ public final class AnthropicClient implements LlmClient {
     private static final Set<String> TRANSIENT_KEYWORDS = Set.of(
             "SSLError", "ssl", "SSL", "ConnectionError", "Max retries exceeded",
             "RemoteDisconnected", "IncompleteRead", "BrokenPipeError",
-            "timeout", "Timeout", "Connection reset", "503", "529", "overloaded");
+            "timeout", "Timeout", "Connection reset", "503", "529", "overloaded",
+            // TLS-layer failures on long streamed/buffered downloads — near-always a transient
+            // one-off network hiccup, not an application-level problem.
+            "bad_record_mac", "fatal alert", "SSLException", "SocketException",
+            "EOFException", "reset by peer", "handshake");
 
     private static final HttpClient HTTP = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(15))
@@ -116,7 +120,24 @@ public final class AnthropicClient implements LlmClient {
 
     private ClaudeResponse retry(ApiCall fn) throws Exception {
         for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-            ClaudeResponse r = fn.call();
+            ClaudeResponse r;
+            try {
+                r = fn.call();
+            } catch (Exception e) {
+                // A network/TLS exception thrown mid-request (e.g. bad_record_mac on a large
+                // buffered download) never produces a ClaudeResponse at all — without this catch,
+                // it would propagate straight out and skip retry entirely, unlike an error that
+                // comes back as a normal (non-2xx) response.
+                String msg = "Exception: " + e.getMessage();
+                if (attempt < MAX_RETRIES && isTransient(msg)) {
+                    long delay = BASE_RETRY_DELAY_MS * attempt;
+                    log.warn("Transient exception (attempt {}/{}): {}. Retrying in {}ms…",
+                            attempt, MAX_RETRIES, msg, delay);
+                    Thread.sleep(delay);
+                    continue;
+                }
+                throw e;
+            }
             if (!r.hasError() || !isTransient(r.getError())) return r;
             if (attempt < MAX_RETRIES) {
                 long delay = BASE_RETRY_DELAY_MS * attempt;

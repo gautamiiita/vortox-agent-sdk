@@ -16,6 +16,9 @@ public interface ActivityListener {
     /** Called at the start of each LLM iteration. */
     default void onIteration(String runId, int iteration, int maxIterations, String description) {}
 
+    /** Running token totals after an iteration's LLM call — for a live cost/usage meter. */
+    default void onTokens(String runId, int iteration, int totalInputTokens, int totalOutputTokens) {}
+
     /** Called just before a tool is dispatched to the {@link ToolExecutor}. */
     default void onToolCall(String runId, String toolName, Map<String, Object> params) {}
 

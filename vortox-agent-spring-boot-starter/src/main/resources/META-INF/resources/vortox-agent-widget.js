@@ -60,6 +60,7 @@
   var _pageCtx      = {};
   var history       = [];
   var isOpen        = false;
+  var isMaximized   = false;
   var isThinking    = false;
   var steps         = [];   // live step trace for the run currently in flight (see addStep/resolveStep)
   var runStartedAt  = 0;
@@ -85,6 +86,17 @@
     'transition:opacity 0.2s cubic-bezier(.4,0,.2,1),transform 0.2s cubic-bezier(.4,0,.2,1);}',
     '#vx-panel.vx-open{opacity:1;transform:translateY(0);pointer-events:auto;}',
 
+    /* Maximized — docks the panel full-height against the right edge of the viewport instead of
+       the small floating card, for reading/writing longer conversations side-by-side with the
+       host page. Slides in from the right rather than fading up, to read as "opening a panel"
+       rather than "opening a popup". */
+    '#vx-panel.vx-maximized{top:0;bottom:0;right:0;height:auto;width:440px;',
+    'max-width:calc(100vw - 32px);border-radius:0;box-shadow:-8px 0 30px rgba(0,0,0,0.12);',
+    'transform:translateX(16px);}',
+    '#vx-panel.vx-maximized.vx-open{transform:translateX(0);}',
+    '#vx-panel.vx-maximized #vx-header{border-radius:0;}',
+    '#vx-panel.vx-maximized #vx-form{border-radius:0;}',
+
     /* Header */
     '#vx-header{padding:14px 16px;background:#f8faff;border-bottom:1px solid #e2e8f0;border-radius:14px 14px 0 0;',
     'display:flex;align-items:center;justify-content:space-between;flex-shrink:0;}',
@@ -92,9 +104,15 @@
     '#vx-header-dot{width:8px;height:8px;border-radius:50%;background:#22c55e;margin-right:8px;',
     'box-shadow:0 0 0 2px rgba(34,197,94,0.25);animation:vx-pulse 2.4s ease-in-out infinite;}',
     '@keyframes vx-pulse{0%,100%{opacity:1}50%{opacity:.5}}',
-    '#vx-close{background:none;border:none;color:#94a3b8;cursor:pointer;font-size:20px;line-height:1;',
-    'padding:0 2px;border-radius:4px;transition:color .15s;}',
-    '#vx-close:hover{color:#475569;}',
+    '#vx-header-actions{display:flex;align-items:center;gap:2px;}',
+    '.vx-header-btn{background:none;border:none;color:#94a3b8;cursor:pointer;',
+    'display:flex;align-items:center;justify-content:center;padding:4px;border-radius:6px;',
+    'transition:color .15s,background .15s;}',
+    '.vx-header-btn:hover{color:#475569;background:rgba(148,163,184,0.15);}',
+    '.vx-header-btn svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:2;',
+    'stroke-linecap:round;stroke-linejoin:round;}',
+    '#vx-minimize{font-size:16px;line-height:1;padding:4px 6px;}',
+    '#vx-close{font-size:20px;line-height:1;padding:2px 6px;}',
 
     /* Messages — the ONLY scrollable area; no overflow on individual bubbles */
     '#vx-messages{flex:1;overflow-y:auto;padding:16px 14px;display:flex;flex-direction:column;gap:12px;min-height:0;}',
@@ -487,13 +505,23 @@
   panel.id = 'vx-panel';
   panel.setAttribute('role', 'dialog');
   panel.setAttribute('aria-label', TITLE);
+  var MAXIMIZE_ICON = '<svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/>' +
+    '<line x1="14" y1="4" x2="14" y2="20"/></svg>';
+  var RESTORE_ICON  = '<svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>';
+
   panel.innerHTML =
     '<div id="vx-header">' +
       '<div style="display:flex;align-items:center">' +
         '<div id="vx-header-dot"></div>' +
         '<span id="vx-header-title">' + esc(TITLE) + '</span>' +
       '</div>' +
-      '<button id="vx-close" aria-label="Close">\xd7</button>' +
+      '<div id="vx-header-actions">' +
+        '<button id="vx-minimize" class="vx-header-btn" aria-label="Minimize" title="Minimize">&minus;</button>' +
+        '<button id="vx-maximize" class="vx-header-btn" aria-label="Expand to side panel" title="Expand to side panel">' +
+          MAXIMIZE_ICON +
+        '</button>' +
+        '<button id="vx-close" class="vx-header-btn" aria-label="Close" title="Close">\xd7</button>' +
+      '</div>' +
     '</div>' +
     '<div id="vx-messages" role="log" aria-live="polite"></div>' +
     '<div id="vx-suggestions"></div>' +
@@ -509,6 +537,7 @@
   var suggestionsEl = document.getElementById('vx-suggestions');
   var inputEl       = document.getElementById('vx-input');
   var sendBtn       = document.getElementById('vx-send');
+  var maximizeBtn   = document.getElementById('vx-maximize');
 
   // ── Suggestions ───────────────────────────────────────────────────────────────
 
@@ -877,6 +906,23 @@
 
   // ── Events ────────────────────────────────────────────────────────────────────
 
+  function closePanel() {
+    isOpen = false;
+    panel.classList.remove('vx-open');
+  }
+
+  /** Toggles between the small floating card and a full-height panel docked to the right
+   *  edge of the viewport. Independent of open/closed state — reopening (via the FAB) after
+   *  a maximize keeps whichever size was last chosen. */
+  function setMaximized(next) {
+    isMaximized = next;
+    panel.classList.toggle('vx-maximized', isMaximized);
+    maximizeBtn.innerHTML = isMaximized ? RESTORE_ICON : MAXIMIZE_ICON;
+    var label = isMaximized ? 'Restore' : 'Expand to side panel';
+    maximizeBtn.title = label;
+    maximizeBtn.setAttribute('aria-label', label);
+  }
+
   fab.addEventListener('click', function () {
     isOpen = !isOpen;
     panel.classList.toggle('vx-open', isOpen);
@@ -886,10 +932,9 @@
     }
   });
 
-  document.getElementById('vx-close').addEventListener('click', function () {
-    isOpen = false;
-    panel.classList.remove('vx-open');
-  });
+  document.getElementById('vx-close').addEventListener('click', closePanel);
+  document.getElementById('vx-minimize').addEventListener('click', closePanel);
+  maximizeBtn.addEventListener('click', function () { setMaximized(!isMaximized); });
 
   sendBtn.addEventListener('click', function () { sendMessage(inputEl.value); });
 
@@ -906,10 +951,7 @@
   });
 
   document.addEventListener('keydown', function (e) {
-    if (e.key === 'Escape' && isOpen) {
-      isOpen = false;
-      panel.classList.remove('vx-open');
-    }
+    if (e.key === 'Escape' && isOpen) closePanel();
   });
 
   // ── Public API ────────────────────────────────────────────────────────────────

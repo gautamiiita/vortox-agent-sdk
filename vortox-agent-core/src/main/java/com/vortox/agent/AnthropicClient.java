@@ -41,10 +41,14 @@ public final class AnthropicClient implements LlmClient {
 
     private static final int    MAX_RETRIES         = 3;
     private static final long   BASE_RETRY_DELAY_MS = 2_000;
+    private static final long   MAX_RETRY_DELAY_MS  = 60_000;
     private static final Set<String> TRANSIENT_KEYWORDS = Set.of(
             "SSLError", "ssl", "SSL", "ConnectionError", "Max retries exceeded",
             "RemoteDisconnected", "IncompleteRead", "BrokenPipeError",
             "timeout", "Timeout", "Connection reset", "503", "529", "overloaded",
+            // Rate limiting (HTTP 429). Anthropic returns a Retry-After header we honour below;
+            // without this the whole task used to fail hard on the first 429 with no backoff.
+            "429", "rate_limit", "rate limit", "Too Many Requests",
             // TLS-layer failures on long streamed/buffered downloads — near-always a transient
             // one-off network hiccup, not an application-level problem.
             "bad_record_mac", "fatal alert", "SSLException", "SocketException",
@@ -130,7 +134,7 @@ public final class AnthropicClient implements LlmClient {
                 // comes back as a normal (non-2xx) response.
                 String msg = "Exception: " + e.getMessage();
                 if (attempt < MAX_RETRIES && isTransient(msg)) {
-                    long delay = BASE_RETRY_DELAY_MS * attempt;
+                    long delay = retryDelayMs(attempt, msg);
                     log.warn("Transient exception (attempt {}/{}): {}. Retrying in {}ms…",
                             attempt, MAX_RETRIES, msg, delay);
                     Thread.sleep(delay);
@@ -140,7 +144,7 @@ public final class AnthropicClient implements LlmClient {
             }
             if (!r.hasError() || !isTransient(r.getError())) return r;
             if (attempt < MAX_RETRIES) {
-                long delay = BASE_RETRY_DELAY_MS * attempt;
+                long delay = retryDelayMs(attempt, r.getError());
                 log.warn("Transient error (attempt {}/{}): {}. Retrying in {}ms…",
                         attempt, MAX_RETRIES, r.getError(), delay);
                 Thread.sleep(delay);
@@ -167,7 +171,16 @@ public final class AnthropicClient implements LlmClient {
                         .build(),
                 HttpResponse.BodyHandlers.ofString());
 
-        if (res.statusCode() != 200) return ClaudeResponse.error(extractApiError(res.body(), res.statusCode()));
+        if (res.statusCode() != 200) {
+            String err = extractApiError(res.body(), res.statusCode());
+            // On a 429, surface the server's Retry-After (seconds) so retry() can honour it instead
+            // of using only the fixed exponential backoff.
+            if (res.statusCode() == 429) {
+                long secs = res.headers().firstValue("retry-after").map(AnthropicClient::parseRetryAfterSeconds).orElse(0L);
+                if (secs > 0) err = err + " [retry-after=" + secs + "s]";
+            }
+            return ClaudeResponse.error(err);
+        }
         return parseResponse(res.body());
     }
 
@@ -415,6 +428,40 @@ public final class AnthropicClient implements LlmClient {
     private static boolean blank(String s)         { return s == null || s.isBlank(); }
     private static boolean isTransient(String err) {
         return err != null && TRANSIENT_KEYWORDS.stream().anyMatch(err::contains);
+    }
+
+    /**
+     * Retry delay for the given attempt: the larger of the exponential backoff and any
+     * server-suggested {@code [retry-after=Ns]} marker (parsed from a 429), capped so a huge
+     * Retry-After can't stall a worker indefinitely.
+     */
+    private static long retryDelayMs(int attempt, String errorMessage) {
+        long backoff   = BASE_RETRY_DELAY_MS * attempt;
+        long suggested = parseRetryAfterMarkerMs(errorMessage);
+        return Math.min(Math.max(backoff, suggested), MAX_RETRY_DELAY_MS);
+    }
+
+    /** Parse the integer seconds from a {@code Retry-After} header value; 0 if not a plain number. */
+    private static long parseRetryAfterSeconds(String header) {
+        try {
+            return Math.max(0L, Long.parseLong(header.trim()));
+        } catch (NumberFormatException e) {
+            return 0L; // HTTP-date form is not handled — caller falls back to exponential backoff
+        }
+    }
+
+    /** Extract the delay (ms) from a {@code [retry-after=Ns]} marker embedded in an error string. */
+    private static long parseRetryAfterMarkerMs(String err) {
+        if (err == null) return 0L;
+        int i = err.indexOf("[retry-after=");
+        if (i < 0) return 0L;
+        int end = err.indexOf("s]", i);
+        if (end < 0) return 0L;
+        try {
+            return Long.parseLong(err.substring(i + "[retry-after=".length(), end).trim()) * 1000L;
+        } catch (NumberFormatException e) {
+            return 0L;
+        }
     }
 
     // ── DTOs ──────────────────────────────────────────────────────────────────

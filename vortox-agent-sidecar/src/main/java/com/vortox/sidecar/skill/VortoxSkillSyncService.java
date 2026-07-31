@@ -109,8 +109,17 @@ public class VortoxSkillSyncService {
         }
     }
 
-    /** Hourly fallback — recovers from missed webhook deliveries. */
-    @Scheduled(fixedDelayString = "${vortox.skill-sync.poll-interval-ms:3600000}")
+    /**
+     * Five-minute fallback — recovers from missed webhook deliveries.
+     *
+     * <p>Was hourly, which meant a skill edit that missed its webhook could stay invisible for the
+     * best part of an hour with nothing to show why. Five minutes bounds that at something a person
+     * will wait through. Each pass refetches the shared tier plus every tenant seen in traffic, so
+     * the cost scales with tenant count, not with skill count; raise
+     * {@code vortox.skill-sync.poll-interval-ms} if a pooled deployment grows enough for that to
+     * matter. The webhook remains the primary path — this only catches what it drops.
+     */
+    @Scheduled(fixedDelayString = "${vortox.skill-sync.poll-interval-ms:300000}")
     public void syncOnSchedule() {
         // Skipped once the key is known to be pooled: repeating a request the backend has already
         // told us it will refuse only fills the log.

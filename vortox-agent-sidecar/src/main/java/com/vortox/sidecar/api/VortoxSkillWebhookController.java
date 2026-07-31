@@ -31,11 +31,22 @@ public class VortoxSkillWebhookController {
         this.syncService = syncService;
     }
 
+    /**
+     * Reload signal. An optional {@code tenantCode} in the body scopes the reload to one tenant's
+     * private skills — the usual case, since a skill change belongs to whoever owns it. Omitting it
+     * reloads the shared tier and then every tenant tier already in play, which is what a change to
+     * a shared skill needs.
+     */
     @PostMapping("/skills/reload")
-    public ResponseEntity<Map<String, String>> reload() {
-        log.info("Received skill reload signal from Vortox");
+    public ResponseEntity<Map<String, String>> reload(
+            @org.springframework.web.bind.annotation.RequestBody(required = false)
+            Map<String, Object> body) {
+        String tenantCode = body != null && body.get("tenantCode") instanceof String s && !s.isBlank()
+                ? s : null;
+        log.info("Received skill reload signal from Vortox (tenant={})", tenantCode);
         // Fire-and-forget: respond immediately, sync runs in background
-        new Thread(syncService::syncOnWebhook, "skill-sync-webhook").start();
-        return ResponseEntity.ok(Map.of("status", "reload triggered"));
+        new Thread(() -> syncService.syncOnWebhook(tenantCode), "skill-sync-webhook").start();
+        return ResponseEntity.ok(Map.of("status", "reload triggered",
+                "scope", tenantCode == null ? "shared+known-tenants" : tenantCode));
     }
 }

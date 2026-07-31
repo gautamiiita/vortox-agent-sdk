@@ -138,6 +138,53 @@ class VortoxChatProxyControllerTest {
     }
 
     @Test
+    void postWithEmptyBodyIsReportedAsEmptyNotMalformed() throws Exception {
+        ChatRelay relay = mock(ChatRelay.class);
+        VortoxChatProxyController controller = new VortoxChatProxyController(relay, ChatContextEnricher.NOOP);
+
+        MockHttpServletRequest request = new MockHttpServletRequest("POST", "/agentChat.htm");
+        request.setContent(new byte[0]);
+        MockHttpServletResponse response = new MockHttpServletResponse();
+
+        controller.handleRequest(request, response);
+
+        assertThat(response.getStatus()).isEqualTo(400);
+        assertThat(response.getContentAsString()).contains("Empty request body");
+        verify(relay, never()).start(anyString());
+    }
+
+    @Test
+    void postWithTruncatedJsonIsRejectedAsMalformed() throws Exception {
+        ChatRelay relay = mock(ChatRelay.class);
+        VortoxChatProxyController controller = new VortoxChatProxyController(relay, ChatContextEnricher.NOOP);
+
+        MockHttpServletRequest request = new MockHttpServletRequest("POST", "/agentChat.htm");
+        request.setContent("{\"message\":\"hi\",\"history\":[{\"role\":\"us".getBytes("UTF-8"));
+        MockHttpServletResponse response = new MockHttpServletResponse();
+
+        controller.handleRequest(request, response);
+
+        assertThat(response.getStatus()).isEqualTo(400);
+        assertThat(response.getContentAsString()).contains("Malformed request body");
+        verify(relay, never()).start(anyString());
+    }
+
+    @Test
+    void postWithNonObjectJsonIsRejectedRatherThanClassCast() throws Exception {
+        ChatRelay relay = mock(ChatRelay.class);
+        VortoxChatProxyController controller = new VortoxChatProxyController(relay, ChatContextEnricher.NOOP);
+
+        MockHttpServletRequest request = new MockHttpServletRequest("POST", "/agentChat.htm");
+        request.setContent("[\"not\",\"an\",\"object\"]".getBytes("UTF-8"));
+        MockHttpServletResponse response = new MockHttpServletResponse();
+
+        controller.handleRequest(request, response);
+
+        assertThat(response.getStatus()).isEqualTo(400);
+        verify(relay, never()).start(anyString());
+    }
+
+    @Test
     void unsupportedMethodReturns405() throws Exception {
         ChatRelay relay = mock(ChatRelay.class);
         VortoxChatProxyController controller = new VortoxChatProxyController(relay, ChatContextEnricher.NOOP);

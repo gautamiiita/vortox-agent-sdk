@@ -38,7 +38,7 @@ class AgentServiceExtractArtifactsTest {
 
         SkillRegistry registry = mock(SkillRegistry.class);
         SkillDefinition oracleSkill = skillWith("oracle_to_studio", OUTPUT_SOURCED);
-        when(registry.find("oracle_to_studio")).thenReturn(Optional.of(oracleSkill));
+        when(registry.findFor(null, "oracle_to_studio")).thenReturn(Optional.of(oracleSkill));
 
         AgentService service = new AgentService(registry, mock(ScriptToolExecutor.class));
 
@@ -65,8 +65,8 @@ class AgentServiceExtractArtifactsTest {
         Files.writeString(report, "<html></html>");
 
         SkillRegistry registry = mock(SkillRegistry.class);
-        when(registry.find("oracle_to_studio")).thenReturn(Optional.of(skillWith("oracle_to_studio", OUTPUT_SOURCED)));
-        when(registry.find("file_write")).thenReturn(Optional.of(
+        when(registry.findFor(null, "oracle_to_studio")).thenReturn(Optional.of(skillWith("oracle_to_studio", OUTPUT_SOURCED)));
+        when(registry.findFor(null, "file_write")).thenReturn(Optional.of(
                 skillWith("file_write", new SkillDefinition.ProducesArtifact("path", "output"))));
 
         AgentService service = new AgentService(registry, mock(ScriptToolExecutor.class));
@@ -90,7 +90,7 @@ class AgentServiceExtractArtifactsTest {
         Files.writeString(csv, "data");
 
         SkillRegistry registry = mock(SkillRegistry.class);
-        when(registry.find("oracle_to_studio")).thenReturn(Optional.of(skillWith("oracle_to_studio", OUTPUT_SOURCED)));
+        when(registry.findFor(null, "oracle_to_studio")).thenReturn(Optional.of(skillWith("oracle_to_studio", OUTPUT_SOURCED)));
 
         AgentService service = new AgentService(registry, mock(ScriptToolExecutor.class));
 

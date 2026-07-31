@@ -15,22 +15,98 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Stream;
 
 /**
- * Scans the skills directory on startup and on demand.
- * Each skill lives in {skillsPath}/{skill-name}/SKILL.md — a plain YAML file.
+ * Scans the skills directory on startup and on demand, in two tiers.
+ *
+ * <p><strong>Shared</strong> skills live at {@code {skillsPath}/{skill-name}/SKILL.md} and are
+ * visible to every tenant — the product toolkit. <strong>Tenant-private</strong> skills live at
+ * {@code {skillsPath}/tenants/{tenantId}/{skill-name}/SKILL.md} and are only ever visible to that
+ * tenant. This mirrors what Vortox already models: {@code Skill} is filtered with
+ * {@code tenant_id = :tenantId OR tenant_id IS NULL}, so a null tenant is a shared skill and a
+ * non-null one is private to its tenant.
+ *
+ * <p>Shared skills deliberately keep the original flat layout rather than moving under a
+ * {@code shared/} directory: the skills directory is a host bind-mount in real deployments, and
+ * relocating existing skill directories would strand them. {@code tenants} is therefore a reserved
+ * name at the top level.
+ *
+ * <p>A tenant may define a skill whose name matches a shared one. That is allowed — customising a
+ * standard skill is legitimate — and <strong>the tenant's copy wins</strong>. It is logged, because
+ * silently running a different body than the shared one is otherwise very hard to diagnose. What is
+ * never possible is one tenant reaching another's skill: lookups consult exactly one tenant's map
+ * plus the shared map, with no global fallback.
  */
 @Component
 public class SkillRegistry {
 
     private static final Logger log = LoggerFactory.getLogger(SkillRegistry.class);
 
+    /** Reserved top-level directory name; everything under it is tenant-private. */
+    static final String TENANTS_DIR = "tenants";
+
     @Value("${sidecar.skills-path:/app/skills}")
     private String skillsPath;
 
-    private final Map<String, SkillDefinition> skills = new ConcurrentHashMap<>();
+    /** Set when this sidecar is attached to a Vortox control plane. */
+    @Value("${vortox.backend.url:}")
+    private String vortoxBackendUrl;
+
+    /**
+     * Escape hatch for a sidecar that must keep running skills Vortox does not know about.
+     *
+     * <p>Off by default once a control plane is configured, because otherwise the tool surface is not
+     * what Vortox authorised: anything written into the skills directory — a bind-mount in real
+     * deployments — becomes callable, sidestepping the application allow-list, the tenant allow-list
+     * and the agent's own {@code availableSkills}. A governed deployment should expose exactly what
+     * it was given, and nothing else.
+     */
+    @Value("${sidecar.skills.allow-local:false}")
+    private boolean allowLocalSkills;
+
+    /** True when unmanaged skills must be hidden from the agent. */
+    private boolean vortoxGoverned() {
+        return vortoxBackendUrl != null && !vortoxBackendUrl.isBlank() && !allowLocalSkills;
+    }
+
+    /**
+     * Whether this skill may be offered to the agent. Under a control plane, only what Vortox
+     * delivered — a local file is loaded and listed (so an operator can see and remove it) but never
+     * exposed as a tool.
+     */
+    private boolean isUsable(String tenantId, String name) {
+        return !vortoxGoverned() || isVortoxManaged(tenantId, name);
+    }
+
+    /** Visible to every tenant. */
+    private final Map<String, SkillDefinition> sharedSkills = new ConcurrentHashMap<>();
+
+    /** tenantId → its own skills. Never merged across tenants. */
+    private final Map<String, Map<String, SkillDefinition>> tenantSkills = new ConcurrentHashMap<>();
+
+    /**
+     * Names last written by a Vortox sync, as {@code tenantId|name} (tenantId blank for shared).
+     *
+     * <p>Provenance matters to the UI: a synced skill is replaced on the next sync, so editing it
+     * here achieves nothing and quietly diverges from what Vortox holds. A skill that only exists on
+     * this container — dropped into the skills directory by hand — is never touched by sync and is
+     * genuinely editable. Without this the UI cannot tell the two apart and has to treat everything
+     * the same way.
+     */
+    private final java.util.Set<String> vortoxManaged = ConcurrentHashMap.newKeySet();
+
+    private static String provenanceKey(String tenantId, String name) {
+        return (tenantId == null ? "" : tenantId) + "|" + name;
+    }
+
+    /** True when this skill's body came from Vortox and will be overwritten on the next sync. */
+    public boolean isVortoxManaged(String tenantId, String name) {
+        return vortoxManaged.contains(provenanceKey(tenantId, name))
+                || vortoxManaged.contains(provenanceKey(null, name));
+    }
 
     @PostConstruct
     public void load() {
-        skills.clear();
+        sharedSkills.clear();
+        tenantSkills.clear();
         Path base = Path.of(skillsPath);
         if (!Files.isDirectory(base)) {
             log.warn("Skills directory not found: {}", base);
@@ -38,13 +114,39 @@ public class SkillRegistry {
         }
 
         try (Stream<Path> entries = Files.list(base)) {
-            entries.filter(Files::isDirectory).forEach(this::loadSkill);
+            entries.filter(Files::isDirectory).forEach(dir -> {
+                if (TENANTS_DIR.equals(dir.getFileName().toString())) {
+                    loadTenantTier(dir);
+                } else {
+                    loadSkill(dir, sharedSkills, null);
+                }
+            });
         } catch (IOException e) {
             log.error("Failed to scan skills directory: {}", e.getMessage());
         }
+        log.info("Skill registry loaded: {} shared, {} tenant(s) with private skills",
+                sharedSkills.size(), tenantSkills.size());
     }
 
-    private void loadSkill(Path skillDir) {
+    private void loadTenantTier(Path tenantsRoot) {
+        try (Stream<Path> tenants = Files.list(tenantsRoot)) {
+            tenants.filter(Files::isDirectory).forEach(tenantDir -> {
+                String tenantId = tenantDir.getFileName().toString();
+                Map<String, SkillDefinition> forTenant =
+                        tenantSkills.computeIfAbsent(tenantId, k -> new ConcurrentHashMap<>());
+                try (Stream<Path> skillDirs = Files.list(tenantDir)) {
+                    skillDirs.filter(Files::isDirectory)
+                             .forEach(dir -> loadSkill(dir, forTenant, tenantId));
+                } catch (IOException e) {
+                    log.error("Failed to scan skills for tenant {}: {}", tenantId, e.getMessage());
+                }
+            });
+        } catch (IOException e) {
+            log.error("Failed to scan tenant skills directory: {}", e.getMessage());
+        }
+    }
+
+    private void loadSkill(Path skillDir, Map<String, SkillDefinition> target, String tenantId) {
         Path skillFile = skillDir.resolve("SKILL.md");
         if (!Files.exists(skillFile)) return;
 
@@ -64,10 +166,10 @@ public class SkillRegistry {
                         dirName, p.name(), p.name());
             }
 
-            skills.put(p.name(), new SkillDefinition(
+            target.put(p.name(), new SkillDefinition(
                     p.name(), p.description(), p.language(), p.timeoutSeconds(), p.inputSchema(),
                     p.implementation(), content, p.producesArtifact()));
-            log.debug("Loaded skill: {}", p.name());
+            log.debug("Loaded skill: {} ({})", p.name(), tenantId == null ? "shared" : "tenant " + tenantId);
         } catch (Exception e) {
             log.error("Failed to load skill from {}: {}", skillFile, e.getMessage());
         }
@@ -108,21 +210,100 @@ public class SkillRegistry {
         return new SkillDefinition.ProducesArtifact(pf, source);
     }
 
+    // ── Lookup ────────────────────────────────────────────────────────────────
+
+    /**
+     * Shared skills only. A caller that has a tenant must pass it — omitting one resolves to the
+     * shared tier rather than to some other tenant's, so a forgotten tenant is a missing-skill bug,
+     * never a cross-tenant leak.
+     */
     public Optional<SkillDefinition> find(String name) {
-        return Optional.ofNullable(skills.get(name));
+        return findFor(null, name);
     }
 
+    /**
+     * Resolves {@code name} for one tenant: its own skills first, then shared. Consults exactly one
+     * tenant's map — there is no fallback that could reach another tenant's copy.
+     */
+    public Optional<SkillDefinition> findFor(String tenantId, String name) {
+        // Refused before the tier lookup: under a control plane an unmanaged skill is not a tool,
+        // whichever tier it happens to sit in.
+        if (!isUsable(tenantId, name)) return Optional.empty();
+        if (tenantId != null) {
+            SkillDefinition own = tenantSkills.getOrDefault(tenantId, Map.of()).get(name);
+            if (own != null) return Optional.of(own);
+        }
+        return Optional.ofNullable(sharedSkills.get(name));
+    }
+
+    /** Shared skills only — see {@link #find(String)}. */
     public Collection<SkillDefinition> all() {
-        return Collections.unmodifiableCollection(skills.values());
+        return allFor(null);
     }
 
+    /** Everything one tenant can see: its own skills shadowing shared ones of the same name. */
+    public Collection<SkillDefinition> allFor(String tenantId) {
+        Map<String, SkillDefinition> merged = new LinkedHashMap<>(sharedSkills);
+        if (tenantId != null) {
+            Map<String, SkillDefinition> own = tenantSkills.getOrDefault(tenantId, Map.of());
+            own.forEach((name, def) -> {
+                if (merged.put(name, def) != null) {
+                    log.info("Tenant {} overrides shared skill '{}' with its own definition", tenantId, name);
+                }
+            });
+        }
+        if (vortoxGoverned()) {
+            int before = merged.size();
+            merged.keySet().removeIf(name -> !isVortoxManaged(tenantId, name));
+            if (before != merged.size()) {
+                log.info("Withheld {} local skill(s) from tenant {}: this sidecar is governed by "
+                        + "Vortox and offers only what Vortox delivered", before - merged.size(), tenantId);
+            }
+        }
+        return Collections.unmodifiableCollection(merged.values());
+    }
+
+    /** Loaded from disk but withheld, so the UI can show an operator what is being ignored. */
+    public Collection<String> unusableNames(String tenantId) {
+        if (!vortoxGoverned()) return List.of();
+        Set<String> names = new LinkedHashSet<>(sharedSkills.keySet());
+        if (tenantId != null) names.addAll(tenantSkills.getOrDefault(tenantId, Map.of()).keySet());
+        names.removeIf(name -> isVortoxManaged(tenantId, name));
+        return names;
+    }
+
+    /** Shared skills only — see {@link #find(String)}. */
     public List<SkillDefinition> subset(List<String> names) {
-        if (names == null || names.isEmpty()) return new ArrayList<>(skills.values());
-        return names.stream().map(skills::get).filter(Objects::nonNull).toList();
+        return subsetFor(null, names);
     }
 
+    /**
+     * The named skills as one tenant sees them, or everything it can see when {@code names} is
+     * empty. Unknown names are dropped, exactly as before — a tenant asking for a skill it has no
+     * access to gets nothing rather than someone else's.
+     */
+    public List<SkillDefinition> subsetFor(String tenantId, List<String> names) {
+        if (names == null || names.isEmpty()) return new ArrayList<>(allFor(tenantId));
+        return names.stream()
+                .map(name -> findFor(tenantId, name).orElse(null))
+                .filter(Objects::nonNull)
+                .toList();
+    }
+
+    /** Number of shared skills. */
     public int count() {
-        return skills.size();
+        return sharedSkills.size();
+    }
+
+    /** Number of skills one tenant can see, counting its overrides once. */
+    public int countFor(String tenantId) {
+        return allFor(tenantId).size();
+    }
+
+    /** Skill names this tenant defines itself, for surfacing overrides in the UI. */
+    public Set<String> tenantOwnedNames(String tenantId) {
+        if (tenantId == null) return Set.of();
+        return Set.copyOf(tenantSkills.getOrDefault(tenantId, Map.of()).keySet());
     }
 
     /**
@@ -135,8 +316,26 @@ public class SkillRegistry {
      * {@code name:} field, silently orphaning the directory and confusing later edits/deletes.
      */
     public SkillDefinition save(String name, String content) throws IOException {
+        return save(null, name, content);
+    }
+
+    /**
+     * Records that this skill came from a Vortox sync rather than a local upload, so the UI can stop
+     * offering to edit something the next sync will overwrite.
+     */
+    public SkillDefinition saveFromVortox(String tenantId, String name, String content) throws IOException {
+        SkillDefinition saved = save(tenantId, name, content);
+        vortoxManaged.add(provenanceKey(tenantId, name));
+        return saved;
+    }
+
+    /** Saves into one tenant's private tier, or the shared tier when {@code tenantId} is null. */
+    public SkillDefinition save(String tenantId, String name, String content) throws IOException {
         if (name == null || name.isBlank()) throw new IllegalArgumentException("name is required");
         if (content == null || content.isBlank()) throw new IllegalArgumentException("content is required");
+        if (TENANTS_DIR.equals(name)) {
+            throw new IllegalArgumentException("'" + TENANTS_DIR + "' is reserved and cannot be a skill name");
+        }
 
         ParsedSkill p = parse(content);
         if (p.name() == null || p.implementation() == null) {
@@ -148,15 +347,15 @@ public class SkillRegistry {
                             + p.name() + "'. They must match.");
         }
 
-        Path skillDir = Path.of(skillsPath, name);
+        Path skillDir = skillDirFor(tenantId, name);
         Files.createDirectories(skillDir);
         Files.writeString(skillDir.resolve("SKILL.md"), content);
 
         SkillDefinition saved = new SkillDefinition(
                 p.name(), p.description(), p.language(), p.timeoutSeconds(), p.inputSchema(),
                 p.implementation(), content, p.producesArtifact());
-        skills.put(p.name(), saved);
-        log.info("Saved skill: {}", name);
+        targetMap(tenantId).put(p.name(), saved);
+        log.info("Saved skill: {} ({})", name, tenantId == null ? "shared" : "tenant " + tenantId);
         return saved;
     }
 
@@ -165,7 +364,15 @@ public class SkillRegistry {
      * Returns false if the skill was not found.
      */
     public boolean delete(String name) throws IOException {
-        Path skillDir = Path.of(skillsPath, name);
+        return delete(null, name);
+    }
+
+    /**
+     * Deletes from one tier only. Deleting a tenant's override does not touch the shared skill of
+     * the same name — the tenant simply stops shadowing it.
+     */
+    public boolean delete(String tenantId, String name) throws IOException {
+        Path skillDir = skillDirFor(tenantId, name);
         if (!Files.exists(skillDir)) return false;
 
         try (Stream<Path> walker = Files.walk(skillDir)) {
@@ -173,8 +380,64 @@ public class SkillRegistry {
                   .map(Path::toFile)
                   .forEach(java.io.File::delete);
         }
-        skills.remove(name);
-        log.info("Deleted skill: {}", name);
+        targetMap(tenantId).remove(name);
+        log.info("Deleted skill: {} ({})", name, tenantId == null ? "shared" : "tenant " + tenantId);
         return true;
+    }
+
+    /**
+     * Replaces one tenant's private tier wholesale, evicting skills the backend no longer returns.
+     * Scoped to the given tenant so a sync for one tenant cannot disturb another's — the reason this
+     * exists rather than a global reset.
+     */
+    public void replaceTenantTier(String tenantId, Map<String, String> nameToContent) throws IOException {
+        if (tenantId == null || tenantId.isBlank()) {
+            throw new IllegalArgumentException("tenantId is required to replace a tenant tier");
+        }
+        Path tenantRoot = Path.of(skillsPath, TENANTS_DIR, sanitizeSegment(tenantId));
+        Set<String> keep = nameToContent.keySet();
+
+        for (String stale : Set.copyOf(tenantSkills.getOrDefault(tenantId, Map.of()).keySet())) {
+            if (!keep.contains(stale)) delete(tenantId, stale);
+        }
+        for (Map.Entry<String, String> e : nameToContent.entrySet()) {
+            try {
+                saveFromVortox(tenantId, e.getKey(), e.getValue());
+            } catch (Exception ex) {
+                log.warn("Tenant {}: failed to save synced skill '{}': {}", tenantId, e.getKey(), ex.getMessage());
+            }
+        }
+        if (!Files.exists(tenantRoot) && !nameToContent.isEmpty()) {
+            log.warn("Tenant {} skill directory missing after sync: {}", tenantId, tenantRoot);
+        }
+    }
+
+    /** True once this tenant's private tier has been populated, so sync can be lazy. */
+    public boolean hasTenantTier(String tenantId) {
+        return tenantId != null && tenantSkills.containsKey(tenantId);
+    }
+
+    private Map<String, SkillDefinition> targetMap(String tenantId) {
+        return tenantId == null
+                ? sharedSkills
+                : tenantSkills.computeIfAbsent(tenantId, k -> new ConcurrentHashMap<>());
+    }
+
+    private Path skillDirFor(String tenantId, String name) {
+        return tenantId == null
+                ? Path.of(skillsPath, sanitizeSegment(name))
+                : Path.of(skillsPath, TENANTS_DIR, sanitizeSegment(tenantId), sanitizeSegment(name));
+    }
+
+    /**
+     * Keeps a tenant id or skill name to a single directory name. Both reach here from outside this
+     * process — a tenant id from a request header, a skill name from a synced SKILL.md — so neither
+     * may contain a separator that would write outside its own tier.
+     */
+    private static String sanitizeSegment(String raw) {
+        String safe = raw == null ? "" : raw.replaceAll("[^A-Za-z0-9._-]", "_");
+        while (safe.startsWith(".")) safe = safe.substring(1);
+        if (safe.isBlank()) throw new IllegalArgumentException("Unusable path segment: '" + raw + "'");
+        return safe;
     }
 }

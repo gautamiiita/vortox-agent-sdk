@@ -35,7 +35,7 @@ class AgentControllerLinkStatusTest {
     void notLinkedWhenNoRefreshServiceBeanExists() {
         AgentController controller = controllerWithRefreshService(null);
 
-        ResponseEntity<Map<String, Object>> response = controller.linkStatus();
+        ResponseEntity<Map<String, Object>> response = controller.linkStatus(null);
 
         assertThat(response.getBody().get("linked")).isEqualTo(false);
         assertThat(response.getBody()).doesNotContainKey("availableSkills");
@@ -44,10 +44,10 @@ class AgentControllerLinkStatusTest {
     @Test
     void notLinkedWhenRefreshServiceHasNoAgentConfigYet() {
         AnthropicKeyRefreshService refreshService = mock(AnthropicKeyRefreshService.class);
-        when(refreshService.getAgentConfig()).thenReturn(null);
+        when(refreshService.getAgentConfig(null)).thenReturn(null);
 
         AgentController controller = controllerWithRefreshService(refreshService);
-        ResponseEntity<Map<String, Object>> response = controller.linkStatus();
+        ResponseEntity<Map<String, Object>> response = controller.linkStatus(null);
 
         assertThat(response.getBody().get("linked")).isEqualTo(false);
     }
@@ -55,14 +55,14 @@ class AgentControllerLinkStatusTest {
     @Test
     void linkedExposesAgentIdAndAvailableSkills() {
         AnthropicKeyRefreshService refreshService = mock(AnthropicKeyRefreshService.class);
-        when(refreshService.getAgentConfig()).thenReturn(Map.of(
+        when(refreshService.getAgentConfig(null)).thenReturn(Map.of(
                 "agentId", "agent-123",
                 "name", "TNAM Assistant",
                 "availableSkills", List.of("file_read", "oracle_query")
         ));
 
         AgentController controller = controllerWithRefreshService(refreshService);
-        ResponseEntity<Map<String, Object>> response = controller.linkStatus();
+        ResponseEntity<Map<String, Object>> response = controller.linkStatus(null);
 
         Map<String, Object> body = response.getBody();
         assertThat(body.get("linked")).isEqualTo(true);
@@ -74,10 +74,10 @@ class AgentControllerLinkStatusTest {
     @Test
     void linkedWithEmptyAvailableSkillsMeansAllAreAvailable() {
         AnthropicKeyRefreshService refreshService = mock(AnthropicKeyRefreshService.class);
-        when(refreshService.getAgentConfig()).thenReturn(Map.of("agentId", "agent-456"));
+        when(refreshService.getAgentConfig(null)).thenReturn(Map.of("agentId", "agent-456"));
 
         AgentController controller = controllerWithRefreshService(refreshService);
-        ResponseEntity<Map<String, Object>> response = controller.linkStatus();
+        ResponseEntity<Map<String, Object>> response = controller.linkStatus(null);
 
         assertThat(response.getBody().get("linked")).isEqualTo(true);
         assertThat((List<?>) response.getBody().get("availableSkills")).isEmpty();

@@ -45,9 +45,15 @@
     file_read: 'Reading file',
     file_write: 'Writing file',
     http_request: 'Making HTTP request',
-    oracle_to_studio: 'Querying database',
+    execute_oracle_sql: 'Querying the database',
+    oracle_query: 'Querying the database',
+    oracle_to_studio: 'Exporting query results',
+    oracle_schema: 'Reviewing database schema',
     s360_db_guide: 'Reviewing database schema',
+    recall_memory: 'Recalling earlier context',
     docker_build_and_run: 'Building & running container',
+    docker_compose_verify: 'Verifying the stack',
+    e2e_test: 'Running browser tests',
     run_sql_query: 'Running SQL query',
     search_code: 'Searching code'
   };
@@ -595,9 +601,45 @@
     if (label) label.textContent = text;
   }
 
-  /** Appends a new "in progress" row to the live step trace for a tool that just started. */
+  /** Text for a step row: the label, how many calls it stands for, and how many of them failed.
+   *  The failure note is only added when there were failures, so a tool legitimately called
+   *  several times in a row reads as "×3" rather than as three things going wrong. */
+  function stepText(step) {
+    var n = step.attempts || 1;
+    var failures = step.failures || 0;
+    var text = step.label + (n > 1 ? ' ×' + n : '');
+    if (step.status === 'running') return text + '…';
+    if (step.status === 'failed') {
+      return n > 1 ? text + ' · ' + failures + ' of ' + n + ' failed' : text;
+    }
+    if (failures > 0) {
+      text += ' · succeeded after ' + failures + (failures === 1 ? ' failure' : ' failures');
+    }
+    return text;
+  }
+
+  /** Appends a new "in progress" row to the live step trace for a tool that just started.
+   *
+   *  Consecutive calls of the same tool collapse into the row already there. The agent retrying a
+   *  failed query, or refining and re-running one, is a single piece of work — eight identical
+   *  rows report it eight times and read as eight separate things going wrong. One row carrying an
+   *  attempt count says what actually happened, and says it in the space of a line. Runs of a
+   *  different tool in between still start a new row, so the order of work stays visible. */
   function addStep(tool) {
-    var step = { tool: tool, label: humanizeTool(tool), status: 'running' };
+    var previous = steps.length ? steps[steps.length - 1] : null;
+    if (previous && previous.tool === tool && previous.status !== 'running') {
+      previous.attempts = (previous.attempts || 1) + 1;
+      previous.status = 'running';
+      if (previous.rowEl) {
+        previous.rowEl.className = 'vx-step vx-step-running';
+        previous.iconEl.textContent = '●';
+        previous.textEl.textContent = stepText(previous);
+      }
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+      return;
+    }
+
+    var step = { tool: tool, label: humanizeTool(tool), status: 'running', attempts: 1, failures: 0 };
     var stepsEl = document.getElementById('vx-steps');
     if (stepsEl) {
       var row = document.createElement('div');
@@ -607,7 +649,7 @@
       icon.textContent = '●';
       var text = document.createElement('span');
       text.className = 'vx-step-text';
-      text.textContent = step.label + '…';
+      text.textContent = stepText(step);
       row.appendChild(icon);
       row.appendChild(text);
       stepsEl.appendChild(row);
@@ -623,10 +665,11 @@
     for (var i = steps.length - 1; i >= 0; i--) {
       if (steps[i].tool === tool && steps[i].status === 'running') {
         steps[i].status = success ? 'done' : 'failed';
+        if (!success) steps[i].failures = (steps[i].failures || 0) + 1;
         if (steps[i].rowEl) {
           steps[i].rowEl.className = 'vx-step ' + (success ? 'vx-step-done' : 'vx-step-failed');
           steps[i].iconEl.textContent = success ? '✓' : '✗';
-          steps[i].textEl.textContent = steps[i].label;
+          steps[i].textEl.textContent = stepText(steps[i]);
         }
         return;
       }
@@ -645,8 +688,11 @@
   function renderStepSummary(elapsedMs) {
     if (!steps.length) return;
 
-    var failedCount = steps.filter(function (s) { return s.status === 'failed'; }).length;
-    var label = steps.length + (steps.length === 1 ? ' step' : ' steps');
+    // Counted over attempts, not rows: rows collapse consecutive calls of the same tool, so
+    // steps.length would under-report both the work done and the failures along the way.
+    var totalCalls = steps.reduce(function (n, s) { return n + (s.attempts || 1); }, 0);
+    var failedCount = steps.reduce(function (n, s) { return n + (s.failures || 0); }, 0);
+    var label = totalCalls + (totalCalls === 1 ? ' step' : ' steps');
     if (failedCount) label += ', ' + failedCount + ' failed';
 
     var wrap = document.createElement('div');
@@ -665,7 +711,7 @@
       row.className = 'vx-step vx-step-' + s.status;
       var iconChar = s.status === 'failed' ? '✗' : (s.status === 'running' ? '•' : '✓');
       row.innerHTML = '<span class="vx-step-icon">' + iconChar + '</span><span class="vx-step-text">' +
-        esc(s.label) + '</span>';
+        esc(stepText(s)) + '</span>';
       detail.appendChild(row);
     });
 

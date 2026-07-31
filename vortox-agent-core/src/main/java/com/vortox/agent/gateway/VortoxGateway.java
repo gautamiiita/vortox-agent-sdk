@@ -56,13 +56,27 @@ public class VortoxGateway {
 
     @SuppressWarnings("unchecked")
     public List<Map<String, Object>> fetchSkills() {
+        return fetchSkills(null);
+    }
+
+    /** Skills visible to one tenant: the shared tier plus that tenant's own. */
+    @SuppressWarnings("unchecked")
+    public List<Map<String, Object>> fetchSkills(String tenantCode) {
         try {
-            String json = get("/api/sdk/v1/skills");
+            String json = get("/api/sdk/v1/skills", tenantCode);
             return objectMapper.readValue(json, List.class);
         } catch (Exception e) {
-            log.warn("Failed to fetch skills from Vortox: {}", e.getMessage());
+            log.warn("Failed to fetch skills from Vortox (tenant={}): {}", tenantCode, e.getMessage());
             return List.of();
         }
+    }
+
+    /**
+     * Raw {@code GET} against the SDK gateway on behalf of one tenant, for callers that need the
+     * response body rather than a parsed shape (the skill-sync service parses its own).
+     */
+    public String getForTenant(String path, String tenantCode) throws Exception {
+        return get(path, tenantCode);
     }
 
     // ── Instance lifecycle ────────────────────────────────────────────────────
@@ -114,6 +128,15 @@ public class VortoxGateway {
     // ── Run tracking ──────────────────────────────────────────────────────────
 
     public void createRun(String runId, String agentId, String task, String model) {
+        createRun(runId, agentId, task, model, null);
+    }
+
+    /**
+     * Records a run for one tenant. The tenant travels as a header, not in the body: Vortox stamps
+     * the run from the <em>resolved</em> tenant so a caller cannot attribute its usage — or its quota
+     * consumption — to somebody else.
+     */
+    public void createRun(String runId, String agentId, String task, String model, String tenantCode) {
         try {
             Map<String, Object> body = new HashMap<>();
             body.put("runId", runId);
@@ -121,22 +144,35 @@ public class VortoxGateway {
             body.put("instanceId", instanceId);
             body.put("task", task != null ? task : "");
             body.put("model", model != null ? model : "");
-            post("/api/sdk/v1/runs", body);
+            post("/api/sdk/v1/runs", body, tenantCode);
         } catch (Exception e) {
-            log.debug("Run tracking unavailable: {}", e.getMessage());
+            // Deliberately WARN, not DEBUG. This is the usage record the platform bills and enforces
+            // quotas on, so losing it must not be silent — a pooled key with no tenant code drops
+            // every run on the floor, and at DEBUG the only symptom is an empty tracking screen.
+            log.warn("Run {} was NOT recorded in Vortox (tenant={}): {}", runId, tenantCode,
+                    e.getMessage());
         }
     }
 
     public void updateRun(String runId, String status, String result, int inputTokens, int outputTokens) {
+        updateRun(runId, status, result, inputTokens, outputTokens, null);
+    }
+
+    /** The tenant must match the one the run was created under, or Vortox refuses the update. */
+    public void updateRun(String runId, String status, String result, int inputTokens, int outputTokens,
+                          String tenantCode) {
         try {
             Map<String, Object> body = new HashMap<>();
             body.put("status", status);
             if (result != null) body.put("result", result);
             body.put("inputTokens", inputTokens);
             body.put("outputTokens", outputTokens);
-            put("/api/sdk/v1/runs/" + runId, body);
+            put("/api/sdk/v1/runs/" + runId, body, tenantCode);
         } catch (Exception e) {
-            log.debug("Run update unavailable: {}", e.getMessage());
+            // Same reasoning as createRun: a run left at RUNNING with no token counts is a silent
+            // hole in usage and quota accounting.
+            log.warn("Run {} result was NOT recorded in Vortox (tenant={}): {}", runId, tenantCode,
+                    e.getMessage());
         }
     }
 
@@ -243,12 +279,32 @@ public class VortoxGateway {
 
     // ── HTTP helpers ──────────────────────────────────────────────────────────
 
+    /**
+     * The header that tells Vortox which tenant a call is for.
+     *
+     * <p>The API key identifies the <em>deployment</em>; when that deployment is embedded in a host
+     * application serving many tenants, the tenant travels per request as the host's own code (TNAM
+     * sends {@code CUBE}). Vortox resolves it against registrations made for this application and
+     * refuses anything unregistered, so this is a scope selector, never a credential — and the
+     * application type is taken from the authenticated key, not sent from here.
+     */
+    public static final String TENANT_CODE_HEADER = "X-Vortox-Tenant-Code";
+
     private String get(String path) throws Exception {
-        HttpRequest req = HttpRequest.newBuilder()
+        return get(path, null);
+    }
+
+    /** As {@link #get(String)}, scoped to one tenant when {@code tenantCode} is non-blank. */
+    private String get(String path, String tenantCode) throws Exception {
+        HttpRequest.Builder builder = HttpRequest.newBuilder()
                 .uri(URI.create(baseUrl + path))
                 .header("Content-Type", "application/json")
                 .header("X-Vortox-Api-Key", apiKey)
-                .header("X-Sdk-Instance-Id", instanceId)
+                .header("X-Sdk-Instance-Id", instanceId);
+        if (tenantCode != null && !tenantCode.isBlank()) {
+            builder.header(TENANT_CODE_HEADER, tenantCode);
+        }
+        HttpRequest req = builder
                 .GET()
                 .timeout(Duration.ofSeconds(REQUEST_TIMEOUT_SECONDS))
                 .build();
@@ -260,12 +316,16 @@ public class VortoxGateway {
     }
 
     private String post(String path, Object body) throws Exception {
+        return post(path, body, null);
+    }
+
+    private String post(String path, Object body, String tenantCode) throws Exception {
         String json = objectMapper.writeValueAsString(body);
-        HttpRequest req = HttpRequest.newBuilder()
+        HttpRequest req = withTenant(HttpRequest.newBuilder()
                 .uri(URI.create(baseUrl + path))
                 .header("Content-Type", "application/json")
                 .header("X-Vortox-Api-Key", apiKey)
-                .header("X-Sdk-Instance-Id", instanceId)
+                .header("X-Sdk-Instance-Id", instanceId), tenantCode)
                 .POST(HttpRequest.BodyPublishers.ofString(json))
                 .timeout(Duration.ofSeconds(REQUEST_TIMEOUT_SECONDS))
                 .build();
@@ -277,12 +337,16 @@ public class VortoxGateway {
     }
 
     private void put(String path, Object body) throws Exception {
+        put(path, body, null);
+    }
+
+    private void put(String path, Object body, String tenantCode) throws Exception {
         String json = objectMapper.writeValueAsString(body);
-        HttpRequest req = HttpRequest.newBuilder()
+        HttpRequest req = withTenant(HttpRequest.newBuilder()
                 .uri(URI.create(baseUrl + path))
                 .header("Content-Type", "application/json")
                 .header("X-Vortox-Api-Key", apiKey)
-                .header("X-Sdk-Instance-Id", instanceId)
+                .header("X-Sdk-Instance-Id", instanceId), tenantCode)
                 .PUT(HttpRequest.BodyPublishers.ofString(json))
                 .timeout(Duration.ofSeconds(REQUEST_TIMEOUT_SECONDS))
                 .build();
@@ -290,6 +354,13 @@ public class VortoxGateway {
         if (resp.statusCode() >= 400) {
             throw new RuntimeException("HTTP " + resp.statusCode() + " from " + path + ": " + resp.body());
         }
+    }
+
+    private static HttpRequest.Builder withTenant(HttpRequest.Builder builder, String tenantCode) {
+        if (tenantCode != null && !tenantCode.isBlank()) {
+            builder.header(TENANT_CODE_HEADER, tenantCode);
+        }
+        return builder;
     }
 
     private void delete(String path) throws Exception {

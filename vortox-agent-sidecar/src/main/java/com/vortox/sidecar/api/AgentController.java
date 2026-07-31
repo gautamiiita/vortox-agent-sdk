@@ -62,6 +62,14 @@ public class AgentController {
     public ResponseEntity<Map<String, Object>> uploadSkill(@RequestBody Map<String, String> body) {
         String name    = body.get("name");
         String content = body.get("content");
+        // Refused server-side, not merely hidden in the UI: the browser is not the only caller, and
+        // a write that the next sync silently discards is worse than a clear refusal.
+        if (name != null && skillRegistry.isVortoxManaged(null, name)) {
+            return ResponseEntity.status(HttpStatus.CONFLICT).body(Map.of(
+                    "error", "'" + name + "' is managed by Vortox and would be overwritten on the "
+                            + "next sync. Edit it in Vortox instead.",
+                    "code", "SKILL_MANAGED_BY_VORTOX"));
+        }
         try {
             SkillDefinition saved = skillRegistry.save(name, content);
             return ResponseEntity.ok(Map.of(
@@ -82,6 +90,14 @@ public class AgentController {
     /** Delete a skill by name. */
     @DeleteMapping("/skills/{name}")
     public ResponseEntity<Map<String, Object>> deleteSkill(@PathVariable String name) {
+        // Deleting a managed skill only removes it until the next sync restores it — a confusing
+        // no-op rather than a deletion. Refuse and point at where it can actually be removed.
+        if (skillRegistry.isVortoxManaged(null, name)) {
+            return ResponseEntity.status(HttpStatus.CONFLICT).body(Map.of(
+                    "error", "'" + name + "' is managed by Vortox and the next sync would restore it. "
+                            + "Delete it in Vortox instead.",
+                    "code", "SKILL_MANAGED_BY_VORTOX"));
+        }
         try {
             boolean deleted = skillRegistry.delete(name);
             if (!deleted) return ResponseEntity.notFound().build();
@@ -175,7 +191,9 @@ public class AgentController {
                 75,
                 apiKey,
                 request.llmProvider(),
-                request.llmBaseUrl()
+                request.llmBaseUrl(),
+                // Resolved once, here at the boundary, then passed explicitly the whole way down.
+                request.tenantCode()
         );
 
         String runId = chatRunService.start(runRequest);
@@ -257,16 +275,40 @@ public class AgentController {
     }
 
     @GetMapping("/skills")
-    public ResponseEntity<List<Map<String, Object>>> skills() {
-        List<Map<String, Object>> list = skillRegistry.all().stream()
-                .map(s -> Map.of(
-                        "name", s.name(),
-                        "description", (Object) s.description(),
-                        "language", s.language(),
-                        "timeoutSeconds", s.timeoutSeconds()
-                ))
-                .sorted((a, b) -> a.get("name").toString().compareTo(b.get("name").toString()))
-                .toList();
+    public ResponseEntity<List<Map<String, Object>>> skills(
+            @org.springframework.web.bind.annotation.RequestParam(required = false) String tenantCode) {
+        String tenant = tenantCode == null || tenantCode.isBlank() ? null : tenantCode;
+        // Withheld skills are still listed — an operator needs to see that a file in the skills
+        // directory is being ignored, rather than watch it silently disappear from the agent.
+        java.util.Set<String> withheld = new java.util.LinkedHashSet<>(skillRegistry.unusableNames(tenant));
+        List<Map<String, Object>> list = skillRegistry.allFor(tenant).stream()
+                .map(s -> {
+                    Map<String, Object> m = new LinkedHashMap<>();
+                    m.put("name", s.name());
+                    m.put("description", s.description());
+                    m.put("language", s.language());
+                    m.put("timeoutSeconds", s.timeoutSeconds());
+                    // Whether Vortox owns this definition. A managed skill is replaced on the next
+                    // sync, so editing it here is discarded silently — the UI needs to say so rather
+                    // than offer an edit that appears to work and then vanishes.
+                    m.put("managedByVortox", skillRegistry.isVortoxManaged(tenant, s.name()));
+                    m.put("ignored", false);
+                    return m;
+                })
+                .collect(java.util.stream.Collectors.toCollection(java.util.ArrayList::new));
+
+        for (String name : withheld) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("name", name);
+            m.put("description", "Not delivered by Vortox — ignored while this sidecar is governed. "
+                    + "Register it in Vortox, or remove the file.");
+            m.put("language", "-");
+            m.put("timeoutSeconds", 0);
+            m.put("managedByVortox", false);
+            m.put("ignored", true);
+            list.add(m);
+        }
+        list.sort((a, b) -> a.get("name").toString().compareTo(b.get("name").toString()));
         return ResponseEntity.ok(list);
     }
 
@@ -280,12 +322,23 @@ public class AgentController {
      * and to switch itself to read-only when a link is present.
      */
     @GetMapping("/link-status")
-    public ResponseEntity<Map<String, Object>> linkStatus() {
+    public ResponseEntity<Map<String, Object>> linkStatus(
+            @org.springframework.web.bind.annotation.RequestParam(required = false) String tenantCode) {
+        // Per tenant: on a pooled sidecar two institutions can link different agents, so "is this
+        // container linked" is only answerable once you say who is asking.
         Map<String, Object> agentConfig = anthropicKeyRefreshService != null
-                ? anthropicKeyRefreshService.getAgentConfig() : null;
+                ? anthropicKeyRefreshService.getAgentConfig(
+                        tenantCode == null || tenantCode.isBlank() ? null : tenantCode)
+                : null;
+
+        // "Linked" means an actual agent, not merely that config arrived: Vortox also sends a
+        // skills-only config to apply a tenant's allow-list when no agent is linked. Treating that as
+        // linked would show the UI an agent named "unknown" and switch it to read-only for nothing.
+        boolean linked = agentConfig != null && agentConfig.get("agentId") != null;
 
         Map<String, Object> body = new LinkedHashMap<>();
-        body.put("linked", agentConfig != null);
+        body.put("linked", linked);
+        if (tenantCode != null && !tenantCode.isBlank()) body.put("tenantCode", tenantCode);
         if (agentConfig != null) {
             body.put("agentId", agentConfig.get("agentId"));
             body.put("agentName", agentConfig.get("name"));

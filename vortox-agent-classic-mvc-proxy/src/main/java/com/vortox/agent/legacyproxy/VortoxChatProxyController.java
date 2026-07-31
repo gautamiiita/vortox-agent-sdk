@@ -73,10 +73,34 @@ public class VortoxChatProxyController implements Controller {
 
     private void handleStart(HttpServletRequest request, HttpServletResponse response) throws IOException {
         String rawBody = readBody(request);
+
+        // An empty body is a different failure from bad JSON and needs saying so: it means the
+        // request arrived without one — the stream was already consumed by an upstream filter, or
+        // something between the browser and here dropped it — not that the widget sent junk.
+        // Jackson makes the two look alike, since readTree("") yields a MissingNode that only
+        // fails later, on the cast.
+        if (rawBody.isEmpty()) {
+            log.warn("Chat start rejected: empty request body (Content-Length header={}, Content-Type={})",
+                    request.getHeader("Content-Length"), request.getContentType());
+            writeJson(response, HttpServletResponse.SC_BAD_REQUEST,
+                    "{\"error\":\"Empty request body\"}");
+            return;
+        }
+
         ObjectNode payload;
         try {
-            payload = (ObjectNode) OBJECT_MAPPER.readTree(rawBody);
+            com.fasterxml.jackson.databind.JsonNode parsed = OBJECT_MAPPER.readTree(rawBody);
+            if (!(parsed instanceof ObjectNode)) {
+                throw new IOException("expected a JSON object, got " + parsed.getNodeType());
+            }
+            payload = (ObjectNode) parsed;
         } catch (Exception e) {
+            // Logged with the size and both ends of the body: a body that parses in the browser but
+            // not here is almost always truncated in transit, which shows up as a plausible opening
+            // and a tail that stops mid-token. Without this the failure left no trace at all.
+            log.warn("Chat start rejected: unparseable request body ({} chars, Content-Length header={}): {} — starts '{}', ends '{}'",
+                    rawBody.length(), request.getHeader("Content-Length"), e.getMessage(),
+                    preview(rawBody, true), preview(rawBody, false));
             writeJson(response, HttpServletResponse.SC_BAD_REQUEST, "{\"error\":\"Malformed request body\"}");
             return;
         }
@@ -142,6 +166,13 @@ public class VortoxChatProxyController implements Controller {
             }
         }
         return new RelayRequestContext(headers, request.getRemoteUser(), request.getRemoteAddr());
+    }
+
+    /** First or last 120 characters of the body, for a diagnostic log line — never echoed to the caller. */
+    private static String preview(String body, boolean head) {
+        int limit = 120;
+        if (body.length() <= limit) return head ? body : "";
+        return head ? body.substring(0, limit) : body.substring(body.length() - limit);
     }
 
     private static String readBody(HttpServletRequest request) throws IOException {

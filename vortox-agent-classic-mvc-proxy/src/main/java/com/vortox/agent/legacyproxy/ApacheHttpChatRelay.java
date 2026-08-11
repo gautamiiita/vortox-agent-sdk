@@ -20,8 +20,16 @@ import java.io.OutputStream;
  * {@link ChatRelay} backed by Apache HttpClient 4.x — matches what TNAM's existing hand-rolled
  * proxy controller already uses, since this module's runtime may predate {@code java.net.http}
  * (Java 11+).
+ * <p>
+ * Carries the sidecar's shared key on every request. That key belongs on this hop and no earlier:
+ * the browser widget must never hold it, because anything that can call {@code /agent/**} can
+ * upload a skill script and run it. This relay is the first server-side step, so it is where the
+ * secret enters the chain.
  */
 public final class ApacheHttpChatRelay implements ChatRelay {
+
+    /** Header the sidecar's SidecarApiKeyFilter requires on every /agent/** call. */
+    private static final String API_KEY_HEADER = "X-Sidecar-Key";
 
     /** Generous ceiling for the stream socket — mirrors the widget's own MAX_WAIT_MS default. */
     private static final int STREAM_SOCKET_TIMEOUT_MS = 20 * 60 * 1000;
@@ -29,21 +37,29 @@ public final class ApacheHttpChatRelay implements ChatRelay {
     private static final int DEFAULT_SOCKET_TIMEOUT_MS = 30_000;
 
     private final String sidecarUrl;
+    private final String apiKey;
     private final CloseableHttpClient client;
 
+    /** No key — every call will be refused by a sidecar that has one configured. */
     public ApacheHttpChatRelay(String sidecarUrl) {
-        this(sidecarUrl, HttpClients.createDefault());
+        this(sidecarUrl, null, HttpClients.createDefault());
+    }
+
+    public ApacheHttpChatRelay(String sidecarUrl, String apiKey) {
+        this(sidecarUrl, apiKey, HttpClients.createDefault());
     }
 
     /** Package-visible for tests — inject a client pointed at a stub server. */
-    ApacheHttpChatRelay(String sidecarUrl, CloseableHttpClient client) {
+    ApacheHttpChatRelay(String sidecarUrl, String apiKey, CloseableHttpClient client) {
         this.sidecarUrl = trimTrailingSlash(sidecarUrl);
+        this.apiKey = apiKey != null && apiKey.trim().length() > 0 ? apiKey.trim() : null;
         this.client = client;
     }
 
     @Override
     public RelayResult start(String payloadJson) throws IOException {
         HttpPost post = new HttpPost(sidecarUrl + "/agent/chat");
+        applyApiKey(post);
         post.setEntity(new StringEntity(payloadJson, ContentType.APPLICATION_JSON));
         post.setConfig(RequestConfig.custom()
                 .setConnectTimeout(CONNECT_TIMEOUT_MS)
@@ -55,6 +71,7 @@ public final class ApacheHttpChatRelay implements ChatRelay {
     @Override
     public RelayResult poll(String runId) throws IOException {
         HttpGet get = new HttpGet(sidecarUrl + "/agent/chat/" + runId);
+        applyApiKey(get);
         get.setConfig(RequestConfig.custom()
                 .setConnectTimeout(CONNECT_TIMEOUT_MS)
                 .setSocketTimeout(DEFAULT_SOCKET_TIMEOUT_MS)
@@ -65,6 +82,7 @@ public final class ApacheHttpChatRelay implements ChatRelay {
     @Override
     public void stream(String runId, OutputStream sink) throws IOException {
         HttpGet get = new HttpGet(sidecarUrl + "/agent/chat/" + runId + "/stream");
+        applyApiKey(get);
         get.setConfig(RequestConfig.custom()
                 .setConnectTimeout(CONNECT_TIMEOUT_MS)
                 .setSocketTimeout(STREAM_SOCKET_TIMEOUT_MS)
@@ -99,6 +117,12 @@ public final class ApacheHttpChatRelay implements ChatRelay {
             return new RelayResult(status, body);
         } finally {
             response.close();
+        }
+    }
+
+    private void applyApiKey(HttpUriRequest request) {
+        if (apiKey != null) {
+            request.setHeader(API_KEY_HEADER, apiKey);
         }
     }
 

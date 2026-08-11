@@ -49,7 +49,16 @@ public class VortoxChatProxyController implements Controller {
     }
 
     public VortoxChatProxyController(String sidecarUrl, ChatContextEnricher enricher) {
-        this(new ApacheHttpChatRelay(sidecarUrl), enricher);
+        this(sidecarUrl, null, enricher);
+    }
+
+    /**
+     * @param apiKey the sidecar's shared key, sent as {@code X-Sidecar-Key}. The sidecar refuses
+     *               every {@code /agent/**} call without it. It is read here, server-side, and
+     *               never reaches the browser.
+     */
+    public VortoxChatProxyController(String sidecarUrl, String apiKey, ChatContextEnricher enricher) {
+        this(new ApacheHttpChatRelay(sidecarUrl, apiKey), enricher);
     }
 
     /** Package-visible for tests — inject a stub {@link ChatRelay} directly. */

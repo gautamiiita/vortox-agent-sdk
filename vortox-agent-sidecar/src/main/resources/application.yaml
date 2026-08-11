@@ -4,6 +4,12 @@ server:
 sidecar:
   skills-path: /app/skills
   default-model: claude-sonnet-4-6
+  # Shared secret required on every /agent/** call (header: X-Sidecar-Key). Unset = all agent
+  # routes refused, because /agent/skills/upload + /agent/run is arbitrary code execution.
+  api-key: ${SIDECAR_API_KEY:}
+  # Set false only for a true sidecar deployment, where the port is reachable solely from its own
+  # host application (loopback or a shared private network) and that boundary is the control.
+  auth-enabled: ${SIDECAR_AUTH_ENABLED:true}
 
 management:
   endpoints:

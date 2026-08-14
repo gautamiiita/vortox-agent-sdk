@@ -23,6 +23,20 @@
   // bounding which part of the page is reachable. Nothing has to be declared per action.
   var PAGE_ACTIONS_ENABLED = cfg.pageActions === true;
   var ACTION_SCOPE         = cfg.actionScope || null;
+
+  // ── Page context (read-only) ──────────────────────────────────────────────────
+  // Describing the page is its own capability, deliberately separate from changing it.
+  // A host that only wants "explain this screen" or "what is this form missing?" enables
+  // this alone and nothing can act on the page at all. Acting implies reading, so the
+  // write capabilities turn it on rather than requiring both flags to be set.
+  //
+  // `includeFieldValues` additionally sends what is typed into non-sensitive fields.
+  // Off by default because a host screen's inputs routinely carry personal data, and
+  // exporting it to an LLM should be an explicit decision per deployment, not a
+  // side effect of wanting the structure. See collectPageDom.
+  var SEND_PAGE_CONTEXT     = cfg.sendPageContext === true
+                              || PAGE_ACTIONS_ENABLED || ALLOW_PAGE_SCRIPTS;
+  var INCLUDE_FIELD_VALUES  = cfg.includeFieldValues === true;
   // Outcomes of the previous turn's actions, sent with the next message so the agent
   // learns whether what it asked for actually happened. Without this it proposes into a
   // void: a stale selector or a refusal would never reach the model.
@@ -232,6 +246,20 @@
     '.vx-summary-detail.vx-summary-detail-open{display:flex;flex-direction:column;gap:3px;}',
     '.vx-summary-wrap{display:flex;flex-direction:column;align-self:flex-start;max-width:100%;}',
 
+    /* Context chips — what the agent was told about this page and user. Sits directly under the
+       header, above the transcript, because it describes the whole conversation rather than any
+       one message. Muted by design: it should be checkable at a glance and ignorable otherwise. */
+    '#vx-context{padding:8px 14px;display:flex;flex-wrap:wrap;gap:5px;flex-shrink:0;',
+    'border-bottom:1px solid #eef2f7;background:#fbfdff;}',
+    '.vx-ctx-chip{background:#f1f5f9;border:1px solid #e2e8f0;color:#475569;',
+    'font-family:' + VX_FONT + ';font-size:11px;line-height:1.3;padding:3px 8px;border-radius:6px;',
+    'cursor:pointer;white-space:nowrap;transition:border-color .15s,color .15s;}',
+    '.vx-ctx-chip:hover{border-color:#94a3b8;color:#1e293b;}',
+    /* Absent context is a state worth seeing, not a chip worth hiding. */
+    '.vx-ctx-off{opacity:.55;text-decoration:line-through;}',
+    /* Arbitrary script execution is a standing risk, so it never reads as routine. */
+    '.vx-ctx-warn{background:#fef3c7;border-color:#fcd34d;color:#92400e;}',
+
     /* Suggestion chips */
     '#vx-suggestions{padding:0 14px 10px;display:flex;flex-wrap:wrap;gap:6px;flex-shrink:0;}',
     '.vx-chip{background:#ffffff;border:1px solid #e2e8f0;color:#475569;',
@@ -431,14 +459,36 @@
   }
 
   // ── DOM introspection ─────────────────────────────────────────────────────────
-  // Automatically collects IDs, labelled form fields, and headings from the live
-  // page so the LLM knows what it can manipulate — no manual pageApiDescription
-  // needed from the host application.
+  // Describes the live page to the agent: headings, addressable elements, and form
+  // fields. Structure is what makes the agent useful on a screen — it can say what a
+  // form is missing, or name the selector for an action — and it is separate from any
+  // ability to change the page (see sendPageContext vs pageActions).
+  //
+  // Field CONTENTS are a different matter. A host screen's inputs routinely hold
+  // personal data — names, emails, addresses, phone numbers — and sending them to an
+  // LLM as a side effect of wanting the structure is a decision no host should make
+  // implicitly. So values are opt-in (`includeFieldValues`), and even then the fields
+  // most likely to carry personal data are reported as filled-or-empty rather than
+  // quoted. Structure answers most questions; contents rarely add much and cost a lot.
+
+  /**
+   * Field id/label/name patterns whose contents are never sent, even with values enabled.
+   * Deliberately broad: over-redacting costs the agent a detail it can ask about, while
+   * under-redacting exports somebody's personal data and cannot be taken back.
+   */
+  var SENSITIVE_FIELD = /(pass|pwd|secret|token|mail|phone|tel|mobile|name|surname|firstname|lastname|birth|dob|address|street|city|zip|postal|iban|bic|card|cvv|ccv|account|ssn|nif|siret|vat|tax|licen|passport|identity|note|comment)/i;
+
+  function isSensitiveField(el, labelText) {
+    if (el.type === 'password') return true;
+    var haystack = [el.id, el.name, el.getAttribute('placeholder'), labelText]
+      .filter(Boolean).join(' ');
+    return SENSITIVE_FIELD.test(haystack);
+  }
 
   function collectPageDom() {
     var parts = [];
 
-    // Headings give the LLM a structural map of the page
+    // Headings give the agent a structural map of the page
     var headings = [];
     document.querySelectorAll('h1,h2,h3').forEach(function (el) {
       var text = el.textContent.trim().replace(/\s+/g, ' ');
@@ -459,21 +509,55 @@
     });
     if (elements.length) parts.push('### Elements with IDs\n' + elements.join('\n'));
 
-    // Labelled form inputs — especially useful for knowing editable field names
+    // Form fields: what they are and whether they are filled. Contents only when the
+    // host asked for them and the field is not one that typically carries personal data.
     var fields = [];
+    var redacted = 0;
     document.querySelectorAll('input,select,textarea').forEach(function (el) {
       if (!el.id || /^vx-/.test(el.id)) return;
       var label = document.querySelector('label[for="' + el.id + '"]');
       var labelText = label ? label.textContent.trim().replace(/\s+/g, ' ') : '';
-      var val = (el.type === 'password') ? '***' : String(el.value).substring(0, 40);
-      var checked = (el.type === 'checkbox' || el.type === 'radio') ? ' checked=' + el.checked : '';
+      var raw = String(el.value == null ? '' : el.value);
+
+      var state;
+      if (el.type === 'checkbox' || el.type === 'radio') {
+        state = 'checked=' + el.checked;
+      } else if (INCLUDE_FIELD_VALUES && !isSensitiveField(el, labelText)) {
+        state = 'value:"' + raw.substring(0, 40) + '"';
+      } else {
+        // Filled-or-empty is usually the analytically interesting part — "this required
+        // field is blank" — without quoting whatever the operator typed.
+        state = raw.trim() ? 'filled' : 'empty';
+        if (raw.trim() && INCLUDE_FIELD_VALUES) redacted++;
+      }
+
       fields.push('#' + el.id + ' (' + (el.type || el.tagName.toLowerCase()) + ')' +
-                  (labelText ? ' label:"' + labelText + '"' : '') +
-                  ' value:"' + val + '"' + checked);
+                  (labelText ? ' label:"' + labelText + '"' : '') + ' ' + state);
     });
-    if (fields.length) parts.push('### Form fields\n' + fields.join('\n'));
+    if (fields.length) {
+      var header = '### Form fields';
+      if (!INCLUDE_FIELD_VALUES) {
+        header += '\n(contents withheld by this deployment — fields are reported as filled or '
+                + 'empty. Ask the user for a value rather than assuming one.)';
+      } else if (redacted) {
+        header += '\n(' + redacted + ' field(s) hold personal data and are reported as filled '
+                + 'rather than quoted.)';
+      }
+      parts.push(header + '\n' + fields.join('\n'));
+    }
 
     return parts.join('\n\n');
+  }
+
+  /** Counts what the snapshot describes, for the context indicator. */
+  function pageContextStats() {
+    var ids = 0;
+    document.querySelectorAll('[id]').forEach(function (el) { if (!/^vx-/.test(el.id)) ids++; });
+    var fields = 0;
+    document.querySelectorAll('input,select,textarea').forEach(function (el) {
+      if (el.id && !/^vx-/.test(el.id)) fields++;
+    });
+    return { elements: ids, fields: fields };
   }
 
   // ── Page-script execution ─────────────────────────────────────────────────────
@@ -884,6 +968,7 @@
         '<button id="vx-close" class="vx-header-btn" aria-label="Close" title="Close">\xd7</button>' +
       '</div>' +
     '</div>' +
+    '<div id="vx-context" hidden></div>' +
     '<div id="vx-messages" role="log" aria-live="polite"></div>' +
     '<div id="vx-suggestions"></div>' +
     '<div id="vx-form">' +
@@ -895,7 +980,61 @@
   document.body.appendChild(panel);
 
   var messagesEl    = document.getElementById('vx-messages');
+  var contextEl     = document.getElementById('vx-context');
   var suggestionsEl = document.getElementById('vx-suggestions');
+
+  // ── Context indicator ─────────────────────────────────────────────────────────
+  // A row of chips naming what the agent was actually told about this page and user.
+  // Rendered from the server's own report of the outgoing request (see
+  // describeEffectiveContext), not from what this widget assembled: the host's enricher
+  // adds the authenticated user and institution the page never sees, and can strip
+  // fields the page did send. A badge that guessed would eventually claim something
+  // untrue about what left the browser.
+  //
+  // Clicking one shows exactly what it contributed, so "what does this thing know about
+  // me?" has a concrete answer instead of requiring trust.
+
+  var CONTEXT_LABELS = {
+    authenticatedUser: { icon: '👤', label: 'User' },
+    institutionCode:   { icon: '🏛', label: 'Institution' },
+    tenant:            { icon: '🏛', label: 'Tenant' },
+    application:       { icon: '📦', label: 'App' },
+    surface:           { icon: '📄', label: 'Screen' },
+    pageContext:       { icon: '🔎', label: 'Page' },
+    pageActions:       { icon: '✋', label: 'Actions' },
+    pageScripts:       { icon: '⚠️', label: 'Scripts' }
+  };
+
+  function renderContextChips(summary) {
+    if (!contextEl) return;
+    contextEl.innerHTML = '';
+    if (!summary || !summary.length) { contextEl.hidden = true; return; }
+
+    summary.forEach(function (item) {
+      if (!item || !item.key) return;
+      var meta = CONTEXT_LABELS[item.key] || { icon: '•', label: item.key };
+      var value = String(item.value == null ? '' : item.value);
+
+      var chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'vx-ctx-chip';
+      // "not sent" is worth showing as a distinct state rather than hiding the chip: absent
+      // page context is a fact about the conversation, not an absence of information.
+      if (/^(not sent|disabled|none)$/i.test(value)) chip.className += ' vx-ctx-off';
+      if (item.key === 'pageScripts') chip.className += ' vx-ctx-warn';
+
+      var short = value.length > 22 ? value.substring(0, 21) + '…' : value;
+      chip.textContent = meta.icon + ' ' + short;
+      chip.title = meta.label + ': ' + value +
+                   (item.source ? '  (added by the ' + item.source + ')' : '');
+      chip.addEventListener('click', function () {
+        appendMessage('agent', '**' + meta.label + '** — ' + value +
+                      (item.source ? '\n\nAdded by the ' + item.source + '.' : ''));
+      });
+      contextEl.appendChild(chip);
+    });
+    contextEl.hidden = false;
+  }
   var inputEl       = document.getElementById('vx-input');
   var sendBtn       = document.getElementById('vx-send');
   var maximizeBtn   = document.getElementById('vx-maximize');
@@ -1109,13 +1248,21 @@
     // when the host has not named its screens, which reads as "the application default".
     if (SURFACE) { payload.surface = SURFACE; }
 
+    // One place builds the snapshot, whichever capability wanted it. It used to be assembled
+    // separately inside each branch, so the two could drift and neither said what happened when
+    // both were off — the read-only case had no way to exist at all.
+    if (SEND_PAGE_CONTEXT) {
+      var domSnapshot = collectPageDom();
+      payload.pageApiDescription = PAGE_API_DESCRIPTION
+        ? domSnapshot + '\n\n### Host-provided notes\n' + PAGE_API_DESCRIPTION
+        : domSnapshot;
+    } else if (PAGE_API_DESCRIPTION) {
+      // The host described its page by hand and does not want it introspected: honour both.
+      payload.pageApiDescription = PAGE_API_DESCRIPTION;
+    }
+
     if (PAGE_ACTIONS_ENABLED) {
       payload.pageActions = Object.keys(PAGE_ACTION_DEFS);
-      // The DOM snapshot is what lets the model pick selectors; without it the actions exist but
-      // it has nothing to aim them at.
-      payload.pageApiDescription = PAGE_API_DESCRIPTION
-        ? collectPageDom() + '\n\n### Host-provided notes\n' + PAGE_API_DESCRIPTION
-        : collectPageDom();
       if (lastActionReport) {
         payload.lastActionResults = lastActionReport;
         lastActionReport = null;
@@ -1124,17 +1271,15 @@
 
     if (ALLOW_PAGE_SCRIPTS) {
       payload.allowPageScripts = true;
-      // Auto-introspect the live DOM so the LLM knows what it can manipulate.
-      // PAGE_API_DESCRIPTION (set by host app) is appended as an optional supplement.
-      var domSnapshot = collectPageDom();
-      payload.pageApiDescription = PAGE_API_DESCRIPTION
-        ? domSnapshot + '\n\n### Host-provided notes\n' + PAGE_API_DESCRIPTION
-        : domSnapshot;
     }
 
     postJson(ENDPOINT, payload, function (err, data) {
       if (err) { finishWithError(err); return; }
       if (!data) { finishWithError('Could not start the agent.'); return; }
+      // Present on the start response whichever transport follows, and it describes the request
+      // that was just sent — so the chips update per message rather than showing a stale first turn.
+      if (data.contextSummary) renderContextChips(data.contextSummary);
+
       if (data.runId) {
         var startedAt = Date.now();
         // Prefer live progress over blind polling when the browser supports it. Any failure to

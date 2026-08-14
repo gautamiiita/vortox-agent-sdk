@@ -192,6 +192,19 @@ public class AgentController {
         // silently displaced the configured one.
         StringBuilder systemPrompt = new StringBuilder();
 
+        // Knowing what is on the page is separate from being allowed to change it, so the structure
+        // is included whenever the widget sent one — the read-only case being both the most useful
+        // and the least dangerous ("what is missing on this form?" needs no write capability at all).
+        //
+        // It used to be appended only inside the allowPageScripts branch below, which broke page
+        // actions in their intended configuration: the action instructions tell the model to take
+        // every selector from "the page structure above" and never invent one, while the structure
+        // itself was withheld unless script execution was also enabled. The model had no option left
+        // but to guess, and a guessed selector silently changes the wrong part of the page.
+        if (request.pageApiDescription() != null && !request.pageApiDescription().isBlank()) {
+            systemPrompt.append("\n\n## Host Page Structure\n").append(request.pageApiDescription());
+        }
+
         if (Boolean.TRUE.equals(request.allowPageScripts())) {
             systemPrompt.append("\n\n## Page Script Capability\n")
                         .append("You can update the user's page directly by including a ```javascript code block in your response.\n")
@@ -201,10 +214,6 @@ public class AgentController {
                         .append("- Never use alert(), confirm(), or prompt() — they block the browser.\n")
                         .append("- Always explain what you are doing in plain text before the code block.\n")
                         .append("- If the right DOM selectors are unclear, ask the user instead of guessing.");
-
-            if (request.pageApiDescription() != null && !request.pageApiDescription().isBlank()) {
-                systemPrompt.append("\n\n## Host Page Structure\n").append(request.pageApiDescription());
-            }
         }
 
         appendPageActionInstructions(systemPrompt, request);
@@ -258,7 +267,56 @@ public class AgentController {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("runId", runId);
         body.put("status", "RUNNING");
+        body.put("contextSummary", describeEffectiveContext(request, runtimeInstructions));
         return ResponseEntity.accepted().body(body);
+    }
+
+    /**
+     * What this run was actually told, for the widget to show the user.
+     *
+     * <p>Reported from the server rather than assembled in the browser because the two do not
+     * necessarily agree: a host's {@code ChatContextEnricher} adds the authenticated user and
+     * institution that the page never sees, and strips or overrides fields the page did send. A
+     * badge built from what the widget *hoped* to send would therefore be able to claim something
+     * untrue, and an indicator that can lie about what left the page is worse than none at all.
+     *
+     * <p>Values are echoed as-is: everything here was already in the outgoing request, so this
+     * discloses nothing new to the browser it came from.
+     */
+    /* package-private for testability */
+    static List<Map<String, String>> describeEffectiveContext(AgentChatRequest request,
+                                                              String runtimeInstructions) {
+        List<Map<String, String>> summary = new java.util.ArrayList<>();
+
+        if (request.context() != null) {
+            request.context().forEach((k, v) -> {
+                if (v == null || String.valueOf(v).isBlank()) return;
+                summary.add(Map.of("key", k, "value", String.valueOf(v), "source", "context"));
+            });
+        }
+        if (request.tenantCode() != null && !request.tenantCode().isBlank()) {
+            // The field that decides which tenant's skills and secrets the run receives — worth
+            // showing separately from the advisory copy that may also sit in `context`.
+            summary.add(Map.of("key", "tenant", "value", request.tenantCode(), "source", "server"));
+        }
+        if (request.surface() != null && !request.surface().isBlank()) {
+            summary.add(Map.of("key", "surface", "value", request.surface(), "source", "page"));
+        }
+
+        boolean sentPageStructure = runtimeInstructions != null
+                && runtimeInstructions.contains("## Host Page Structure");
+        summary.add(Map.of("key", "pageContext",
+                "value", sentPageStructure ? "included" : "not sent",
+                "source", "page"));
+
+        if (request.pageActions() != null && !request.pageActions().isEmpty()) {
+            summary.add(Map.of("key", "pageActions",
+                    "value", String.join(", ", request.pageActions()), "source", "page"));
+        }
+        if (Boolean.TRUE.equals(request.allowPageScripts())) {
+            summary.add(Map.of("key", "pageScripts", "value", "enabled", "source", "server"));
+        }
+        return summary;
     }
 
     /** Poll target for {@link #chat}. Returns {runId, status, reply?, artifacts?, error?}. */

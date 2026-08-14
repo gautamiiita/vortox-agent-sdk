@@ -161,10 +161,42 @@ public class VortoxSkillSyncService {
     public void ensureTenantSynced(String tenantCode) {
         if (tenantCode == null || tenantCode.isBlank()) return;
         if (syncedTenants.contains(tenantCode)) return;
-        sync("first-use", tenantCode);
+        syncLock.lock();
+        try {
+            // Re-check now the lock is held: several runs for a new tenant can arrive together, and
+            // without this each would pay for its own fetch of the same tier.
+            if (syncedTenants.contains(tenantCode)) return;
+            syncLocked("first-use", tenantCode);
+        } finally {
+            syncLock.unlock();
+        }
     }
 
+    /**
+     * Serialises every sync, whatever triggered it.
+     *
+     * <p>Four things call in here — startup, the webhook Vortox pushes on any skill change, the
+     * five-minute fallback poll, and {@link #ensureTenantSynced} at the start of a run — on three
+     * different threads, all rewriting the same files and the same registry tiers. Two of them
+     * overlapping meant a run could resolve its tools from a tier one sync had begun replacing and
+     * another had not finished, which is unreproducible by construction.
+     *
+     * <p>A plain lock rather than per-tenant locking: a sync is a handful of small file writes,
+     * contention is rare, and one ordering is far easier to reason about than several. The
+     * first-use path holds up its own run only, and only until the tier it needs exists.
+     */
+    private final java.util.concurrent.locks.ReentrantLock syncLock = new java.util.concurrent.locks.ReentrantLock();
+
     private void sync(String trigger, String tenantCode) {
+        syncLock.lock();
+        try {
+            syncLocked(trigger, tenantCode);
+        } finally {
+            syncLock.unlock();
+        }
+    }
+
+    private void syncLocked(String trigger, String tenantCode) {
         String url = gateway.getBaseUrl() + "/api/sdk/v1/skills/sync";
         log.info("Syncing skills from Vortox [trigger={} tenant={}] url={}", trigger, tenantCode, url);
         try {

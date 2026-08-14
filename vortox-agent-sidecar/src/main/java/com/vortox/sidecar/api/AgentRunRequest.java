@@ -24,11 +24,42 @@ public record AgentRunRequest(
          * worker pool, so a {@code ThreadLocal} tenant would leak between tenants exactly as
          * {@code TenantContext} does on the backend's async pools.
          */
-        String tenantCode
+        String tenantCode,
+
+        /**
+         * Which screen of the host application this run was started from, e.g.
+         * {@code tnam:order-detail}. Null when the host does not identify its surfaces.
+         *
+         * <p>Unlike {@code tenantCode} this cannot be established server-side: one chat endpoint
+         * serves every screen, and only the browser knows which one is open. It is therefore
+         * untrusted, and usable only to <em>select</em> among configurations already registered in
+         * Vortox — an unrecognised value falls back to the application default. It must never grant
+         * anything a run would not otherwise have.
+         */
+        String surface,
+
+        /**
+         * Instructions about the runtime environment — the page actions available, the host page's
+         * structure — appended after the agent's own system prompt rather than replacing it.
+         *
+         * <p>Separate from {@code systemPrompt} because the two have different owners. The agent's
+         * persona comes from Vortox and is policy; this describes what the browser can do on this
+         * particular turn. Merging them, as this once did, meant a widget that sent page actions
+         * silently discarded the configured persona.
+         */
+        String runtimeInstructions
 ) {
     /** Overload keeping the pre-tenant argument order usable for single-tenant callers and tests. */
     public AgentRunRequest(String task, List<String> skills, String systemPrompt, String model,
                            Integer maxIterations, String apiKey, String llmProvider, String llmBaseUrl) {
         this(task, skills, systemPrompt, model, maxIterations, apiKey, llmProvider, llmBaseUrl, null);
+    }
+
+    /** Overload for callers that name a tenant but no surface or runtime instructions. */
+    public AgentRunRequest(String task, List<String> skills, String systemPrompt, String model,
+                           Integer maxIterations, String apiKey, String llmProvider, String llmBaseUrl,
+                           String tenantCode) {
+        this(task, skills, systemPrompt, model, maxIterations, apiKey, llmProvider, llmBaseUrl,
+                tenantCode, null, null);
     }
 }

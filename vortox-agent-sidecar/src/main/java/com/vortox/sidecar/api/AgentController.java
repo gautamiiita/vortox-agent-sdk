@@ -129,19 +129,68 @@ public class AgentController {
      * When allowPageScripts=true the system prompt instructs the LLM that it may include
      * a ```javascript block which the widget will execute in the host page context.
      */
+    /**
+     * Teaches the model the closed set of page operations it may request, and the envelope to
+     * request them in.
+     *
+     * <p>Deliberately unlike the {@code allowPageScripts} instructions above, which invite arbitrary
+     * JavaScript that the widget then executes. Here the model emits a description of what it wants
+     * done; the browser decides whether to do it, having validated every field. The model's output
+     * is a request, never the action itself — which is what keeps an instruction smuggled in through
+     * a database value from becoming code running in the operator's session.
+     *
+     * <p>The fenced block carries its own tag rather than {@code json}, so a JSON example the model
+     * writes to explain something to the user cannot be mistaken for something to run.
+     */
+    /* package-private for testability */
+    static void appendPageActionInstructions(StringBuilder systemPrompt,
+                                             AgentChatRequest request) {
+        java.util.List<String> actions = request.pageActions();
+        if (actions == null || actions.isEmpty()) return;
+
+        systemPrompt.append("\n\n## Page Actions\n")
+                .append("You may ask the user's browser to change the page it is showing. ")
+                .append("You cannot run code — you describe what you want, and the widget does it ")
+                .append("after checking it is permitted.\n\n")
+                .append("Available actions: ").append(String.join(", ", actions)).append("\n\n")
+                .append("- highlight {target}          — draw attention to elements\n")
+                .append("- scrollTo  {target}          — bring the first match into view\n")
+                .append("- setClass  {target, add?, remove?} — add or remove a CSS class\n")
+                .append("- setText   {target, text}    — replace text (never on a form field)\n")
+                .append("- fill      {target, value}   — set an input, select or textarea\n\n")
+                .append("To request them, end your reply with one block, exactly:\n")
+                .append("```vortox-actions\n")
+                .append("{\"actions\":[{\"name\":\"fill\",\"target\":\"#status\",\"value\":\"OPEN\"}]}\n")
+                .append("```\n\n")
+                .append("Rules:\n")
+                .append("- `target` is a CSS selector taken from the page structure above. Never invent one.\n")
+                .append("- At most one block per reply, and at most 20 actions in it.\n")
+                .append("- Always say in plain text what you are changing, before the block.\n")
+                .append("- `fill` needs the user's approval, so say what you are about to set and why.\n")
+                .append("- If you are unsure which element is meant, ask instead of guessing — a wrong\n")
+                .append("  selector silently changes the wrong part of the page.\n")
+                .append("- Requesting anything not in the list above is refused and nothing runs.");
+
+        if (request.lastActionResults() != null && !request.lastActionResults().isBlank()) {
+            systemPrompt.append("\n\n### What happened to your last page actions\n")
+                    .append(request.lastActionResults())
+                    .append("\nTake this into account. If something failed, do not simply repeat it — ")
+                    .append("either choose a different selector or tell the user what you could not do.");
+        }
+    }
+
     @PostMapping("/chat")
     public ResponseEntity<Map<String, Object>> chat(@RequestBody AgentChatRequest request) {
         if (request.message() == null || request.message().isBlank()) {
             return ResponseEntity.badRequest().body(Map.of("error", "message is required"));
         }
 
-        // ── System prompt ────────────────────────────────────────────────────
-        // Pass null when there's no explicit systemPrompt so AgentService can
-        // fall back to the linked agent's persona from Vortox.
+        // ── Runtime instructions ─────────────────────────────────────────────
+        // What the browser can do on this turn, kept apart from the agent's persona: AgentService
+        // appends this after the prompt it resolves from Vortox. Building both in one buffer, as
+        // this used to, made any turn carrying page actions look like a caller-supplied persona and
+        // silently displaced the configured one.
         StringBuilder systemPrompt = new StringBuilder();
-        if (request.systemPrompt() != null && !request.systemPrompt().isBlank()) {
-            systemPrompt.append(request.systemPrompt());
-        }
 
         if (Boolean.TRUE.equals(request.allowPageScripts())) {
             systemPrompt.append("\n\n## Page Script Capability\n")
@@ -157,6 +206,8 @@ public class AgentController {
                 systemPrompt.append("\n\n## Host Page Structure\n").append(request.pageApiDescription());
             }
         }
+
+        appendPageActionInstructions(systemPrompt, request);
 
         // ── Task: context + history + message ────────────────────────────────
         StringBuilder task = new StringBuilder();
@@ -182,18 +233,23 @@ public class AgentController {
         task.append("## User Message\n").append(request.message());
 
         String apiKey = request.llmApiKey();  // explicit per-request key takes precedence
-        String resolvedSystemPrompt = systemPrompt.length() > 0 ? systemPrompt.toString() : null;
+        String runtimeInstructions = systemPrompt.length() > 0 ? systemPrompt.toString() : null;
         AgentRunRequest runRequest = new AgentRunRequest(
                 task.toString(),
                 null,
-                resolvedSystemPrompt,
+                // The caller's own persona, offered but not guaranteed: AgentService refuses it for
+                // runs linked to a Vortox agent, where the prompt is that agent's configuration and
+                // not something a chat payload gets to replace.
+                request.systemPrompt(),
                 request.model(),
                 75,
                 apiKey,
                 request.llmProvider(),
                 request.llmBaseUrl(),
                 // Resolved once, here at the boundary, then passed explicitly the whole way down.
-                request.tenantCode()
+                request.tenantCode(),
+                request.surface(),
+                runtimeInstructions
         );
 
         String runId = chatRunService.start(runRequest);

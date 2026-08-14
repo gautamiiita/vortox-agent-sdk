@@ -43,6 +43,22 @@ public class SkillRegistry {
     /** Reserved top-level directory name; everything under it is tenant-private. */
     static final String TENANTS_DIR = "tenants";
 
+    /**
+     * Marker written beside a SKILL.md that a Vortox sync delivered.
+     *
+     * <p>Provenance decides whether a skill may be offered as a tool at all under a control plane
+     * ({@link #isUsable}), so holding it only in memory made the tool surface depend on whether a
+     * sync had succeeded in <em>this process</em>. A restart, or a sync that failed — a pooled key
+     * refused for want of a tenant code, a network blip — left every skill loaded from disk,
+     * counted in the logs, and silently withheld from the agent. From the user's side that looks
+     * like the assistant randomly losing its abilities mid-conversation.
+     *
+     * <p>Writing it next to the file it describes makes provenance survive a restart and travel with
+     * the skill directory, so a failed sync now degrades to "the definitions we last received"
+     * rather than "no capability at all".
+     */
+    private static final String MANAGED_MARKER = ".vortox-managed";
+
     @Value("${sidecar.skills-path:/app/skills}")
     private String skillsPath;
 
@@ -169,6 +185,13 @@ public class SkillRegistry {
             target.put(p.name(), new SkillDefinition(
                     p.name(), p.description(), p.language(), p.timeoutSeconds(), p.inputSchema(),
                     p.implementation(), content, p.producesArtifact()));
+
+            // Restore provenance from disk. Keyed by the parsed name rather than the directory name
+            // because that is what the registry and isUsable() key on — the two can differ, and the
+            // mismatch is only warned about above.
+            if (Files.exists(skillDir.resolve(MANAGED_MARKER))) {
+                vortoxManaged.add(provenanceKey(tenantId, p.name()));
+            }
             log.debug("Loaded skill: {} ({})", p.name(), tenantId == null ? "shared" : "tenant " + tenantId);
         } catch (Exception e) {
             log.error("Failed to load skill from {}: {}", skillFile, e.getMessage());
@@ -259,6 +282,18 @@ public class SkillRegistry {
                 log.info("Withheld {} local skill(s) from tenant {}: this sidecar is governed by "
                         + "Vortox and offers only what Vortox delivered", before - merged.size(), tenantId);
             }
+            // Withholding *everything* is different in kind from withholding a few local extras: the
+            // agent silently loses every tool and answers from its own knowledge instead, which reads
+            // to a user as the assistant arbitrarily forgetting what it can do. It means no sync has
+            // ever succeeded here, so say so plainly rather than leaving it to be inferred from a
+            // skills=[] line.
+            if (before > 0 && merged.isEmpty()) {
+                log.error("No skills are available to tenant {}: {} definition(s) are loaded from disk "
+                        + "but none is marked as delivered by Vortox, so all are withheld. The agent "
+                        + "will run with no tools. This means no skill sync has succeeded — check the "
+                        + "sync log above for an HTTP error (a pooled key needs a tenant code).",
+                        tenantId, before);
+            }
         }
         return Collections.unmodifiableCollection(merged.values());
     }
@@ -326,6 +361,17 @@ public class SkillRegistry {
     public SkillDefinition saveFromVortox(String tenantId, String name, String content) throws IOException {
         SkillDefinition saved = save(tenantId, name, content);
         vortoxManaged.add(provenanceKey(tenantId, name));
+        // Persist it too, so the next restart does not have to re-derive provenance from a sync that
+        // may not succeed. Best-effort: a read-only skills mount should not fail the sync, it just
+        // costs us the durability this marker buys.
+        try {
+            Files.writeString(skillDirFor(tenantId, name).resolve(MANAGED_MARKER),
+                    "Delivered by Vortox. Edits here are overwritten by the next sync.\n");
+        } catch (IOException e) {
+            log.warn("Could not write the managed marker for '{}' ({}): {}. Provenance will be "
+                    + "in-memory only until the next successful sync.",
+                    name, tenantId == null ? "shared" : "tenant " + tenantId, e.getMessage());
+        }
         return saved;
     }
 
@@ -350,6 +396,11 @@ public class SkillRegistry {
         Path skillDir = skillDirFor(tenantId, name);
         Files.createDirectories(skillDir);
         Files.writeString(skillDir.resolve("SKILL.md"), content);
+
+        // A local write makes this skill locally-owned again; saveFromVortox re-establishes
+        // provenance immediately after calling through here, so sync is unaffected.
+        vortoxManaged.remove(provenanceKey(tenantId, p.name()));
+        Files.deleteIfExists(skillDir.resolve(MANAGED_MARKER));
 
         SkillDefinition saved = new SkillDefinition(
                 p.name(), p.description(), p.language(), p.timeoutSeconds(), p.inputSchema(),
@@ -381,6 +432,9 @@ public class SkillRegistry {
                   .forEach(java.io.File::delete);
         }
         targetMap(tenantId).remove(name);
+        // Otherwise a deleted-then-recreated local skill would inherit the old provenance and be
+        // treated as Vortox-delivered.
+        vortoxManaged.remove(provenanceKey(tenantId, name));
         log.info("Deleted skill: {} ({})", name, tenantId == null ? "shared" : "tenant " + tenantId);
         return true;
     }
@@ -397,18 +451,90 @@ public class SkillRegistry {
         Path tenantRoot = Path.of(skillsPath, TENANTS_DIR, sanitizeSegment(tenantId));
         Set<String> keep = nameToContent.keySet();
 
-        for (String stale : Set.copyOf(tenantSkills.getOrDefault(tenantId, Map.of()).keySet())) {
-            if (!keep.contains(stale)) delete(tenantId, stale);
-        }
+        // Build the replacement tier off to the side, then publish it with a single put.
+        //
+        // This used to mutate the live map in place — delete the stale entries, then re-save the
+        // rest one at a time — which left a window, on every five-minute poll and for every tenant
+        // seen in traffic, where a concurrent run resolved a half-populated tier and got a subset of
+        // the tools it should have had. Same question, different answer, depending on timing.
+        // Writing files still happens one at a time (they are not transactional), but what a run
+        // *sees* now flips from the whole old tier to the whole new one.
+        Map<String, SkillDefinition> next = new ConcurrentHashMap<>();
         for (Map.Entry<String, String> e : nameToContent.entrySet()) {
             try {
-                saveFromVortox(tenantId, e.getKey(), e.getValue());
+                next.put(e.getKey(), writeTenantSkill(tenantId, e.getKey(), e.getValue()));
             } catch (Exception ex) {
                 log.warn("Tenant {}: failed to save synced skill '{}': {}", tenantId, e.getKey(), ex.getMessage());
+                // Keep whatever we had for this one rather than dropping it: a single bad definition
+                // should not cost the tenant a working tool.
+                SkillDefinition previous = tenantSkills.getOrDefault(tenantId, Map.of()).get(e.getKey());
+                if (previous != null) next.put(e.getKey(), previous);
             }
         }
+
+        Map<String, SkillDefinition> previousTier = tenantSkills.put(tenantId, next);
+
+        // Only once the new tier is live: removing the files a run can no longer reach is safe,
+        // whereas doing it first is exactly the gap described above.
+        if (previousTier != null) {
+            for (String stale : Set.copyOf(previousTier.keySet())) {
+                if (!keep.contains(stale)) {
+                    try {
+                        deleteFiles(tenantId, stale);
+                        vortoxManaged.remove(provenanceKey(tenantId, stale));
+                    } catch (IOException ex) {
+                        log.warn("Tenant {}: failed to remove evicted skill '{}': {}",
+                                tenantId, stale, ex.getMessage());
+                    }
+                }
+            }
+        }
+
         if (!Files.exists(tenantRoot) && !nameToContent.isEmpty()) {
             log.warn("Tenant {} skill directory missing after sync: {}", tenantId, tenantRoot);
+        }
+    }
+
+    /**
+     * Writes one tenant skill to disk and returns its definition <em>without</em> touching the live
+     * tier — the piece {@link #replaceTenantTier} needs to stage a whole tier before publishing it.
+     */
+    private SkillDefinition writeTenantSkill(String tenantId, String name, String content) throws IOException {
+        if (name == null || name.isBlank()) throw new IllegalArgumentException("name is required");
+        if (content == null || content.isBlank()) throw new IllegalArgumentException("content is required");
+
+        ParsedSkill p = parse(content);
+        if (p.name() == null || p.implementation() == null) {
+            throw new IllegalArgumentException("SKILL.md must define both 'name' and 'implementation'");
+        }
+        if (!p.name().equals(name)) {
+            throw new IllegalArgumentException("Name mismatch: requested to save as '" + name
+                    + "' but the SKILL.md content declares name '" + p.name() + "'. They must match.");
+        }
+
+        Path skillDir = skillDirFor(tenantId, name);
+        Files.createDirectories(skillDir);
+        Files.writeString(skillDir.resolve("SKILL.md"), content);
+        vortoxManaged.add(provenanceKey(tenantId, name));
+        try {
+            Files.writeString(skillDir.resolve(MANAGED_MARKER),
+                    "Delivered by Vortox. Edits here are overwritten by the next sync.\n");
+        } catch (IOException e) {
+            log.warn("Could not write the managed marker for tenant {} skill '{}': {}",
+                    tenantId, name, e.getMessage());
+        }
+        return new SkillDefinition(p.name(), p.description(), p.language(), p.timeoutSeconds(),
+                p.inputSchema(), p.implementation(), content, p.producesArtifact());
+    }
+
+    /** Removes a skill's directory without touching the in-memory tier. */
+    private void deleteFiles(String tenantId, String name) throws IOException {
+        Path skillDir = skillDirFor(tenantId, name);
+        if (!Files.exists(skillDir)) return;
+        try (Stream<Path> walker = Files.walk(skillDir)) {
+            walker.sorted(Comparator.reverseOrder())
+                  .map(Path::toFile)
+                  .forEach(java.io.File::delete);
         }
     }
 

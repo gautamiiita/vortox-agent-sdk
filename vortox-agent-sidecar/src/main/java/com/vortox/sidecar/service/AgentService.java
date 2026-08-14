@@ -38,6 +38,14 @@ public class AgentService {
     /** Refuse to inline anything bigger than this into a JSON response. */
     private static final long MAX_ARTIFACT_BYTES = 8L * 1024 * 1024;
 
+    /**
+     * Upper bound on files delivered by one run. Generous enough that a legitimate multi-deliverable
+     * answer (a report plus its data, or a file per region) is never truncated, low enough to stop a
+     * looping agent inlining an unbounded number of base64 payloads onto one response. Anything
+     * dropped is logged by name — see {@link #extractArtifacts}.
+     */
+    private static final int MAX_ARTIFACTS_PER_RUN = 10;
+
     @Value("${sidecar.default-model:claude-sonnet-4-6}")
     private String defaultModel;
 
@@ -69,6 +77,10 @@ public class AgentService {
      */
     @Value("${sidecar.require-tenant-code:false}")
     private boolean requireTenantCode;
+
+    /** Used only when neither the request nor a linked Vortox agent supplies one. */
+    private static final String DEFAULT_SYSTEM_PROMPT =
+            "You are an autonomous AI agent. Use the available skills to complete the task.";
 
     private final SkillRegistry skillRegistry;
     private final ScriptToolExecutor scriptToolExecutor;
@@ -127,9 +139,7 @@ public class AgentService {
         String model = firstNonBlank(request.model(),
                 agentConfig != null ? (String) agentConfig.get("model") : null,
                 defaultModel);
-        String systemPrompt = firstNonBlank(request.systemPrompt(),
-                agentConfig != null ? (String) agentConfig.get("systemPrompt") : null,
-                "You are an autonomous AI agent. Use the available skills to complete the task.");
+        String systemPrompt = resolveSystemPrompt(runId, request, agentConfig);
 
         // Explicit request value wins; otherwise defer to the linked agent's own cap (set from
         // Vortox, so it's controllable centrally per agent); otherwise a generous sidecar default.
@@ -202,8 +212,9 @@ public class AgentService {
                 ? new GatewayToolExecutor(vortoxGateway, tenantBound)
                 : tenantBound;
 
-        log.info("Agent run {} — tenant={} task='{}' model={} provider={} skills={} gateway={}", runId,
-                tenantCode, truncate(request.task(), 80), model, llmProvider,
+        log.info("Agent run {} — tenant={} surface={} task='{}' model={} provider={} skills={} gateway={}",
+                runId, tenantCode, firstNonBlank(request.surface(), "-"),
+                truncate(request.task(), 80), model, llmProvider,
                 activeSkills.stream().map(SkillDefinition::name).toList(),
                 vortoxGateway != null ? "enabled" : "disabled");
 
@@ -270,12 +281,17 @@ public class AgentService {
      * from outside this process, so the bytes are inlined here and the file is deleted immediately
      * after being read.
      * <p>
-     * Keeps only the <em>last</em> successful call per skill. Some artifact-producing skills
-     * (e.g. a SQL-to-CSV export) write a file as a side effect of every successful call, not just
-     * a final "save my result" action — if the agent calls the same skill several times while
-     * exploring or retrying (wrong column names, refining a query), only the last, presumably
-     * correct result should be surfaced as a download; earlier attempts' files are deleted here
-     * rather than left to accumulate or all shown to the user as if each were a separate result.
+     * Deduplicated by (skill, path): a repeat write to the same path supersedes the earlier one — the
+     * retry-overwrites-its-output case — while writes to <em>different</em> paths are treated as
+     * different deliverables and all delivered. Keying on the skill alone, as this once did, meant a
+     * general-purpose writer could only ever return one file per run: an agent that wrote a report and
+     * then regenerated its companion data file silently delivered one and deleted the other.
+     * <p>
+     * The cost of that choice is that a skill which writes a uniquely-named file on every call — a
+     * SQL export naming each result after a UUID, say — now surfaces each attempt rather than only
+     * the last. That is the better failure: a reader offered two exports can pick one, whereas a
+     * reader offered none has no recourse. Total files are capped by
+     * {@link #MAX_ARTIFACTS_PER_RUN}, and anything dropped is logged by name rather than vanishing.
      */
     /* package-private for testability */
     List<AgentRunResponse.ArtifactDto> extractArtifacts(List<AgentResult.ToolCall> toolCalls, String runId) {
@@ -290,7 +306,19 @@ public class AgentService {
     /* package-private for testability */
     List<AgentRunResponse.ArtifactDto> extractArtifacts(String tenantCode,
                                                         List<AgentResult.ToolCall> toolCalls, String runId) {
-        java.util.Map<String, String> latestPathByTool = new java.util.LinkedHashMap<>();
+        // Keyed by tool AND path, so a skill called several times for several different files
+        // delivers all of them.
+        //
+        // This used to key on the tool alone, keeping only that skill's last call. That is right for
+        // a skill whose every call writes a file as a side effect — an agent refining a query
+        // shouldn't hand the user each failed attempt — but wrong for a general-purpose writer, where
+        // separate calls are separate deliverables. An agent that wrote a report and then regenerated
+        // its companion data file delivered only whichever it happened to write last, and the other
+        // was deleted from disk: the user was told about a file they could not obtain.
+        //
+        // A repeat write to the SAME path is still a supersede, which preserves the original intent
+        // for retries that overwrite their output.
+        java.util.Map<String, String> keptPaths = new java.util.LinkedHashMap<>();
         for (AgentResult.ToolCall tc : toolCalls) {
             if (!tc.success()) continue;
             SkillDefinition.ProducesArtifact declaration = skillRegistry.findFor(tenantCode, tc.toolName())
@@ -303,19 +331,30 @@ public class AgentService {
                     : jsonStringField(tc.output(), declaration.pathField());
             if (pathStr == null || pathStr.isBlank()) continue;
 
-            String supersededPath = latestPathByTool.put(tc.toolName(), pathStr);
-            if (supersededPath != null && !supersededPath.equals(pathStr)) {
+            keptPaths.put(tc.toolName() + " " + pathStr, pathStr);
+        }
+
+        // A run that produced an implausible number of files is more likely looping than delivering.
+        // Truncate, but never silently: a dropped file the user was told about is exactly the failure
+        // this method just stopped causing.
+        List<String> paths = new java.util.ArrayList<>(keptPaths.values());
+        if (paths.size() > MAX_ARTIFACTS_PER_RUN) {
+            List<String> dropped = paths.subList(MAX_ARTIFACTS_PER_RUN, paths.size());
+            log.warn("Run {}: produced {} artifacts, keeping the first {}. Not delivered: {}",
+                    runId, paths.size(), MAX_ARTIFACTS_PER_RUN, dropped);
+            for (String extra : dropped) {
                 try {
-                    Files.deleteIfExists(Path.of(supersededPath));
+                    Files.deleteIfExists(Path.of(extra));
                 } catch (Exception e) {
-                    log.warn("Run {}: failed to clean up superseded artifact '{}': {}",
-                            runId, supersededPath, e.getMessage());
+                    log.warn("Run {}: failed to clean up undelivered artifact '{}': {}",
+                            runId, extra, e.getMessage());
                 }
             }
+            paths = new java.util.ArrayList<>(paths.subList(0, MAX_ARTIFACTS_PER_RUN));
         }
 
         List<AgentRunResponse.ArtifactDto> artifacts = new java.util.ArrayList<>();
-        for (String pathStr : latestPathByTool.values()) {
+        for (String pathStr : paths) {
             try {
                 Path path = Path.of(pathStr);
                 if (!Files.isRegularFile(path)) continue;
@@ -369,6 +408,46 @@ public class AgentService {
     /** Normalises a blank tenant code to null, so "no tenant" has exactly one representation. */
     private static String emptyToNull(String s) {
         return s == null || s.isBlank() ? null : s;
+    }
+
+    /**
+     * Decides which system prompt a run gets, and appends this turn's runtime instructions to it.
+     *
+     * <p>Two rules, both about ownership. A run linked to a Vortox agent uses <em>that agent's</em>
+     * prompt: the chat endpoint is reachable by anything able to post to the host application's
+     * proxy, so honouring a caller-supplied persona there would let any such caller redefine the
+     * agent — including the parts of the prompt that constrain it. Runs with no linked agent keep
+     * the override, because there is no configuration to defend and embedded SDK callers rely on it.
+     *
+     * <p>Runtime instructions — the page actions available, the host page's structure — are appended
+     * to whichever prompt won, never merged into the choice. Building both in one string, as the
+     * chat endpoint used to, made every turn carrying page actions look like a caller-supplied
+     * persona and silently displaced the configured one.
+     *
+     * <p>Package-private so the rule can be tested on its own: reaching it through {@code run()}
+     * would mean standing up an LLM call to observe a decision made before the loop starts.
+     */
+    static String resolveSystemPrompt(String runId, AgentRunRequest request,
+                                      java.util.Map<String, Object> agentConfig) {
+        boolean linkedToVortoxAgent = agentConfig != null && agentConfig.get("agentId") != null;
+        String configuredPrompt = agentConfig != null ? (String) agentConfig.get("systemPrompt") : null;
+
+        if (linkedToVortoxAgent && isNotBlank(request.systemPrompt())) {
+            log.warn("Run {} supplied a systemPrompt; ignoring it — agent '{}' owns the prompt for "
+                    + "this run.", runId, agentConfig.get("agentId"));
+        }
+
+        String basePrompt = linkedToVortoxAgent
+                ? firstNonBlank(configuredPrompt, DEFAULT_SYSTEM_PROMPT)
+                : firstNonBlank(request.systemPrompt(), configuredPrompt, DEFAULT_SYSTEM_PROMPT);
+
+        return isNotBlank(request.runtimeInstructions())
+                ? basePrompt + "\n" + request.runtimeInstructions()
+                : basePrompt;
+    }
+
+    private static boolean isNotBlank(String s) {
+        return s != null && !s.isBlank();
     }
 
     /** Returns the first non-null, non-blank string from the candidates, or null if none. */

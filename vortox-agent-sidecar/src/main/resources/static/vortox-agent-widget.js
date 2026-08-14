@@ -7,6 +7,26 @@
   var SUGGESTIONS          = cfg.suggestions          || [];
   var ALLOW_PAGE_SCRIPTS   = cfg.allowPageScripts     === true;
   var PAGE_API_DESCRIPTION = cfg.pageApiDescription   || '';
+  // Identifies the screen the widget sits on, e.g. 'tnam:order-detail'. Vortox matches it against
+  // the surfaces registered for this application; anything unrecognised falls back to the
+  // application default, so a typo degrades rather than breaks.
+  var SURFACE              = cfg.surface              || '';
+
+  // ── Page actions ──────────────────────────────────────────────────────────────
+  // A closed set of DOM operations the agent may request, in place of the arbitrary
+  // JavaScript that allowPageScripts executes. The difference is the whole point: none of
+  // these can call fetch, read cookies or evaluate a string, so a prompt-injected
+  // instruction can at worst put a wrong value in a field the operator is looking at —
+  // not silently POST as a logged-in user.
+  //
+  // The host opts in with `pageActions: true` and, ideally, an `actionScope` selector
+  // bounding which part of the page is reachable. Nothing has to be declared per action.
+  var PAGE_ACTIONS_ENABLED = cfg.pageActions === true;
+  var ACTION_SCOPE         = cfg.actionScope || null;
+  // Outcomes of the previous turn's actions, sent with the next message so the agent
+  // learns whether what it asked for actually happened. Without this it proposes into a
+  // void: a stale selector or a refusal would never reach the model.
+  var lastActionReport     = null;
   var getContext           = typeof cfg.context === 'function' ? cfg.context : function () { return {}; };
 
   // Chat normally runs asynchronously against the sidecar directly: POST starts the run and
@@ -249,7 +269,38 @@
     'transition:background .15s,border-color .15s;}',
     '.vx-artifact:hover{background:#dbeafe;border-color:#93c5fd;}',
     '.vx-artifact svg{stroke:#1d4ed8;flex-shrink:0;}',
-    '.vx-artifact-size{color:#64748b;font-weight:400;margin-left:2px;}'
+    '.vx-artifact-size{color:#64748b;font-weight:400;margin-left:2px;}',
+
+    /* Page actions — what the agent asked the page to do, and what actually happened */
+    '.vx-actions{margin-top:9px;border:1px solid #e2e8f0;border-radius:9px;overflow:hidden;',
+    'background:#fff;font-family:' + VX_FONT + ';}',
+    '.vx-actions-head{padding:6px 10px;background:#f8fafc;border-bottom:1px solid #e2e8f0;',
+    'font-size:10.5px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#475569;}',
+    '.vx-actions-list{padding:3px 0;}',
+    '.vx-action-row{display:flex;align-items:baseline;gap:7px;padding:5px 10px;font-size:12px;}',
+    '.vx-action-name{font-family:ui-monospace,monospace;font-size:11.5px;font-weight:600;',
+    'color:#be1250;flex:0 0 auto;}',
+    '.vx-action-args{font-family:ui-monospace,monospace;font-size:11px;color:#64748b;',
+    'overflow-wrap:anywhere;min-width:0;}',
+    '.vx-action-state{margin-left:auto;flex:0 0 auto;font-size:10.5px;font-weight:700;}',
+    '.vx-state-ok{color:#15803d;}',
+    '.vx-state-warn{color:#b45309;}',
+    '.vx-state-stop{color:#b91c1c;}',
+    '.vx-state-muted{color:#94a3b8;font-weight:600;}',
+    '.vx-actions-note{padding:7px 10px;font-size:11.5px;line-height:1.45;}',
+    '.vx-actions-note-stop{background:#fef2f2;color:#b91c1c;}',
+    '.vx-actions-foot{display:flex;align-items:center;gap:7px;padding:8px 10px;',
+    'border-top:1px solid #e2e8f0;}',
+    '.vx-action-btn{font-family:inherit;font-size:12px;font-weight:600;padding:5px 12px;',
+    'border-radius:6px;border:1px solid #e2e8f0;background:#fff;color:#334155;cursor:pointer;}',
+    '.vx-action-btn:hover{background:#f8fafc;}',
+    '.vx-action-btn-primary{background:#be1250;border-color:#be1250;color:#fff;}',
+    '.vx-action-btn-primary:hover{background:#a30f45;}',
+    '.vx-actions-runas{margin-left:auto;font-size:10.5px;color:#94a3b8;}',
+    /* Applied to the host page, so it is namespaced and deliberately unobtrusive —
+       an outline rather than a background, which would fight the application\'s own styling. */
+    '.vx-action-highlight{outline:2px solid #be1250 !important;outline-offset:1px !important;',
+    'transition:outline-color .2s;}'
   ].join('');
   document.head.appendChild(style);
 
@@ -449,6 +500,310 @@
       badge.textContent = '✗ Script error: ' + err.message;
     }
     containerEl.appendChild(badge);
+  }
+
+  // ── Page actions ──────────────────────────────────────────────────────────────
+
+  /**
+   * The closed set. `confirm: true` means the operator approves before it runs.
+   *
+   * Only `fill` asks. Highlighting and scrolling change nothing that survives a refresh, and
+   * prompting for those would teach people to click through prompts without reading — which is
+   * exactly the habit that makes the prompt on `fill` worthless when it matters.
+   *
+   * `click` is deliberately absent from this first cut: it is the one primitive that can trigger
+   * anything on the page, up to and including a delete, and the other five are useful without it.
+   */
+  var PAGE_ACTION_DEFS = {
+    highlight: { confirm: false, args: { target: 'selector' } },
+    scrollTo:  { confirm: false, args: { target: 'selector' } },
+    setClass:  { confirm: false, args: { target: 'selector', add: 'string?', remove: 'string?' } },
+    setText:   { confirm: false, args: { target: 'selector', text: 'string' } },
+    fill:      { confirm: true,  args: { target: 'selector', value: 'string' } }
+  };
+
+  var FILLABLE = { INPUT: 1, SELECT: 1, TEXTAREA: 1 };
+
+  /** Elements matching `target`, restricted to actionScope if the host set one. */
+  function resolveTargets(selector) {
+    var root = document;
+    if (ACTION_SCOPE) {
+      root = document.querySelector(ACTION_SCOPE);
+      if (!root) return { error: 'the page area this widget may touch (' + ACTION_SCOPE + ') is not on this page' };
+    }
+    var found;
+    try {
+      found = root.querySelectorAll(selector);
+    } catch (e) {
+      return { error: 'not a usable selector: ' + selector };
+    }
+    if (!found.length) return { error: 'nothing on the page matches ' + selector };
+    return { nodes: Array.prototype.slice.call(found) };
+  }
+
+  /**
+   * Checks one requested action against its definition before anything runs.
+   *
+   * This is the security boundary, so it rejects rather than coerces: an unknown name, a missing
+   * argument, a wrong type or an argument that was never declared all fail. Silently ignoring an
+   * unexpected key is how a validator stops being one.
+   */
+  function validateAction(action) {
+    if (!action || typeof action !== 'object') return 'not a valid action';
+    var def = Object.prototype.hasOwnProperty.call(PAGE_ACTION_DEFS, action.name)
+      ? PAGE_ACTION_DEFS[action.name] : null;
+    if (!def) return 'unknown action "' + action.name + '"';
+
+    for (var key in action) {
+      if (!Object.prototype.hasOwnProperty.call(action, key)) continue;
+      if (key === 'name') continue;
+      if (!Object.prototype.hasOwnProperty.call(def.args, key)) {
+        return '"' + action.name + '" does not take "' + key + '"';
+      }
+    }
+
+    for (var arg in def.args) {
+      if (!Object.prototype.hasOwnProperty.call(def.args, arg)) continue;
+      var spec = def.args[arg];
+      var optional = spec.charAt(spec.length - 1) === '?';
+      var present = action[arg] !== undefined && action[arg] !== null;
+      if (!present) {
+        if (!optional) return '"' + action.name + '" needs "' + arg + '"';
+        continue;
+      }
+      if (typeof action[arg] !== 'string') return '"' + arg + '" must be text';
+      if (spec.indexOf('selector') === 0 && !action[arg].trim()) return '"' + arg + '" is empty';
+    }
+
+    if (action.name === 'setClass' && !action.add && !action.remove) {
+      return 'setClass needs "add" or "remove"';
+    }
+    return null;
+  }
+
+  /** Runs one already-validated action. Returns {ok, detail}. */
+  function runAction(action) {
+    var resolved = resolveTargets(action.target);
+    if (resolved.error) return { ok: false, detail: resolved.error };
+    var nodes = resolved.nodes;
+
+    try {
+      switch (action.name) {
+        case 'highlight':
+          nodes.forEach(function (n) {
+            n.classList.add('vx-action-highlight');
+            setTimeout(function () { n.classList.remove('vx-action-highlight'); }, 4000);
+          });
+          return { ok: true, detail: nodes.length > 1 ? String(nodes.length) + ' elements' : '' };
+
+        case 'scrollTo':
+          nodes[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
+          return { ok: true, detail: '' };
+
+        case 'setClass':
+          nodes.forEach(function (n) {
+            if (action.add)    n.classList.add(action.add);
+            if (action.remove) n.classList.remove(action.remove);
+          });
+          return { ok: true, detail: nodes.length > 1 ? String(nodes.length) + ' elements' : '' };
+
+        case 'setText':
+          // Refused on form controls: setting .textContent on an input does nothing visible while
+          // reporting success, which would tell the agent a value was entered when it was not.
+          for (var i = 0; i < nodes.length; i++) {
+            if (FILLABLE[nodes[i].tagName]) {
+              return { ok: false, detail: 'that is a form field — use fill, not setText' };
+            }
+          }
+          nodes.forEach(function (n) { n.textContent = action.text; });
+          return { ok: true, detail: '' };
+
+        case 'fill':
+          var filled = 0;
+          for (var j = 0; j < nodes.length; j++) {
+            var el = nodes[j];
+            if (!FILLABLE[el.tagName]) continue;
+            el.value = action.value;
+            // Both events, because frameworks listen for different ones and a value set without
+            // them looks right on screen while the application still holds the old one.
+            el.dispatchEvent(new Event('input',  { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            filled++;
+          }
+          if (!filled) return { ok: false, detail: 'not a field that can be filled' };
+          return { ok: true, detail: filled > 1 ? String(filled) + ' fields' : '' };
+
+        default:
+          return { ok: false, detail: 'unsupported' };
+      }
+    } catch (err) {
+      return { ok: false, detail: err.message };
+    }
+  }
+
+  /** Reads the ```vortox-actions block, if the model emitted one. */
+  function parseActions(raw) {
+    var m = /```vortox-actions\s*([\s\S]*?)```/.exec(raw);
+    if (!m) return null;
+    var parsed;
+    try {
+      parsed = JSON.parse(m[1].trim());
+    } catch (e) {
+      return { error: 'the assistant proposed page changes but they were not readable' };
+    }
+    var list = parsed && parsed.actions;
+    if (!Array.isArray(list) || !list.length) return null;
+    // A cap, because a runaway list of hundreds is a malfunction rather than an intention.
+    if (list.length > 20) return { error: 'too many page changes proposed at once' };
+    return { actions: list };
+  }
+
+  /**
+   * Renders the action card and executes what it is allowed to.
+   *
+   * Anything needing approval is held until the operator clicks Apply. Approval is the only guard
+   * that speaks to intent: permissions establish that the operator *may* do this, never that they
+   * *meant* it — and an injected instruction typically asks for something they are entitled to do.
+   */
+  function handlePageActions(raw, containerEl) {
+    var parsed = parseActions(raw);
+    if (!parsed) return;
+
+    var card = document.createElement('div');
+    card.className = 'vx-actions';
+    var head = document.createElement('div');
+    head.className = 'vx-actions-head';
+    card.appendChild(head);
+
+    if (parsed.error) {
+      head.textContent = 'Nothing ran';
+      var bad = document.createElement('div');
+      bad.className = 'vx-actions-note vx-actions-note-stop';
+      bad.textContent = parsed.error;
+      card.appendChild(bad);
+      containerEl.appendChild(card);
+      lastActionReport = 'Your proposed page changes could not be read, so nothing ran.';
+      return;
+    }
+
+    var rows = [];
+    var needsApproval = false;
+
+    parsed.actions.forEach(function (action) {
+      var problem = validateAction(action);
+      var row = { action: action, problem: problem, el: null, stateEl: null };
+      if (!problem && PAGE_ACTION_DEFS[action.name].confirm) needsApproval = true;
+      rows.push(row);
+    });
+
+    var list = document.createElement('div');
+    list.className = 'vx-actions-list';
+    rows.forEach(function (row) {
+      var el = document.createElement('div');
+      el.className = 'vx-action-row';
+      var name = document.createElement('span');
+      name.className = 'vx-action-name';
+      name.textContent = row.action && row.action.name ? String(row.action.name) : '?';
+      var args = document.createElement('span');
+      args.className = 'vx-action-args';
+      args.textContent = describeArgs(row.action);
+      var state = document.createElement('span');
+      state.className = 'vx-action-state';
+      if (row.problem) {
+        state.textContent = 'blocked';
+        state.className += ' vx-state-stop';
+      }
+      el.appendChild(name); el.appendChild(args); el.appendChild(state);
+      list.appendChild(el);
+      row.el = el; row.stateEl = state;
+    });
+    card.appendChild(list);
+    containerEl.appendChild(card);
+
+    var applyAll = function () {
+      var report = [];
+      rows.forEach(function (row) {
+        if (row.problem) {
+          report.push(row.action && row.action.name ? row.action.name + ': refused — ' + row.problem
+                                                    : 'refused — ' + row.problem);
+          return;
+        }
+        var result = runAction(row.action);
+        row.stateEl.className = 'vx-action-state ' + (result.ok ? 'vx-state-ok' : 'vx-state-warn');
+        row.stateEl.textContent = result.ok ? ('✓' + (result.detail ? ' ' + result.detail : ''))
+                                            : result.detail;
+        report.push(row.action.name + ' ' + row.action.target + ': ' +
+                    (result.ok ? 'applied' + (result.detail ? ' (' + result.detail + ')' : '')
+                               : 'failed — ' + result.detail));
+      });
+      head.textContent = summarise(rows);
+      lastActionReport = report.join('\n');
+    };
+
+    if (!needsApproval) {
+      applyAll();
+      return;
+    }
+
+    head.textContent = 'Waiting for approval · ' + rows.length +
+                       (rows.length === 1 ? ' change' : ' changes');
+    var foot = document.createElement('div');
+    foot.className = 'vx-actions-foot';
+    var apply = document.createElement('button');
+    apply.type = 'button';
+    apply.className = 'vx-action-btn vx-action-btn-primary';
+    apply.textContent = 'Apply';
+    var dismiss = document.createElement('button');
+    dismiss.type = 'button';
+    dismiss.className = 'vx-action-btn';
+    dismiss.textContent = 'Dismiss';
+    var note = document.createElement('span');
+    note.className = 'vx-actions-runas';
+    note.textContent = 'runs as you';
+    foot.appendChild(apply); foot.appendChild(dismiss); foot.appendChild(note);
+    card.appendChild(foot);
+
+    apply.addEventListener('click', function () {
+      foot.parentNode.removeChild(foot);
+      applyAll();
+    });
+    dismiss.addEventListener('click', function () {
+      foot.parentNode.removeChild(foot);
+      head.textContent = 'Dismissed';
+      rows.forEach(function (row) {
+        if (row.problem) return;
+        row.stateEl.textContent = 'not applied';
+        row.stateEl.className = 'vx-action-state vx-state-muted';
+      });
+      // Recorded so the agent knows the operator declined rather than that it silently worked.
+      lastActionReport = 'The user reviewed your proposed page changes and dismissed them. ' +
+                         'Nothing was applied. Do not simply repeat the same proposal.';
+    });
+  }
+
+  function describeArgs(action) {
+    if (!action || typeof action !== 'object') return '';
+    var bits = [];
+    if (action.target) bits.push(String(action.target));
+    if (action.value !== undefined)  bits.push('→ "' + action.value + '"');
+    if (action.text !== undefined)   bits.push('→ "' + action.text + '"');
+    if (action.add)    bits.push('+' + action.add);
+    if (action.remove) bits.push('−' + action.remove);
+    return bits.join(' ');
+  }
+
+  /** Plain-language verdict — "1 error" is not something an operator can act on. */
+  function summarise(rows) {
+    var total = rows.length;
+    var ok = 0, failed = 0;
+    rows.forEach(function (row) {
+      if (row.problem) { failed++; return; }
+      if (row.stateEl && row.stateEl.className.indexOf('vx-state-ok') !== -1) ok++;
+      else failed++;
+    });
+    if (failed === 0) return 'Page updated';
+    if (ok === 0)     return 'Nothing ran';
+    return ok + ' of ' + total + ' applied';
   }
 
   // ── Downloadable artifacts ────────────────────────────────────────────────────
@@ -749,6 +1104,24 @@
       context: Object.assign({}, getContext(), _pageCtx)
     };
 
+    // Which screen this is, so the agent's instructions can differ per screen. A plain identifier,
+    // not a description: the prose about the page already travels in `context`. Omitted entirely
+    // when the host has not named its screens, which reads as "the application default".
+    if (SURFACE) { payload.surface = SURFACE; }
+
+    if (PAGE_ACTIONS_ENABLED) {
+      payload.pageActions = Object.keys(PAGE_ACTION_DEFS);
+      // The DOM snapshot is what lets the model pick selectors; without it the actions exist but
+      // it has nothing to aim them at.
+      payload.pageApiDescription = PAGE_API_DESCRIPTION
+        ? collectPageDom() + '\n\n### Host-provided notes\n' + PAGE_API_DESCRIPTION
+        : collectPageDom();
+      if (lastActionReport) {
+        payload.lastActionResults = lastActionReport;
+        lastActionReport = null;
+      }
+    }
+
     if (ALLOW_PAGE_SCRIPTS) {
       payload.allowPageScripts = true;
       // Auto-introspect the live DOM so the LLM knows what it can manipulate.
@@ -906,6 +1279,7 @@
     var msgEl = appendMessage('agent', reply);
     history.push({ role: 'assistant', content: reply });
     if (ALLOW_PAGE_SCRIPTS) extractAndRunScripts(reply, msgEl);
+    if (PAGE_ACTIONS_ENABLED) handlePageActions(reply, msgEl);
     renderArtifacts(artifacts, msgEl);
   }
 
@@ -1005,5 +1379,8 @@
   // VortoxAgent.setSuggestions([...])   — replace the suggestion chips
   cfg.setContext    = function (key, value) { _pageCtx[key] = value; };
   cfg.setSuggestions = function (suggestions) { SUGGESTIONS = suggestions; };
+  // For applications that navigate without reloading the page, where the widget outlives the screen
+  // it was configured on and would otherwise keep reporting the first one it ever saw.
+  cfg.setSurface    = function (surface) { SURFACE = surface || ''; };
 
 })();

@@ -16,6 +16,24 @@ public record AgentChatRequest(
         Map<String, Object> context,
         Boolean allowPageScripts,
         String pageApiDescription,
+
+        /**
+         * Names of the DOM operations this widget will execute, sent by the widget itself since it
+         * owns the implementations. Advisory to the prompt only: the browser validates every
+         * requested action against its own definitions before running anything, so a name that
+         * arrives here but is not implemented there is simply refused.
+         */
+        List<String> pageActions,
+
+        /**
+         * What became of the actions proposed on the previous turn — applied, failed, or dismissed
+         * by the operator.
+         *
+         * <p>Actions execute after the run has finished, so without this the agent proposes into a
+         * void: a stale selector or a refusal would never reach it, and it would keep repeating a
+         * suggestion that has already failed twice.
+         */
+        String lastActionResults,
         String systemPrompt,
         String model,
         String llmProvider,        // optional: "anthropic" (default) or "local"
@@ -31,5 +49,17 @@ public record AgentChatRequest(
          * which skills and which secrets a run gets, so it must be something the server sets and the
          * page cannot.
          */
-        String tenantCode
+        String tenantCode,
+
+        /**
+         * Which screen the widget is embedded in, e.g. {@code tnam:order-detail}. Sent by the widget
+         * from its own configuration, since only the browser knows which screen is open — one chat
+         * endpoint serves them all.
+         *
+         * <p>Consequently untrusted, unlike {@code tenantCode}: it selects among configurations
+         * already registered in Vortox for this application, and an unrecognised value falls back to
+         * the application default. A host application that can determine the surface server-side is
+         * free to overwrite it in its own {@code ChatContextEnricher}.
+         */
+        String surface
 ) {}

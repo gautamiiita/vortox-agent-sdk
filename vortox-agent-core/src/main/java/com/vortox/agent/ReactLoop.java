@@ -42,6 +42,42 @@ public final class ReactLoop {
 
     // ── Built-in tool names ───────────────────────────────────────────────────
     static final String TASK_COMPLETE_TOOL      = "task_complete";
+
+    /**
+     * Picks what the user actually sees when a run ends via {@code task_complete}.
+     *
+     * <p>The summary is an argument to a tool call — a status line for the caller. The report the
+     * user wants (the number, the table, the caveats) is prose the model wrote in an earlier turn.
+     * Using the summary as the reply meant that prose was discarded on every completed run, so an
+     * analyst agent that produced a full breakdown delivered one flat sentence instead, and the
+     * behaviour read as the assistant becoming vague for no reason.
+     *
+     * <p>The rule: prefer the prose when there is any, and keep the summary only when it adds
+     * something the prose does not already say. A summary that is longer than the prose is treated
+     * as the real answer — that is the shape of an agent instructed to put its answer in the summary
+     * field, which some prompts do — so this does not regress those.
+     *
+     * <p>Package-private so the choice can be tested without standing up an LLM call.
+     */
+    static String chooseReply(String assistantText, String summary) {
+        boolean hasText    = assistantText != null && !assistantText.isBlank();
+        boolean hasSummary = summary != null && !summary.isBlank();
+
+        if (!hasText) return hasSummary ? summary : "";
+        if (!hasSummary) return assistantText;
+
+        String text = assistantText.trim();
+        String sum  = summary.trim();
+
+        // The agent put its answer in the summary: honour that rather than replacing it with a
+        // shorter lead-in like "Let me run that query for you."
+        if (sum.length() > text.length()) return sum;
+
+        // Already said it — appending would only repeat the last line back to the reader.
+        if (text.contains(sum)) return text;
+
+        return text;
+    }
     static final String CLARIFICATION_TOOL      = "request_clarification";
     static final String APPROVAL_TOOL           = "request_approval";
     static final String HANDOFF_TOOL            = "request_handoff";
@@ -203,6 +239,8 @@ public final class ReactLoop {
         List<AgentResult.ToolCall> toolCalls = new ArrayList<>();
         int totalIn = 0, totalOut = 0, totalCC = 0, totalCR = 0;
         boolean outcomeCheckDone = false;
+        /** The last non-blank prose the model produced, in any turn — see chooseReply. */
+        String lastAssistantText = null;
 
         int maxIterations = config.getMaxIterations();
         int iterations = 0;
@@ -240,6 +278,16 @@ public final class ReactLoop {
             totalCC  += response.getCacheCreationInputTokens();
             totalCR  += response.getCacheReadInputTokens();
             listener.onTokens(runId, iterations, totalIn, totalOut);
+
+            // Keep the most recent prose the model wrote. A model that works for several turns and
+            // then signals completion typically writes its actual answer — the formatted report,
+            // the table — in an earlier turn, and gives task_complete a one-line summary. Taking the
+            // summary as the reply threw that away: runs spending well over a thousand output
+            // tokens were delivering a single sentence to the user. See chooseReply below.
+            String iterationText = response.getTextContent();
+            if (iterationText != null && !iterationText.isBlank()) {
+                lastAssistantText = iterationText.trim();
+            }
 
             if (!response.hasToolUse()) {
                 // LLM returned plain text — task complete
@@ -286,13 +334,14 @@ public final class ReactLoop {
                     listener.onComplete(runId, r);
                     return r;
                 }
+                String reply = chooseReply(lastAssistantText, summary);
                 if ("PARTIAL".equals(outcome)) {
-                    AgentResult r = AgentResult.partial(summary, iterations, toolCalls,
+                    AgentResult r = AgentResult.partial(reply, iterations, toolCalls,
                             messages, totalIn, totalOut, totalCC, totalCR);
                     listener.onComplete(runId, r);
                     return r;
                 }
-                AgentResult r = AgentResult.success(summary, iterations, toolCalls,
+                AgentResult r = AgentResult.success(reply, iterations, toolCalls,
                         messages, totalIn, totalOut, totalCC, totalCR);
                 listener.onComplete(runId, r);
                 return r;

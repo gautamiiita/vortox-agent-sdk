@@ -1,0 +1,377 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Widget harness — Vortox Agent Sidecar</title>
+<style>
+  :root { --ink:#1e293b; --muted:#64748b; --line:#e2e8f0; --bg:#f8fafc; --card:#fff; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.55 -apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;
+         color:var(--ink); background:var(--bg); }
+  .wrap { max-width:900px; margin:0 auto; padding:24px 20px 140px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  h2 { font-size:15px; margin:26px 0 10px; padding-bottom:6px; border-bottom:1px solid var(--line); }
+  .sub { color:var(--muted); margin:0 0 20px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px 18px; }
+  .note { background:#fffbeb; border:1px solid #fcd34d; color:#78350f; border-radius:8px;
+          padding:10px 14px; margin:0 0 20px; font-size:13px; }
+  .note code, .expect code { background:rgba(0,0,0,.06); padding:1px 4px; border-radius:3px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:12px 16px; }
+  label { display:block; font-size:12px; color:var(--muted); margin-bottom:3px; }
+  input[type=text],input[type=number],input[type=email],input[type=tel],select,textarea {
+    width:100%; padding:7px 9px; border:1px solid var(--line); border-radius:6px;
+    font:inherit; font-size:13px; background:#fff; color:var(--ink); }
+  textarea { min-height:64px; resize:vertical; }
+  .row { display:flex; gap:14px; align-items:center; flex-wrap:wrap; }
+  .row label { margin:0; font-size:13px; color:var(--ink); display:flex; align-items:center; gap:6px; }
+  button { font:inherit; font-size:13px; padding:7px 14px; border-radius:7px; cursor:pointer;
+           border:1px solid #2563eb; background:#2563eb; color:#fff; }
+  button.ghost { background:#fff; color:#475569; border-color:var(--line); }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); }
+  th { color:var(--muted); font-weight:600; font-size:12px; }
+  .expect { font-size:13px; color:var(--muted); }
+  .expect td { padding:5px 8px; border:0; vertical-align:top; }
+  .tag { font-size:11px; padding:1px 6px; border-radius:4px; background:#f1f5f9; color:#475569;
+         white-space:nowrap; }
+  .tag-sent { background:#dcfce7; color:#166534; }
+  .tag-held { background:#fee2e2; color:#991b1b; }
+  .tag-ok   { background:#dbeafe; color:#1e40af; }
+
+  /* Classes the agent can add or remove with setClass — named so it has something concrete
+     to aim at, and so the effect is unmistakable on screen. */
+  .demo-flagged { background:#fef3c7 !important; outline:2px solid #f59e0b; }
+  .demo-resolved { background:#dcfce7 !important; outline:2px solid #22c55e; }
+
+  #demo-banner { padding:10px 14px; border-radius:8px; background:#eff6ff; border:1px solid #bfdbfe;
+                 color:#1e40af; font-size:13px; }
+  #out-of-scope { border:1px dashed #cbd5e1; }
+  #mutation-log { font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; max-height:190px;
+                  overflow:auto; background:#0f172a; color:#cbd5e1; border-radius:8px; padding:10px 12px; }
+  #mutation-log .m-none { color:#64748b; }
+  #mutation-log .m-hit  { color:#86efac; }
+  .spacer { height:520px; display:flex; align-items:center; justify-content:center; color:#cbd5e1;
+            font-size:13px; border:1px dashed var(--line); border-radius:10px; margin:14px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Widget harness</h1>
+  <p class="sub">A stand-in host page for exercising the chat widget — page context, DOM actions,
+     downloads — without a host application.</p>
+
+  <p class="note">
+    <strong>Development only.</strong> This page talks straight to the sidecar, which a real host
+    must never do — a host serves the widget itself and relays chat through its own endpoint, so the
+    browser never reaches the sidecar and never holds a key. That protection is absent here; the
+    loopback port binding is what stands in for it. Do not serve this page from a sidecar reachable
+    beyond localhost.
+  </p>
+
+  <h2>Harness settings</h2>
+  <div class="card">
+    <form method="get" id="cfgForm">
+      <div class="grid">
+        <div>
+          <label for="cfg-tenant">Tenant code <span class="tag">skills &amp; secrets</span></label>
+          <input type="text" id="cfg-tenant" name="tenant" placeholder="e.g. CUBE">
+        </div>
+        <div>
+          <label for="cfg-surface">Surface (screen id)</label>
+          <input type="text" id="cfg-surface" name="surface" placeholder="e.g. demo:order-detail">
+        </div>
+        <div>
+          <label for="cfg-user">Simulated signed-in user</label>
+          <input type="text" id="cfg-user" name="user" placeholder="e.g. SUP#GSR">
+        </div>
+        <div>
+          <label for="cfg-scope">Action scope <span class="tag">what may be touched</span></label>
+          <input type="text" id="cfg-scope" name="scope" placeholder="#stx-screen">
+        </div>
+      </div>
+      <div class="row" style="margin-top:14px">
+        <label><input type="checkbox" name="pageContext" id="cfg-pageContext" value="1"> Send page context</label>
+        <label><input type="checkbox" name="fieldValues" id="cfg-fieldValues" value="1"> Include field values</label>
+        <label><input type="checkbox" name="pageActions" id="cfg-pageActions" value="1"> Allow page actions</label>
+        <button type="submit">Apply &amp; reload</button>
+      </div>
+    </form>
+  </div>
+
+  <!-- Everything the agent is allowed to touch lives inside #stx-screen. The settings above and the
+       verification panels below are deliberately outside it, so an out-of-scope selector can be
+       shown to be refused rather than merely unused. -->
+  <h2>Simulated screen — order detail</h2>
+  <div class="card" id="stx-screen">
+
+    <div id="demo-banner">Order is awaiting payment confirmation.</div>
+
+    <div class="grid" style="margin-top:14px">
+      <div>
+        <label for="order-id">Order reference</label>
+        <input type="text" id="order-id" name="order-id" value="ORD-88213">
+      </div>
+      <div>
+        <label for="order-status">Status</label>
+        <select id="order-status" name="order-status">
+          <option value="OPEN" selected>OPEN</option>
+          <option value="CLOSED">CLOSED</option>
+          <option value="ABANDONNED">ABANDONNED</option>
+        </select>
+      </div>
+      <div>
+        <label for="order-amount">Amount (EUR)</label>
+        <input type="number" id="order-amount" name="order-amount" value="149.50">
+      </div>
+      <div>
+        <label for="promo-code">Promo code</label>
+        <input type="text" id="promo-code" name="promo-code" value="SUMMER25">
+      </div>
+      <div>
+        <label for="customer-name">Customer name</label>
+        <input type="text" id="customer-name" name="customer-name" value="Marie Dupont">
+      </div>
+      <div>
+        <label for="customer-email">Customer e-mail</label>
+        <input type="email" id="customer-email" name="customer-email" value="marie.dupont@example.com">
+      </div>
+      <div>
+        <label for="customer-phone">Phone</label>
+        <input type="tel" id="customer-phone" name="customer-phone" value="+33 6 12 34 56 78">
+      </div>
+      <div>
+        <label for="delivery-address">Delivery address</label>
+        <input type="text" id="delivery-address" name="delivery-address" value="12 rue de la Paix, Paris">
+      </div>
+      <div>
+        <label for="invoice-reference">Invoice reference <em>(deliberately blank)</em></label>
+        <input type="text" id="invoice-reference" name="invoice-reference" value="">
+      </div>
+    </div>
+
+    <div style="margin-top:12px">
+      <label for="internal-notes">Internal notes</label>
+      <textarea id="internal-notes" name="internal-notes">Customer called about the delayed ticket download.</textarea>
+    </div>
+
+    <div class="row" style="margin-top:12px">
+      <label><input type="checkbox" id="marketing-consent" name="marketing-consent" checked> Marketing consent</label>
+    </div>
+
+    <h3 id="lines-heading" style="font-size:14px;margin:18px 0 8px">Order lines</h3>
+    <table>
+      <thead><tr><th>Product</th><th>Qty</th><th>Unit</th><th>Total</th></tr></thead>
+      <tbody>
+        <tr id="line-1"><td>Season ticket — Zone A</td><td>2</td><td>59.00</td><td>118.00</td></tr>
+        <tr id="line-2"><td>Booking fee</td><td>1</td><td>31.50</td><td>31.50</td></tr>
+      </tbody>
+    </table>
+
+    <div class="spacer">↓ deliberately tall, so <code>scrollTo</code> is observable ↓</div>
+
+    <div id="audit-trail" class="card" style="box-shadow:none">
+      <strong>Audit trail</strong>
+      <p id="audit-note" style="margin:6px 0 0;color:var(--muted)">No adjustments recorded.</p>
+    </div>
+  </div>
+
+  <h2>Out of scope — must never change</h2>
+  <div class="card" id="out-of-scope">
+    <p id="protected-text" style="margin:0">
+      This block sits outside the action scope. An agent asking to change
+      <code>#protected-text</code> should be refused, not obeyed.
+    </p>
+  </div>
+
+  <h2>What actually changed <span class="tag">independent of the widget</span></h2>
+  <div class="card">
+    <div id="mutation-log"><span class="m-none">No DOM changes observed yet.</span></div>
+    <div class="row" style="margin-top:10px">
+      <button type="button" class="ghost" id="clear-log">Clear log</button>
+      <button type="button" class="ghost" id="reset-screen">Reset screen</button>
+      <span class="expect">Recorded by a MutationObserver on the page, so it reports what happened
+        rather than what the agent said it did.</span>
+    </div>
+  </div>
+
+  <h2>What to expect</h2>
+  <div class="card">
+    <table class="expect">
+      <tr><td><strong>Page context</strong></td><td></td></tr>
+      <tr><td><code>order-id</code>, <code>order-status</code>, <code>order-amount</code>, <code>promo-code</code></td>
+          <td><span class="tag tag-sent">value sent</span> when field values are on</td></tr>
+      <tr><td><code>customer-name</code>, <code>customer-email</code>, <code>customer-phone</code>,
+              <code>delivery-address</code>, <code>internal-notes</code></td>
+          <td><span class="tag tag-held">withheld</span> — filled/empty even with values on</td></tr>
+      <tr><td><code>invoice-reference</code></td><td><span class="tag">empty</span></td></tr>
+
+      <tr><td style="padding-top:14px"><strong>Page actions</strong></td><td></td></tr>
+      <tr><td>“highlight the blank invoice reference”</td>
+          <td><span class="tag tag-ok">applied</span> — flashes, then clears itself</td></tr>
+      <tr><td>“scroll to the audit trail”</td><td><span class="tag tag-ok">applied</span></td></tr>
+      <tr><td>“mark the booking fee row as flagged” (<code>setClass</code> → <code>demo-flagged</code>)</td>
+          <td><span class="tag tag-ok">applied</span> — amber outline</td></tr>
+      <tr><td>“set the audit note to …” (<code>setText</code>)</td><td><span class="tag tag-ok">applied</span></td></tr>
+      <tr><td>“set the status to CLOSED” (<code>fill</code>)</td>
+          <td><span class="tag">waits for Apply</span> — nothing changes until you approve</td></tr>
+      <tr><td>“change <code>#protected-text</code>”</td>
+          <td><span class="tag tag-held">blocked</span> — outside the action scope</td></tr>
+      <tr><td><code>setText</code> aimed at an input</td>
+          <td><span class="tag tag-held">blocked</span> — refused on form controls</td></tr>
+    </table>
+    <p class="expect" style="margin:12px 0 0">
+      The mutation log is the check that matters: if the widget reports “applied” for something the
+      log never saw, or the log shows a change to an out-of-scope element, that is a real defect.
+    </p>
+  </div>
+
+</div>
+
+<script>
+  // ── Harness settings ──────────────────────────────────────────────────────────
+  // Read from the query string so a configuration is shareable and survives reload.
+  var qs = new URLSearchParams(location.search);
+  var flag = function (k, dflt) { return qs.has(k) ? qs.get(k) === '1' : dflt; };
+
+  var settings = {
+    tenant:      qs.get('tenant')  || 'CUBE',
+    surface:     qs.get('surface') || 'demo:order-detail',
+    user:        qs.get('user')    || 'SUP#GSR',
+    scope:       qs.get('scope')   || '#stx-screen',
+    pageContext: flag('pageContext', true),
+    fieldValues: flag('fieldValues', false),
+    pageActions: flag('pageActions', true)
+  };
+
+  document.getElementById('cfg-tenant').value  = settings.tenant;
+  document.getElementById('cfg-surface').value = settings.surface;
+  document.getElementById('cfg-user').value    = settings.user;
+  document.getElementById('cfg-scope').value   = settings.scope;
+  document.getElementById('cfg-pageContext').checked = settings.pageContext;
+  document.getElementById('cfg-fieldValues').checked  = settings.fieldValues;
+  document.getElementById('cfg-pageActions').checked  = settings.pageActions;
+
+  // ── Independent record of what changed ────────────────────────────────────────
+  // The widget reports what it believes it applied. This watches the document itself, so a
+  // discrepancy between the two is visible — including a change landing somewhere it should
+  // not have been able to reach.
+  var logEl = document.getElementById('mutation-log');
+  var logCount = 0;
+
+  function describeTarget(node) {
+    var el = node.nodeType === 1 ? node : node.parentElement;
+    if (!el) return '(detached)';
+    return (el.id ? '#' + el.id : el.tagName.toLowerCase())
+         + (el.className && typeof el.className === 'string'
+              ? ' .' + el.className.trim().split(/\s+/).join('.') : '');
+  }
+
+  // Writing to the log is itself a DOM change, and the log lives in the observed subtree — so
+  // appending a line was being observed, which appended a line, which was observed. The page hung
+  // during load, because the widget inserting its own button is enough to start it. Two independent
+  // guards, since one silent infinite loop was plenty:
+  //   1. mutations inside the log panel, or anywhere in the widget's own UI, are never reported
+  //   2. a re-entrancy flag, so nothing this function does can come back around
+  var writing = false;
+
+  function ignored(node) {
+    var el = node && node.nodeType === 1 ? node : (node ? node.parentElement : null);
+    while (el) {
+      if (el === logEl) return true;
+      if (el.id && /^vx-/.test(el.id)) return true;   // the widget's own panel, chips, messages
+      el = el.parentElement;
+    }
+    return false;
+  }
+
+  function note(text, outOfScope) {
+    if (writing) return;
+    writing = true;
+    try {
+      if (logCount === 0) logEl.innerHTML = '';
+      logCount++;
+      var line = document.createElement('div');
+      line.className = outOfScope ? '' : 'm-hit';
+      if (outOfScope) line.style.color = '#fca5a5';
+      var t = new Date().toISOString().substring(11, 19);
+      line.textContent = t + '  ' + (outOfScope ? '⚠ OUT OF SCOPE  ' : '') + text;
+      logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+    } finally {
+      writing = false;
+    }
+  }
+
+  var scopeEl = document.querySelector(settings.scope);
+  new MutationObserver(function (records) {
+    records.forEach(function (r) {
+      if (ignored(r.target)) return;
+      var inScope = scopeEl && r.target && scopeEl.contains(r.target);
+      if (r.type === 'attributes') {
+        note(r.attributeName + ' changed on ' + describeTarget(r.target), !inScope);
+      } else if (r.type === 'characterData') {
+        note('text changed in ' + describeTarget(r.target), !inScope);
+      } else {
+        note('children changed in ' + describeTarget(r.target), !inScope);
+      }
+    });
+  }).observe(document.body, {
+    subtree: true, childList: true, characterData: true,
+    attributes: true, attributeFilter: ['class', 'value', 'style']
+  });
+
+  // `fill` sets .value, which is a property rather than an attribute and so is invisible to a
+  // MutationObserver. Watching input events covers it, which is the point of this panel: the
+  // record should not depend on the mechanism used to change things.
+  document.addEventListener('input', function (e) {
+    if (!e.target || !e.target.id || ignored(e.target)) return;
+    note('value set on #' + e.target.id, !(scopeEl && scopeEl.contains(e.target)));
+  }, true);
+
+  document.getElementById('clear-log').addEventListener('click', function () {
+    logCount = 0;
+    logEl.innerHTML = '<span class="m-none">No DOM changes observed yet.</span>';
+  });
+  document.getElementById('reset-screen').addEventListener('click', function () {
+    location.reload();
+  });
+
+  // ── Widget ────────────────────────────────────────────────────────────────────
+  window.VortoxAgent = {
+    // Same origin as this page, so the sidecar's own endpoint. A host application would point this
+    // at its relay instead and let that add the sidecar key server-side.
+    endpoint: '/agent/chat',
+    title: 'AI Assistant (harness)',
+    surface: settings.surface,
+    // Only needed because there is no relay here to derive it from a session.
+    tenantCode: settings.tenant,
+    sendPageContext: settings.pageContext,
+    includeFieldValues: settings.fieldValues,
+    pageActions: settings.pageActions,
+    // Bounds what any action can reach. Everything outside #stx-screen — the settings form, the
+    // verification panels, the out-of-scope block — is unreachable by construction, which is what
+    // makes a refusal demonstrable rather than assumed.
+    actionScope: settings.scope,
+    // Stands in for what a host's enricher would add server-side, so the context chips have
+    // something to show.
+    context: function () {
+      return {
+        authenticatedUser: settings.user,
+        institutionCode: settings.tenant,
+        application: 'WIDGET-HARNESS'
+      };
+    },
+    suggestions: [
+      'What can you see on this screen, and what is missing?',
+      'Highlight the fields that still need filling in',
+      'Mark the booking fee line as flagged',
+      'Set the status to CLOSED',
+      'Change the protected text outside the screen'
+    ]
+  };
+</script>
+<script src="/vortox-agent-widget.js"></script>
+</body>
+</html>

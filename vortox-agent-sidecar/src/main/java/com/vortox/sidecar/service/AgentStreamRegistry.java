@@ -58,7 +58,15 @@ public class AgentStreamRegistry {
 
             @Override
             public void onToolCall(String rid, String toolName, Map<String, Object> params) {
-                publish(rid, "tool_call", Map.of("tool", toolName));
+                // The tool name alone produces a progress trail that repeats one line — eight
+                // "Querying the database" rows say nothing about what was queried, and read as
+                // eight things going wrong rather than one investigation proceeding. The
+                // parameters are already here; a short summary of them is what makes each step
+                // legible.
+                String detail = summariseParams(params);
+                publish(rid, "tool_call", detail == null
+                        ? Map.of("tool", toolName)
+                        : Map.of("tool", toolName, "detail", detail));
             }
 
             @Override
@@ -117,6 +125,60 @@ public class AgentStreamRegistry {
     public void remove(String runId) {
         queues.remove(runId);
         timestamps.remove(runId);
+    }
+
+    /** Parameter names worth showing, most informative first. */
+    private static final String[] INTERESTING_PARAMS =
+            {"sql", "query", "url", "path", "file", "filename", "command", "target", "name", "message"};
+
+    /** Never shown, whatever the tool calls them. */
+    private static final java.util.regex.Pattern SECRET_PARAM =
+            java.util.regex.Pattern.compile("(pass|pwd|secret|token|api[_-]?key|credential)", 2);
+
+    private static final int DETAIL_MAX = 120;
+
+    /**
+     * A one-line summary of what a tool was asked to do, for the progress trail.
+     *
+     * <p>Prefers the parameter that identifies the work — the statement for a query, the path for a
+     * file, the URL for a fetch — and falls back to the first usable scalar so a tool this code has
+     * never heard of still says something. Whitespace is collapsed because a formatted SQL statement
+     * spanning twelve lines cannot be a single progress row, and the result is length-capped.
+     *
+     * <p>Parameters are model-authored and shown only to the user whose session produced them, but
+     * anything named like a credential is skipped regardless: a progress trail is not worth leaking
+     * a token into, and it is often the part of a UI that gets screenshotted.
+     */
+    /* package-private for testability */
+    static String summariseParams(Map<String, Object> params) {
+        if (params == null || params.isEmpty()) return null;
+
+        for (String key : INTERESTING_PARAMS) {
+            if (SECRET_PARAM.matcher(key).find()) continue;
+            String value = compact(params.get(key));
+            if (value != null) return value;
+        }
+        for (Map.Entry<String, Object> entry : params.entrySet()) {
+            if (entry.getKey() == null || SECRET_PARAM.matcher(entry.getKey()).find()) continue;
+            String value = compact(entry.getValue());
+            if (value != null) return entry.getKey() + ": " + value;
+        }
+        return null;
+    }
+
+    /** Single-line, length-capped rendering of a scalar parameter; null when there is nothing to show. */
+    private static String compact(Object raw) {
+        String text;
+        if (raw instanceof String s) {
+            text = s;
+        } else if (raw instanceof Number || raw instanceof Boolean) {
+            text = String.valueOf(raw);
+        } else {
+            return null;   // maps and lists are structure, not a progress line
+        }
+        text = text.replaceAll("\\s+", " ").trim();
+        if (text.isEmpty()) return null;
+        return text.length() > DETAIL_MAX ? text.substring(0, DETAIL_MAX - 1) + "…" : text;
     }
 
     /** Evicts queues whose stream endpoint was never connected to (or never completed) within TTL_MS. */

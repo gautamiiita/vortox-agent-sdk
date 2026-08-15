@@ -15,7 +15,7 @@ public class WebMvcConfig implements WebMvcConfigurer {
 
     @Override
     public void addResourceHandlers(ResourceHandlerRegistry registry) {
-        registry.addResourceHandler("/vortox-agent-widget.js")
+        registry.addResourceHandler("/vortox-agent-widget.js", "/demo.html")
                 .addResourceLocations("classpath:/static/")
                 .setCacheControl(CacheControl.noStore());
     }

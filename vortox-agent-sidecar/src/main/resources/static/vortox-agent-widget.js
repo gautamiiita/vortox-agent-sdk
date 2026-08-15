@@ -11,6 +11,12 @@
   // the surfaces registered for this application; anything unrecognised falls back to the
   // application default, so a typo degrades rather than breaks.
   var SURFACE              = cfg.surface              || '';
+  // Which tenant's skills and secrets the run should use. A real host does NOT set this: its relay
+  // derives it from the authenticated session and discards whatever the page sent, because it
+  // decides which customer's credentials get injected (TnamChatContextEnricher does exactly that).
+  // It exists for embeddings with no relay in front — the sidecar's own demo page, local testing —
+  // where nothing else can supply it.
+  var TENANT_CODE          = cfg.tenantCode           || '';
 
   // ── Page actions ──────────────────────────────────────────────────────────────
   // A closed set of DOM operations the agent may request, in place of the arbitrary
@@ -103,6 +109,7 @@
   var isMaximized   = false;
   var isThinking    = false;
   var steps         = [];   // live step trace for the run currently in flight (see addStep/resolveStep)
+  var stepsExpanded = false; // whether the trace shows every step or only the most recent few
   var runStartedAt  = 0;
 
   // ── Styles ────────────────────────────────────────────────────────────────────
@@ -223,15 +230,36 @@
     '.vx-thinking-label{color:#64748b;font-family:' + VX_FONT + ';font-size:12px;',
     'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:340px;}',
 
-    /* Live step trace — one row per tool call, appended as SSE events arrive */
-    '.vx-steps{display:flex;flex-direction:column;gap:3px;max-height:160px;overflow-y:auto;}',
-    '.vx-step{display:flex;gap:7px;align-items:center;font-family:' + VX_FONT + ';font-size:12px;',
-    'color:#475569;line-height:1.4;}',
-    '.vx-step-icon{width:12px;flex-shrink:0;text-align:center;font-size:11px;}',
-    '.vx-step-running .vx-step-icon{color:#f59e0b;animation:vx-step-pulse 1.3s ease-in-out infinite;}',
-    '.vx-step-done .vx-step-icon{color:#22c55e;}',
-    '.vx-step-failed .vx-step-icon{color:#ef4444;}',
-    '.vx-step-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
+    /* Live step trace — a timeline of what the agent is doing, one entry per piece of work.
+       Two lines per entry: what kind of step it is, and which thing it acted on. A single line
+       carrying only the tool's name repeats itself as soon as the agent works iteratively, which
+       reads as the same thing failing over and over rather than an investigation progressing.
+       No inner scrollbar: a scroll region inside a chat bubble is cramped and hides the very
+       history it is meant to show, so older entries collapse behind a count instead. */
+    '.vx-steps{display:flex;flex-direction:column;}',
+    '.vx-step{display:flex;gap:9px;font-family:' + VX_FONT + ';font-size:12px;color:#475569;',
+    'line-height:1.45;padding:3px 0;position:relative;}',
+    /* the connecting rail, drawn behind the icons */
+    '.vx-step:not(:last-child)::before{content:"";position:absolute;left:6px;top:19px;bottom:-3px;',
+    'width:1px;background:#e2e8f0;}',
+    '.vx-step-icon{width:13px;height:13px;flex-shrink:0;margin-top:2px;text-align:center;',
+    'font-size:10px;line-height:13px;border-radius:50%;background:#f1f5f9;color:#94a3b8;',
+    'position:relative;z-index:1;}',
+    '.vx-step-running .vx-step-icon{background:#fef3c7;color:#b45309;',
+    'animation:vx-step-pulse 1.3s ease-in-out infinite;}',
+    '.vx-step-done .vx-step-icon{background:#dcfce7;color:#166534;}',
+    '.vx-step-failed .vx-step-icon{background:#fee2e2;color:#991b1b;}',
+    '.vx-step-body{min-width:0;flex:1;}',
+    '.vx-step-title{color:#334155;font-weight:500;overflow:hidden;text-overflow:ellipsis;',
+    'white-space:nowrap;}',
+    '.vx-step-failed .vx-step-title{color:#991b1b;}',
+    /* The detail is the substance — the statement, the path, the URL — so it gets room to wrap
+       to a second line rather than being clipped to nothing. */
+    '.vx-step-detail{color:#94a3b8;font-size:11px;overflow:hidden;display:-webkit-box;',
+    '-webkit-line-clamp:2;-webkit-box-orient:vertical;word-break:break-word;}',
+    '.vx-step-more{align-self:flex-start;background:none;border:none;padding:2px 0 4px 22px;',
+    'color:#64748b;font-family:' + VX_FONT + ';font-size:11px;cursor:pointer;text-align:left;}',
+    '.vx-step-more:hover{color:#2563eb;text-decoration:underline;}',
 
     /* Collapsed step summary — rendered above the final reply once the run completes;
        click to expand/collapse the full trace (Claude Desktop's "Thought for Xs" pattern) */
@@ -1070,6 +1098,7 @@
 
   function showThinking() {
     steps = [];
+    stepsExpanded = false;
     var div = document.createElement('div');
     div.className = 'vx-thinking';
     div.id = 'vx-thinking';
@@ -1112,6 +1141,69 @@
     return text;
   }
 
+  /** The second line: what this step acted on, plus how long it took once known. */
+  function stepDetail(step) {
+    var parts = [];
+    if (step.detail) parts.push(step.detail);
+    if (step.status !== 'running' && step.durationMs != null && step.durationMs >= 1000) {
+      parts.push(Math.round(step.durationMs / 100) / 10 + 's');
+    }
+    return parts.join('  ·  ');
+  }
+
+  /** Icon per state. Glyphs rather than colour alone, so state survives a colourblind reader. */
+  function stepIcon(status) {
+    return status === 'done' ? '✓' : status === 'failed' ? '✕' : '●';
+  }
+
+  /** Paints one step's row from its current state. */
+  function paintStep(step) {
+    if (!step.rowEl) return;
+    step.rowEl.className = 'vx-step vx-step-' + step.status;
+    step.iconEl.textContent = stepIcon(step.status);
+    step.titleEl.textContent = stepText(step);
+    var detail = stepDetail(step);
+    step.detailEl.textContent = detail;
+    step.detailEl.style.display = detail ? '' : 'none';
+  }
+
+  /**
+   * Keeps the live trace short by folding all but the last few entries behind a count.
+   *
+   * A long run can make dozens of tool calls; showing every one pushes the reply out of view, and
+   * putting them in a scroll box (as this once did) makes a cramped region that hides the history
+   * it exists to show. The recent steps are what a waiting user reads, and the rest stay one click
+   * away.
+   */
+  var STEPS_VISIBLE = 4;
+
+  function reflowSteps() {
+    var stepsEl = document.getElementById('vx-steps');
+    if (!stepsEl) return;
+    var hidden = stepsExpanded ? 0 : Math.max(0, steps.length - STEPS_VISIBLE);
+
+    steps.forEach(function (s, i) {
+      if (s.rowEl) s.rowEl.style.display = i < hidden ? 'none' : '';
+    });
+
+    var moreEl = document.getElementById('vx-step-more');
+    if (!hidden && !stepsExpanded) { if (moreEl) moreEl.remove(); return; }
+    if (!moreEl) {
+      moreEl = document.createElement('button');
+      moreEl.type = 'button';
+      moreEl.id = 'vx-step-more';
+      moreEl.className = 'vx-step-more';
+      moreEl.addEventListener('click', function () {
+        stepsExpanded = !stepsExpanded;
+        reflowSteps();
+      });
+      stepsEl.insertBefore(moreEl, stepsEl.firstChild);
+    }
+    moreEl.textContent = stepsExpanded
+      ? 'Show less'
+      : '↑ ' + hidden + ' earlier step' + (hidden === 1 ? '' : 's');
+  }
+
   /** Appends a new "in progress" row to the live step trace for a tool that just started.
    *
    *  Consecutive calls of the same tool collapse into the row already there. The agent retrying a
@@ -1119,52 +1211,55 @@
    *  rows report it eight times and read as eight separate things going wrong. One row carrying an
    *  attempt count says what actually happened, and says it in the space of a line. Runs of a
    *  different tool in between still start a new row, so the order of work stays visible. */
-  function addStep(tool) {
+  function addStep(tool, detail) {
     var previous = steps.length ? steps[steps.length - 1] : null;
-    if (previous && previous.tool === tool && previous.status !== 'running') {
+    // Only fold a repeat into the row above when it is the same work on the same thing. Two
+    // queries against different tables are two steps however adjacent they are — folding those
+    // was what produced a trace of identical rows that said nothing.
+    if (previous && previous.tool === tool && previous.status !== 'running'
+        && (previous.detail || '') === (detail || '')) {
       previous.attempts = (previous.attempts || 1) + 1;
       previous.status = 'running';
-      if (previous.rowEl) {
-        previous.rowEl.className = 'vx-step vx-step-running';
-        previous.iconEl.textContent = '●';
-        previous.textEl.textContent = stepText(previous);
-      }
+      previous.durationMs = null;
+      paintStep(previous);
       messagesEl.scrollTop = messagesEl.scrollHeight;
       return;
     }
 
-    var step = { tool: tool, label: humanizeTool(tool), status: 'running', attempts: 1, failures: 0 };
+    var step = { tool: tool, label: humanizeTool(tool), detail: detail || '',
+                 status: 'running', attempts: 1, failures: 0, durationMs: null };
     var stepsEl = document.getElementById('vx-steps');
     if (stepsEl) {
       var row = document.createElement('div');
-      row.className = 'vx-step vx-step-running';
       var icon = document.createElement('span');
       icon.className = 'vx-step-icon';
-      icon.textContent = '●';
-      var text = document.createElement('span');
-      text.className = 'vx-step-text';
-      text.textContent = stepText(step);
+      var body = document.createElement('div');
+      body.className = 'vx-step-body';
+      var title = document.createElement('div');
+      title.className = 'vx-step-title';
+      var det = document.createElement('div');
+      det.className = 'vx-step-detail';
+      body.appendChild(title);
+      body.appendChild(det);
       row.appendChild(icon);
-      row.appendChild(text);
+      row.appendChild(body);
       stepsEl.appendChild(row);
-      stepsEl.scrollTop = stepsEl.scrollHeight;
-      step.rowEl = row; step.iconEl = icon; step.textEl = text;
+      step.rowEl = row; step.iconEl = icon; step.titleEl = title; step.detailEl = det;
+      paintStep(step);
     }
     steps.push(step);
+    reflowSteps();
     messagesEl.scrollTop = messagesEl.scrollHeight;
   }
 
   /** Resolves the most recent still-running step for this tool to done/failed. */
-  function resolveStep(tool, success) {
+  function resolveStep(tool, success, durationMs) {
     for (var i = steps.length - 1; i >= 0; i--) {
       if (steps[i].tool === tool && steps[i].status === 'running') {
         steps[i].status = success ? 'done' : 'failed';
+        steps[i].durationMs = durationMs;
         if (!success) steps[i].failures = (steps[i].failures || 0) + 1;
-        if (steps[i].rowEl) {
-          steps[i].rowEl.className = 'vx-step ' + (success ? 'vx-step-done' : 'vx-step-failed');
-          steps[i].iconEl.textContent = success ? '✓' : '✗';
-          steps[i].textEl.textContent = stepText(steps[i]);
-        }
+        paintStep(steps[i]);
         return;
       }
     }
@@ -1203,9 +1298,13 @@
     steps.forEach(function (s) {
       var row = document.createElement('div');
       row.className = 'vx-step vx-step-' + s.status;
-      var iconChar = s.status === 'failed' ? '✗' : (s.status === 'running' ? '•' : '✓');
-      row.innerHTML = '<span class="vx-step-icon">' + iconChar + '</span><span class="vx-step-text">' +
-        esc(stepText(s)) + '</span>';
+      // Same two-line shape as the live trace, so expanding the summary after the fact shows
+      // exactly what was on screen while the run was going.
+      var summaryDetail = stepDetail(s);
+      row.innerHTML = '<span class="vx-step-icon">' + stepIcon(s.status) + '</span>' +
+        '<div class="vx-step-body"><div class="vx-step-title">' + esc(stepText(s)) + '</div>' +
+        (summaryDetail ? '<div class="vx-step-detail">' + esc(summaryDetail) + '</div>' : '') +
+        '</div>';
       detail.appendChild(row);
     });
 
@@ -1247,6 +1346,7 @@
     // not a description: the prose about the page already travels in `context`. Omitted entirely
     // when the host has not named its screens, which reads as "the application default".
     if (SURFACE) { payload.surface = SURFACE; }
+    if (TENANT_CODE) { payload.tenantCode = TENANT_CODE; }
 
     // One place builds the snapshot, whichever capability wanted it. It used to be assembled
     // separately inside each branch, so the two could drift and neither said what happened when
@@ -1348,14 +1448,14 @@
       try {
         var d = JSON.parse(ev.data);
         setThinkingHeader('Working…');
-        addStep(d.tool);
+        addStep(d.tool, d.detail);
       } catch (e) { /* ignore malformed event */ }
     });
 
     es.addEventListener('tool_result', function (ev) {
       try {
         var d = JSON.parse(ev.data);
-        resolveStep(d.tool, d.success);
+        resolveStep(d.tool, d.success, d.durationMs);
       } catch (e) { /* ignore malformed event */ }
     });
 

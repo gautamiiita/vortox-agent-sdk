@@ -29,6 +29,14 @@ import java.util.Map;
  */
 public final class AgentConfig {
 
+    // ── Identity ────────────────────────────────────────────────────────────
+    /**
+     * Which agent this configuration belongs to. Optional, and never sent to the LLM — it exists so
+     * the log lines a run emits can name the agent alongside the task it is working on. Without it a
+     * reader watching several agents work in parallel sees only opaque run ids.
+     */
+    private final String agentId;
+
     // ── LLM ──────────────────────────────────────────────────────────────────
     private final String apiKey;
     private final String model;
@@ -62,6 +70,7 @@ public final class AgentConfig {
     private final TaskSpawner taskSpawner;
 
     private AgentConfig(Builder b) {
+        this.agentId             = b.agentId;
         this.apiKey              = b.apiKey;
         this.model               = b.model;
         this.maxTokens           = b.maxTokens;
@@ -87,6 +96,7 @@ public final class AgentConfig {
 
     // ── Getters ───────────────────────────────────────────────────────────────
 
+    public String getAgentId()             { return agentId; }
     public String getApiKey()              { return apiKey; }
     public String getModel()               { return model; }
     public int getMaxTokens()              { return maxTokens; }
@@ -110,6 +120,7 @@ public final class AgentConfig {
     // ── Builder ───────────────────────────────────────────────────────────────
 
     public static final class Builder {
+        private String agentId;
         private String apiKey;
         private String model            = "claude-sonnet-4-6";
         private int maxTokens           = 4096;
@@ -132,6 +143,8 @@ public final class AgentConfig {
         private ControlHook controlHook      = ControlHook.NOOP;
         private TaskSpawner taskSpawner      = null;
 
+        /** Identifies the agent in the log lines this run emits. Optional. */
+        public Builder agentId(String agentId)                 { this.agentId = agentId; return this; }
         public Builder apiKey(String apiKey)                   { this.apiKey = apiKey; return this; }
         public Builder model(String model)                     { this.model = model; return this; }
         public Builder maxTokens(int maxTokens)                { this.maxTokens = maxTokens; return this; }

@@ -106,6 +106,9 @@ public final class ReactLoop {
     private static final int PRUNED_RESULT_MAX_CHARS       = 400;
     private static final int PRUNED_ASSISTANT_TEXT_MAX_CHARS = 200;
 
+    /** A task title is free text; keep the log line readable rather than letting one run own it. */
+    private static final int RUN_LABEL_MAX_CHARS = 70;
+
     private final AgentConfig config;
     private final LlmClient client;
     private final ObjectMapper objectMapper;
@@ -157,6 +160,15 @@ public final class ReactLoop {
     }
 
     /**
+     * Run with a human-readable label for the work — in Vortox, the task title. The label only
+     * identifies this run in the log; it is never sent to the LLM.
+     */
+    public AgentResult run(String userMessage, String runId, String expectedOutcome,
+                           List<Map<String, Object>> priorMessages, String runLabel) {
+        return runInternal(userMessage, runId, expectedOutcome, priorMessages, runLabel);
+    }
+
+    /**
      * Resume after a human approved (or rejected) a paused approval gate.
      *
      * @param conversationSnapshot the {@link AgentResult#conversationHistory()} from the paused run
@@ -169,7 +181,18 @@ public final class ReactLoop {
                                             List<Map<String, Object>> assistantContent,
                                             String toolUseId,
                                             String decisionMessage) {
-        log.info("ReactLoop: resuming after approval for run {}", runId);
+        return resumeAfterApproval(runId, conversationSnapshot, assistantContent, toolUseId,
+                decisionMessage, null);
+    }
+
+    /** As {@link #resumeAfterApproval}, with a human-readable label for the log. */
+    public AgentResult resumeAfterApproval(String runId,
+                                            List<Map<String, Object>> conversationSnapshot,
+                                            List<Map<String, Object>> assistantContent,
+                                            String toolUseId,
+                                            String decisionMessage,
+                                            String runLabel) {
+        log.info("ReactLoop [{}] resuming after approval", runTag(runId, runLabel));
         List<Map<String, Object>> messages = new ArrayList<>(sanitizeMessages(conversationSnapshot));
         messages.add(Map.of("role", "assistant", "content", assistantContent));
 
@@ -179,7 +202,7 @@ public final class ReactLoop {
         toolResult.put("content", decisionMessage);
         messages.add(Map.of("role", "user", "content", List.of(toolResult)));
 
-        return run(null, runId, null, messages, null);
+        return runInternal(null, runId, null, messages, runLabel);
     }
 
     /**
@@ -203,11 +226,37 @@ public final class ReactLoop {
 
     // ── Core loop ─────────────────────────────────────────────────────────────
 
-    private AgentResult run(String userMessage,
-                             String runId,
-                             String expectedOutcome,
-                             List<Map<String, Object>> priorMessages,
-                             String agentId) {
+    /**
+     * How a run identifies itself in the log. A run id on its own is an opaque UUID: with several
+     * agents working in parallel, a reader cannot tell which agent is talking to the LLM, nor about
+     * what. Naming the agent and the work as well makes a single log line stand on its own.
+     *
+     * <p>Package-private so the format can be tested without standing up an LLM call.
+     */
+    String runTag(String runId, String runLabel) {
+        StringBuilder sb = new StringBuilder();
+        String agentId = config.getAgentId();
+        if (agentId != null && !agentId.isBlank()) sb.append(agentId).append(" · ");
+        sb.append(runId);
+        if (runLabel != null && !runLabel.isBlank()) {
+            String label = runLabel.strip().replaceAll("\\s+", " ");
+            if (label.length() > RUN_LABEL_MAX_CHARS) {
+                label = label.substring(0, RUN_LABEL_MAX_CHARS - 1).strip() + "…";
+            }
+            sb.append(" · '").append(label).append("'");
+        }
+        return sb.toString();
+    }
+
+    private AgentResult runInternal(String userMessage,
+                                    String runId,
+                                    String expectedOutcome,
+                                    List<Map<String, Object>> priorMessages,
+                                    String runLabel) {
+
+        // Prefixes every log line this run emits, so one line names the agent, the task id and the
+        // task itself — see runTag.
+        final String tag = runTag(runId, runLabel);
 
         List<Map<String, Object>> tools    = buildAllTools();
         String                    sysPrompt = config.getSystemPrompt();
@@ -251,7 +300,7 @@ public final class ReactLoop {
             // Human control checkpoint: may block (pause), splice guidance into `messages`,
             // or return false to cancel. Executor-agnostic — see ControlHook.
             if (!control.beforeIteration(runId, iterations, messages)) {
-                log.info("ReactLoop [{}] cancelled by control channel at iteration {}", runId, iterations);
+                log.info("ReactLoop [{}] cancelled by control channel at iteration {}", tag, iterations);
                 AgentResult r = AgentResult.cancelled(
                         "Run cancelled by operator at iteration " + iterations,
                         iterations, toolCalls, messages, totalIn, totalOut, totalCC, totalCR);
@@ -259,14 +308,14 @@ public final class ReactLoop {
                 return r;
             }
 
-            log.info("ReactLoop [{}] iteration {}/{}", runId, iterations, maxIterations);
+            log.info("ReactLoop [{}] iteration {}/{}", tag, iterations, maxIterations);
             listener.onIteration(runId, iterations, maxIterations, "LLM call");
 
             AnthropicClient.ClaudeResponse response = client.send(
                     sysPrompt, messages, tools, config.getApiKey(), config.getModel());
 
             if (response.hasError()) {
-                log.error("ReactLoop [{}] LLM error: {}", runId, response.getError());
+                log.error("ReactLoop [{}] LLM error: {}", tag, response.getError());
                 listener.onError(runId, "LLM error: " + response.getError());
                 AgentResult r = AgentResult.error("LLM error: " + response.getError(), totalIn, totalOut);
                 listener.onComplete(runId, r);
@@ -278,6 +327,15 @@ public final class ReactLoop {
             totalCC  += response.getCacheCreationInputTokens();
             totalCR  += response.getCacheReadInputTokens();
             listener.onTokens(runId, iterations, totalIn, totalOut);
+
+            // What actually went over the wire this turn. Tagged like every other line, so a reader
+            // can follow one agent's conversation about one task through a log holding many.
+            log.debug("ReactLoop [{}] LLM turn {} — model={} sent {} message(s), {} tool(s); "
+                            + "stop={} tokens in/out {}/{} (cache write/read {}/{})",
+                    tag, iterations, config.getModel(), messages.size(),
+                    tools != null ? tools.size() : 0, response.getStopReason(),
+                    response.getInputTokens(), response.getOutputTokens(),
+                    response.getCacheCreationInputTokens(), response.getCacheReadInputTokens());
 
             // Keep the most recent prose the model wrote. A model that works for several turns and
             // then signals completion typically writes its actual answer — the formatted report,
@@ -293,7 +351,7 @@ public final class ReactLoop {
                 // LLM returned plain text — task complete
                 String text = response.getTextContent();
                 log.info("ReactLoop [{}] completed after {} iterations (stop={})",
-                        runId, iterations, response.getStopReason());
+                        tag, iterations, response.getStopReason());
                 AgentResult r = AgentResult.success(text, iterations, toolCalls,
                         messages, totalIn, totalOut, totalCC, totalCR);
                 listener.onComplete(runId, r);
@@ -310,7 +368,7 @@ public final class ReactLoop {
                 Map<String, Object> ci = completeCall.get().getToolInput();
                 String summary = str(ci, "summary", "Task completed");
                 String outcome = str(ci, "outcome", "SUCCESS");
-                log.info("ReactLoop [{}] task_complete outcome={}", runId, outcome);
+                log.info("ReactLoop [{}] task_complete outcome={}", tag, outcome);
 
                 if ("SUCCESS".equals(outcome) && !outcomeCheckDone
                         && expectedOutcome != null && !expectedOutcome.isBlank()) {
@@ -460,7 +518,7 @@ public final class ReactLoop {
         }
 
         // Max iterations reached
-        log.warn("ReactLoop [{}] max iterations ({}) reached", runId, maxIterations);
+        log.warn("ReactLoop [{}] max iterations ({}) reached", tag, maxIterations);
         listener.onError(runId, "Max iterations (" + maxIterations + ") reached");
         AgentResult r = AgentResult.partial(
                 "Task incomplete — max iterations reached",

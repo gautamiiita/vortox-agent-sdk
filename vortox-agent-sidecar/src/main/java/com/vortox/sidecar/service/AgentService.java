@@ -218,17 +218,19 @@ public class AgentService {
                 activeSkills.stream().map(SkillDefinition::name).toList(),
                 vortoxGateway != null ? "enabled" : "disabled");
 
+        // The linked agent rather than the literal "sidecar-agent" this always reported, so runs in
+        // Vortox attribute to the agent that actually handled them — per tenant, since a pooled
+        // deployment resolves a different agent for each. Also what ReactLoop names in its log lines.
+        String reportedAgentId = agentConfig != null && agentConfig.get("agentId") instanceof String a
+                ? a : "sidecar-agent";
+
         if (vortoxGateway != null) {
-            // Report the linked agent rather than the literal "sidecar-agent" this always sent, so
-            // runs in Vortox attribute to the agent that actually handled them — per tenant, since a
-            // pooled deployment resolves a different agent for each.
-            String reportedAgentId = agentConfig != null && agentConfig.get("agentId") instanceof String a
-                    ? a : "sidecar-agent";
             vortoxGateway.createRun(runId, reportedAgentId, truncate(request.task(), 500), model,
                     emptyToNull(tenantCode));
         }
 
         AgentConfig.Builder configBuilder = AgentConfig.builder()
+                .agentId(reportedAgentId)
                 .apiKey(apiKey)
                 .model(model)
                 .maxIterations(maxIterations)
@@ -247,7 +249,8 @@ public class AgentService {
             configBuilder.memoryStore(gatewayMemoryStore);
         }
 
-        AgentResult result = new ReactLoop(configBuilder.build()).run(request.task(), runId);
+        AgentResult result = new ReactLoop(configBuilder.build())
+                .run(request.task(), runId, null, null, request.task());
 
         if (vortoxGateway != null) {
             vortoxGateway.updateRun(runId, result.status().name(),

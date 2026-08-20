@@ -52,7 +52,18 @@ public final class AnthropicClient implements LlmClient {
             // TLS-layer failures on long streamed/buffered downloads — near-always a transient
             // one-off network hiccup, not an application-level problem.
             "bad_record_mac", "fatal alert", "SSLException", "SocketException",
-            "EOFException", "reset by peer", "handshake");
+            "EOFException", "reset by peer", "handshake",
+            // Matching is on the exception MESSAGE, not its type, so "EOFException" above never
+            // caught the one that actually occurs: java.net.http throws
+            // `IOException: EOF reached while reading` when the server closes a response stream
+            // early. That is the single most common way a long run dies, and it was being
+            // classified permanent — one dropped stream at iteration 30 threw away seven minutes
+            // of completed work. HTTP/2 GOAWAY and a plainly-worded closed connection are the same
+            // class of thing.
+            // "timed out" is not a typo for "timeout" above: java.net.http.HttpTimeoutException's
+            // message is literally "request timed out", which the substring "timeout" does not
+            // match. That one also appeared in the logs, failing runs that a retry would have saved.
+            "EOF reached", "GOAWAY", "connection closed", "Connection closed", "timed out");
 
     private static final HttpClient HTTP = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(15))
@@ -426,7 +437,8 @@ public final class AnthropicClient implements LlmClient {
 
     private static boolean isOAuth(String key)    { return key != null && key.contains("sk-ant-oat"); }
     private static boolean blank(String s)         { return s == null || s.isBlank(); }
-    private static boolean isTransient(String err) {
+    /** Package-private so the keyword list can be tested directly — it is easy to get subtly wrong. */
+    static boolean isTransient(String err) {
         return err != null && TRANSIENT_KEYWORDS.stream().anyMatch(err::contains);
     }
 

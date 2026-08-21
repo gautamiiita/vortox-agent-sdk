@@ -206,6 +206,40 @@ public final class ReactLoop {
     }
 
     /**
+     * Adds the "carry on from here" instruction to a resumed conversation without creating two
+     * {@code user} turns in a row.
+     *
+     * <p><strong>Why this is not just an {@code add}.</strong> A snapshot taken when the loop ran out
+     * of iterations ends with the {@code user} message carrying that round's {@code tool_result}
+     * blocks — the loop appends the results and then re-checks the budget. Appending a fresh
+     * {@code user} message after it produces two consecutive user turns, and whether the Messages API
+     * merges those or rejects them with {@code roles must alternate} is not something to leave to
+     * chance in the one code path that only runs after a run has already gone wrong. Folding the
+     * instruction into that final turn as an extra {@code text} block is well-formed either way: a
+     * user turn may carry {@code tool_result} blocks followed by text.
+     *
+     * <p>This is what made {@link #resume} usable for the case its own javadoc names. Only the
+     * approval gate had used it, and that path happens to append an {@code assistant} turn first, so
+     * it never hit this.
+     */
+    static void appendContinuationInstruction(List<Map<String, Object>> messages, String instruction) {
+        int lastIndex = messages.size() - 1;
+        Map<String, Object> last = lastIndex >= 0 ? messages.get(lastIndex) : null;
+
+        if (last != null && "user".equals(last.get("role")) && last.get("content") instanceof List<?> blocks) {
+            List<Object> merged = new ArrayList<>(blocks);
+            merged.add(Map.of("type", "text", "text", instruction));
+            messages.set(lastIndex, Map.of("role", "user", "content", merged));
+            return;
+        }
+        if (last != null && "user".equals(last.get("role")) && last.get("content") instanceof String text) {
+            messages.set(lastIndex, Map.of("role", "user", "content", text + "\n\n" + instruction));
+            return;
+        }
+        messages.add(Map.of("role", "user", "content", instruction));
+    }
+
+    /**
      * The Anthropic Messages API rejects any message object with keys other than "role"/"content" —
      * a resumed/persisted conversation snapshot may carry extra metadata (e.g. a "timestamp" added
      * by an unrelated persistence path) that was never part of what the API itself returned. Strip
@@ -270,14 +304,12 @@ public final class ReactLoop {
 
         if (isContinuation) {
             messages.addAll(sanitizeMessages(priorMessages));
-            if (userMessage != null && !userMessage.isBlank()) {
-                messages.add(Map.of("role", "user", "content", userMessage));
-            } else {
-                messages.add(Map.of("role", "user", "content",
-                        "You previously worked on this task but were paused. " +
-                        "Your full conversation history above shows exactly what you did. " +
-                        "Continue from where you left off — do not repeat work already done. Resume now."));
-            }
+            String continueWith = userMessage != null && !userMessage.isBlank()
+                    ? userMessage
+                    : "You previously worked on this task but were paused. "
+                    + "Your full conversation history above shows exactly what you did. "
+                    + "Continue from where you left off — do not repeat work already done. Resume now.";
+            appendContinuationInstruction(messages, continueWith);
         } else {
             if (userMessage == null || userMessage.isBlank()) {
                 return AgentResult.error("userMessage is required for a fresh run");

@@ -18,6 +18,31 @@
   // where nothing else can supply it.
   var TENANT_CODE          = cfg.tenantCode           || '';
 
+  // ── One assistant per screen ────────────────────────────────────────────
+  // Host applications of this vintage routinely draw the real screen inside an iframe, and one
+  // page template renders both the shell and the framed page — so this script is included by
+  // both. Left alone the widget then starts twice: once in the shell, where it sits in the right
+  // place but can only see the navigation chrome around the screen, and once inside the frame,
+  // where it can see the actual screen but is clipped to the frame's box and scrolls away with it.
+  // Neither is the assistant anyone asked for, and between them they explain both halves of
+  // "the widget doesn't load correctly in the child pages".
+  //
+  // It therefore runs in the top-level document only, and reads the framed content from there
+  // instead — see readableDocuments(). A host that deliberately puts the widget in a frame of its
+  // own (an isolation wrapper, a preview pane) opts back in with `inFrames: true`.
+  if (cfg.inFrames !== true && isFramedDocument()) return;
+
+  /** Whether this document is something other than the top-level browsing context. */
+  function isFramedDocument() {
+    try {
+      return window.top !== window.self;
+    } catch (e) {
+      // A cross-origin ancestor can make even this comparison unavailable. Being unable to prove
+      // we are the top document is reason enough not to draw a second widget.
+      return true;
+    }
+  }
+
   // ── Page actions ──────────────────────────────────────────────────────────────
   // A closed set of DOM operations the agent may request, in place of the arbitrary
   // JavaScript that allowPageScripts executes. The difference is the whole point: none of
@@ -43,6 +68,22 @@
   var SEND_PAGE_CONTEXT     = cfg.sendPageContext === true
                               || PAGE_ACTIONS_ENABLED || ALLOW_PAGE_SCRIPTS;
   var INCLUDE_FIELD_VALUES  = cfg.includeFieldValues === true;
+
+  // ── Budgets ──────────────────────────────────────────────────────────────
+  // The snapshot used to be bounded per item (200 characters of text, 40 of a field value) and
+  // not at all in aggregate. A 1,000-row results grid produced ~86KB — roughly 24,000 tokens —
+  // and it was rebuilt and resent on every single turn, because the screen is re-read each time.
+  // That is the cost of the whole conversation paid again per message, and it is also what pushed
+  // request bodies into the range where the host's request reader fell over.
+  //
+  // Row 900 of a list tells the model nothing row 120 did not. So the list is cut, and the cut is
+  // stated in the text — a model that is told it saw 120 of 1,430 elements can say so, whereas one
+  // handed a silently truncated list will answer confidently about a page it only half saw.
+  var MAX_ITEMS_PER_SECTION  = cfg.maxItemsPerSection  || 120;
+  var MAX_PAGE_CONTEXT_CHARS = cfg.maxPageContextChars || 24000;
+  // Conversation history is resent in full on every turn as well. Recent turns carry the thread;
+  // the twentieth turn back is paid for on every message and read by nobody.
+  var MAX_HISTORY_TURNS      = cfg.maxHistoryTurns     || 12;
   // Outcomes of the previous turn's actions, sent with the next message so the agent
   // learns whether what it asked for actually happened. Without this it proposes into a
   // void: a stale selector or a refusal would never reach the model.
@@ -506,6 +547,58 @@
    */
   var SENSITIVE_FIELD = /(pass|pwd|secret|token|mail|phone|tel|mobile|name|surname|firstname|lastname|birth|dob|address|street|city|zip|postal|iban|bic|card|cvv|ccv|account|ssn|nif|siret|vat|tax|licen|passport|identity|note|comment)/i;
 
+  /**
+   * Personal data as it appears in page TEXT, rather than in a form field.
+   *
+   * SENSITIVE_FIELD above guards what an operator typed into an input. It never applied to what the
+   * page renders — and on a contact record or a results grid, that is exactly where the personal
+   * data is. The same email address was withheld when typed into a field and sent verbatim when
+   * displayed in the row above it, which made the field-level control look like a policy it was not.
+   *
+   * Matched on the text itself, so it holds wherever the value appears: a table cell, a heading, a
+   * free-text note. Structure survives — the value is replaced in place, so the model still learns
+   * that this row carries an email, just not which one.
+   *
+   * Deliberately NOT matched: personal names. No pattern distinguishes "Dupont, Marie-Helene" from
+   * an ordinary noun, and pretending otherwise would advertise a guarantee this cannot make. Names
+   * displayed on the page still reach the model — say so when this is discussed as a control.
+   */
+  var PERSONAL_TEXT = [
+    { name: 'email',  re: /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g },
+    { name: 'IBAN',   re: /\b[A-Z]{2}[0-9]{2}(?:[ -]?[A-Z0-9]{4}){2,7}(?:[ -]?[A-Z0-9]{1,3})?\b/g },
+    // 13–19 digits in groups, i.e. a card number however it is spaced. Runs before the phone
+    // pattern, which would otherwise claim the same digits.
+    { name: 'card',   re: /\b(?:[0-9][ -]?){12,18}[0-9]\b/g },
+    { name: 'phone',  re: /(?:\+|00)[0-9][0-9 ().-]{7,}[0-9]/g }
+  ];
+
+  /** A date is only withheld when the surrounding text says it is a date of birth — on a ticketing
+   *  screen almost every date is a performance date, and blanking those would cost far more than it
+   *  protects. */
+  var BIRTH_DATE = /((?:born|birth|dob|n[eé]\(?e?\)?|naissance|geburt)[^0-9]{0,20})([0-9]{1,4}[-/.][0-9]{1,2}[-/.][0-9]{1,4})/gi;
+
+  /**
+   * Scrubs one run of page text. Returns the text with values replaced, and how many were replaced
+   * so the snapshot can say that something was withheld rather than quietly shrinking.
+   */
+  var _scrubCount = 0;
+  function scrubText(text) {
+    if (!text) return text;
+    var out = text;
+    out = out.replace(BIRTH_DATE, function (m, lead) { _scrubCount++; return lead + '[date of birth withheld]'; });
+    for (var i = 0; i < PERSONAL_TEXT.length; i++) {
+      var p = PERSONAL_TEXT[i];
+      out = out.replace(p.re, function () {
+        _scrubCount++;
+        return '[' + p.name + ' withheld]';
+      });
+    }
+    // A page that renders a fenced code block — or a value engineered to look like one — must not be
+    // able to close the fence this snapshot travels inside and start speaking as the prompt.
+    out = out.replace(/```/g, '`\u200b``');
+    return out;
+  }
+
   function isSensitiveField(el, labelText) {
     if (el.type === 'password') return true;
     var haystack = [el.id, el.name, el.getAttribute('placeholder'), labelText]
@@ -513,37 +606,139 @@
     return SENSITIVE_FIELD.test(haystack);
   }
 
+  /** How deep to follow nested frames, and how many documents to describe in total. Bounds, not
+   *  policy: a framed application can nest further than is useful, and every extra document is
+   *  prompt the model has to read before answering about the one screen in front of the user. */
+  var MAX_FRAME_DEPTH = 3;
+  var MAX_DOCUMENTS   = 12;
+
+  /**
+   * Every document this widget may describe: its own, plus any same-origin frame beneath it.
+   *
+   * The screen a user is looking at is not necessarily the document this script runs in. Where the
+   * host frames its content, describing only this document would report the navigation shell
+   * around the screen — an accurate description of the page, and of no use to anyone asking about
+   * what they can see.
+   *
+   * Cross-origin frames are skipped in silence. The browser will not hand over their contents, and
+   * that boundary is not one to work around.
+   */
+  function readableDocuments() {
+    var found = [{ label: '', doc: document }];
+    collectFrameDocuments(document, '', found, 0);
+    return found;
+  }
+
+  function collectFrameDocuments(root, prefix, found, depth) {
+    if (depth >= MAX_FRAME_DEPTH || found.length >= MAX_DOCUMENTS) return;
+    var frames = root.querySelectorAll('iframe,frame');
+    for (var i = 0; i < frames.length && found.length < MAX_DOCUMENTS; i++) {
+      var frame = frames[i];
+      var doc = null;
+      try {
+        doc = frame.contentDocument;
+      } catch (e) {
+        doc = null;                       // cross-origin — not ours to read
+      }
+      if (!doc || !doc.body) continue;
+      var name  = frame.id || frame.name || frame.getAttribute('src') || 'frame ' + (i + 1);
+      var label = prefix ? prefix + ' › ' + name : name;
+      found.push({ label: label, doc: doc });
+      collectFrameDocuments(doc, label, found, depth + 1);
+    }
+  }
+
+  /** " (showing 120 of 1430 elements)" — empty when nothing was cut. Said out loud because a model
+   *  handed a silently truncated list will answer confidently about a page it only half saw. */
+  function shownOf(shown, total, noun) {
+    if (total <= shown) return '';
+    return ' (showing ' + shown + ' of ' + total + ' ' + noun + 's — the rest were not included)';
+  }
+
   function collectPageDom() {
+    _scrubCount = 0;
+    var docs = readableDocuments();
+    var parts = [];
+    for (var i = 0; i < docs.length; i++) {
+      var described = describeDocument(docs[i].doc);
+      if (!described) continue;
+      if (!docs[i].label) {
+        parts.push(described);
+        continue;
+      }
+      // Named as a frame, and said to be one: a selector taken from here does not resolve against
+      // the main document, so anything acting on these elements has to enter the frame first. The
+      // model is told rather than left to discover it by proposing something that silently fails.
+      parts.push('## Inside frame "' + docs[i].label + '"\n'
+               + '(a nested document — selectors below are relative to it, not to the main page)\n\n'
+               + described);
+    }
+
+    var snapshot = parts.join('\n\n');
+    if (_scrubCount) {
+      snapshot += '\n\n(' + _scrubCount + ' value(s) in the page text matched a personal-data pattern '
+                + 'and were replaced with a placeholder. Ask the user for one rather than guessing. '
+                + 'Note that personal names are not detectable this way and are not withheld.)';
+    }
+    // Backstop for a screen that defeats the per-section caps some other way — one enormous element,
+    // a dozen frames each just under the limit. Announced, for the same reason the section caps are.
+    if (snapshot.length > MAX_PAGE_CONTEXT_CHARS) {
+      snapshot = snapshot.substring(0, MAX_PAGE_CONTEXT_CHARS)
+               + '\n\n[page description truncated at ' + MAX_PAGE_CONTEXT_CHARS + ' characters — '
+               + 'this screen holds more than is described above]';
+    }
+    return snapshot;
+  }
+
+  /** The structure of one document, in the form the agent reads it. */
+  function describeDocument(doc) {
     var parts = [];
 
     // Headings give the agent a structural map of the page
     var headings = [];
-    document.querySelectorAll('h1,h2,h3').forEach(function (el) {
-      var text = el.textContent.trim().replace(/\s+/g, ' ');
+    var allHeadings = doc.querySelectorAll('h1,h2,h3');
+    allHeadings.forEach(function (el) {
+      if (headings.length >= MAX_ITEMS_PER_SECTION) return;
+      var text = scrubText(el.textContent.trim().replace(/\s+/g, ' '));
       if (text) headings.push(el.tagName.toLowerCase() + ': ' + text);
     });
-    if (headings.length) parts.push('### Page headings\n' + headings.join('\n'));
+    if (headings.length) {
+      parts.push('### Page headings' + shownOf(headings.length, allHeadings.length, 'heading')
+               + '\n' + headings.join('\n'));
+    }
 
     // All elements that have an id (excluding the widget itself)
     var elements = [];
-    document.querySelectorAll('[id]').forEach(function (el) {
+    var allWithId = doc.querySelectorAll('[id]');
+    var idCount = 0;
+    allWithId.forEach(function (el) {
       if (/^vx-/.test(el.id)) return;
+      idCount++;
+      if (elements.length >= MAX_ITEMS_PER_SECTION) return;
       var tag  = el.tagName.toLowerCase();
       var type = el.getAttribute('type') ? ' type="' + el.getAttribute('type') + '"' : '';
-      // Short visible text hint (collapsed whitespace, 200-char cap)
-      var text = (el.getAttribute('placeholder') || el.textContent || '').trim()
-                   .replace(/\s+/g, ' ').substring(0, 200);
+      // Short visible text hint (collapsed whitespace, 200-char cap), scrubbed of anything that
+      // matches a personal-data pattern before it leaves the page.
+      var text = scrubText((el.getAttribute('placeholder') || el.textContent || '').trim()
+                   .replace(/\s+/g, ' ').substring(0, 200));
       elements.push('#' + el.id + ' <' + tag + type + '>' + (text ? ' "' + text + '"' : ''));
     });
-    if (elements.length) parts.push('### Elements with IDs\n' + elements.join('\n'));
+    if (elements.length) {
+      parts.push('### Elements with IDs' + shownOf(elements.length, idCount, 'element')
+               + '\n' + elements.join('\n'));
+    }
 
     // Form fields: what they are and whether they are filled. Contents only when the
     // host asked for them and the field is not one that typically carries personal data.
     var fields = [];
     var redacted = 0;
-    document.querySelectorAll('input,select,textarea').forEach(function (el) {
+    var allFields = doc.querySelectorAll('input,select,textarea');
+    var fieldCount = 0;
+    allFields.forEach(function (el) {
       if (!el.id || /^vx-/.test(el.id)) return;
-      var label = document.querySelector('label[for="' + el.id + '"]');
+      fieldCount++;
+      if (fields.length >= MAX_ITEMS_PER_SECTION) return;
+      var label = doc.querySelector('label[for="' + el.id + '"]');
       var labelText = label ? label.textContent.trim().replace(/\s+/g, ' ') : '';
       var raw = String(el.value == null ? '' : el.value);
 
@@ -551,7 +746,8 @@
       if (el.type === 'checkbox' || el.type === 'radio') {
         state = 'checked=' + el.checked;
       } else if (INCLUDE_FIELD_VALUES && !isSensitiveField(el, labelText)) {
-        state = 'value:"' + raw.substring(0, 40) + '"';
+        // Scrubbed as well as name-checked: a field called "reference" can still hold an email.
+        state = 'value:"' + scrubText(raw.substring(0, 40)) + '"';
       } else {
         // Filled-or-empty is usually the analytically interesting part — "this required
         // field is blank" — without quoting whatever the operator typed.
@@ -563,7 +759,7 @@
                   (labelText ? ' label:"' + labelText + '"' : '') + ' ' + state);
     });
     if (fields.length) {
-      var header = '### Form fields';
+      var header = '### Form fields' + shownOf(fields.length, fieldCount, 'field');
       if (!INCLUDE_FIELD_VALUES) {
         header += '\n(contents withheld by this deployment — fields are reported as filled or '
                 + 'empty. Ask the user for a value rather than assuming one.)';
@@ -1338,7 +1534,10 @@
 
     var payload = {
       message: text,
-      history: history.slice(0, -1),
+      // The last entry is the message being sent, which travels in `message`. Everything before it
+      // is windowed: history is resent in full on every turn, so an unbounded one is paid for again
+      // on each message — and the oldest turns are the least likely to matter to the current answer.
+      history: history.slice(Math.max(0, history.length - 1 - MAX_HISTORY_TURNS), -1),
       context: Object.assign({}, getContext(), _pageCtx)
     };
 
@@ -1494,9 +1693,12 @@
       finishWithError('The agent took too long to respond. Try a simpler query.');
       return;
     }
-    getJson(buildPollUrl(runId), function (err, data) {
+    getJson(buildPollUrl(runId), function (err, data, info) {
       if (err) {
-        // Transient network hiccup while polling — keep trying until MAX_WAIT_MS.
+        // An expired session or a missing endpoint will not repair itself, and polling through one
+        // for the whole MAX_WAIT_MS budget ends in "the agent took too long to respond" — the one
+        // explanation that is certainly wrong. Retry only what is genuinely transient.
+        if (info && info.fatal) { finishWithError(err); return; }
         setTimeout(function () { pollRun(runId, startedAt); }, POLL_INTERVAL_MS);
         return;
       }
@@ -1561,12 +1763,74 @@
     xhr.send();
   }
 
+  // Every completed request lands here — xhr.onload fires for an HTTP 500, and for a 302 bounced
+  // to a sign-in page, exactly as it does for a 200. The status and content type therefore have to
+  // be read rather than assumed. They used to be ignored entirely: any body that wasn't JSON became
+  // the single sentence "Unexpected response from agent." with every piece of evidence discarded, so
+  // an expired session, a gateway's HTML error page and a genuinely malformed reply were
+  // indistinguishable to the user reading it and to whoever they reported it to.
   function parseJsonResponse(xhr, cb) {
+    var body = xhr.responseText || '';
+    var parsed;
     try {
-      cb(null, JSON.parse(xhr.responseText));
+      parsed = JSON.parse(body);
     } catch (e) {
-      cb('Unexpected response from agent.');
+      failNonJson(xhr, body, cb);
+      return;
     }
+    // JSON that isn't an object (`null`, a bare number, a quoted string) is no more usable than
+    // HTML would be: every caller reads named fields off this value.
+    if (!parsed || typeof parsed !== 'object') {
+      failNonJson(xhr, body, cb);
+      return;
+    }
+    cb(null, parsed);
+  }
+
+  /** Explains a non-JSON response in a sentence the user can act on, marks whether retrying could
+   *  ever help, and leaves the raw evidence in the console for whoever fixes the deployment. */
+  function failNonJson(xhr, body, cb) {
+    var status      = xhr.status;
+    var contentType = (xhr.getResponseHeader('Content-Type') || '').toLowerCase();
+    var isHtml      = contentType.indexOf('html') !== -1 || /^\s*<(!doctype|html)/i.test(body);
+    // The browser sets responseURL to where the response actually came from, so it differs from the
+    // URL we asked for precisely when something redirected us — the signature of a session-expiry
+    // bounce to a login page, which otherwise arrives looking like an ordinary 200.
+    var landedOn    = xhr.responseURL || '';
+
+    if (window.console && console.error) {
+      console.error('[VortoxAgent] Non-JSON response from ' + (landedOn || 'the chat endpoint'), {
+        status: status,
+        contentType: contentType,
+        length: body.length,
+        snippet: body.slice(0, 300)
+      });
+    }
+
+    var message, fatal = true;
+    if (status === 0) {
+      message = 'The request to the agent was blocked or cancelled by the browser.';
+    } else if (status === 401 || status === 403 || (isHtml && status < 400)) {
+      message = 'The server sent a web page instead of an answer — your session has most likely '
+              + 'expired. Reload this page, sign in again, and retry.';
+    } else if (status === 413) {
+      message = 'This message was too large to send. Start a new conversation, or try from a screen '
+              + 'with less on it.';
+    } else if (status === 404) {
+      message = 'The chat endpoint was not found (HTTP 404) — the assistant is not wired up on this '
+              + 'server.';
+    } else if (status >= 500) {
+      // A bad gateway or a restarting backend does come back on its own, so a poll may as well
+      // keep trying; a single POST still surfaces it immediately.
+      message = 'The server hit an error handling this message (HTTP ' + status + ').';
+      fatal = false;
+    } else {
+      message = 'Unexpected response from agent (HTTP ' + status
+              + (contentType ? ', ' + contentType : '') + '). See the browser console for what it '
+              + 'returned.';
+      fatal = false;
+    }
+    cb(message, null, { fatal: fatal, status: status, contentType: contentType });
   }
 
   // ── Events ────────────────────────────────────────────────────────────────────

@@ -334,7 +334,12 @@ public class AgentService {
                     : jsonStringField(tc.output(), declaration.pathField());
             if (pathStr == null || pathStr.isBlank()) continue;
 
-            keptPaths.put(tc.toolName() + " " + pathStr, pathStr);
+            // NUL joins the two halves of the key because it is the one byte that cannot appear in
+            // either a tool name or a path, so no pair of (tool, path) can collide with another.
+            // Written as the escape rather than as a raw NUL byte in the source, which is how it was
+            // — one unprintable byte made this whole file binary to git, so every change to the agent
+            // loop showed up as "Bin 24470 -> 25082 bytes" with no reviewable diff.
+            keptPaths.put(tc.toolName() + "\0" + pathStr, pathStr);
         }
 
         // A run that produced an implausible number of files is more likely looping than delivering.

@@ -257,6 +257,40 @@ public class ScriptToolExecutor implements ToolExecutor {
         return normalized.toString();
     }
 
+    /**
+     * Resolves a path a skill reported as a deliverable, confined to that run's own workspace.
+     *
+     * <p>Exists because artifact delivery reads paths this class never got to confine. A skill
+     * declaring {@code produces_artifact} names its output file either in its JSON output or in its
+     * recorded tool-call <em>input</em> — and {@link #confineParams} deliberately leaves the
+     * caller's map untouched, so the recorded input is the raw value the model supplied, not the
+     * rewritten one. Reading that value directly, which is what {@code AgentService} used to do,
+     * turned artifact delivery into an arbitrary file read: {@code /proc/self/environ} came back
+     * base64-encoded in the response, carrying this container's API keys, and the over-cap cleanup
+     * branch deleted whatever path it was handed.
+     *
+     * <p>Returns empty rather than throwing when the path escapes or cannot be resolved. Artifact
+     * extraction runs after the model's work is done and reports per-file failures without failing
+     * the run, so a refusal here should read as "no artifact" and be logged, not abort a completed
+     * answer.
+     *
+     * @param tenantId the run's tenant, or null for the shared tier
+     * @param runId    the run whose workspace bounds the path
+     * @param rawPath  the path as the skill reported it
+     */
+    public java.util.Optional<Path> resolveDeliverablePath(String tenantId, String runId, String rawPath) {
+        if (rawPath == null || rawPath.isBlank()) return java.util.Optional.empty();
+        if (!confineToRunWorkspace) return java.util.Optional.of(Path.of(rawPath));
+        try {
+            Path runWorkspace = prepareRunWorkspace(tenantId, runId);
+            return java.util.Optional.of(Path.of(confinePath(rawPath, runWorkspace)));
+        } catch (ToolExecutionException | java.io.IOException e) {
+            log.warn("Refusing artifact path '{}' for run {} (tenant={}): {}",
+                    rawPath, runId, tenantId, e.getMessage());
+            return java.util.Optional.empty();
+        }
+    }
+
     /** True when the parameter's last name token marks it as a filesystem path. */
     /* package-private for testability */
     static boolean looksLikePathParam(String name) {
@@ -330,20 +364,47 @@ public class ScriptToolExecutor implements ToolExecutor {
         return dir.getFileName().toString().matches("[A-Za-z0-9]{8}-[A-Za-z0-9-]{20,}");
     }
 
+    /**
+     * The closed set of languages a skill may declare.
+     *
+     * <p>Both switches below used to end in a bash default, which meant a SKILL.md declaring
+     * {@code language: ruby} was written to {@code skill.sh} and handed to {@code /bin/bash} — so
+     * the error the author saw was a shell syntax complaint about their Ruby, and a body that
+     * happened to parse in both languages ran the wrong way with no error at all. Naming the
+     * supported set once, and refusing anything outside it, says what actually went wrong.
+     */
+    private static final Map<String, String> INTERPRETERS = Map.of(
+            "bash",    "/bin/bash",
+            "sh",      "/bin/bash",
+            "python",  "python3",
+            "python3", "python3",
+            "node",    "node",
+            "nodejs",  "node");
+
+    private static final Map<String, String> EXTENSIONS = Map.of(
+            "bash",    ".sh",
+            "sh",      ".sh",
+            "python",  ".py",
+            "python3", ".py",
+            "node",    ".js",
+            "nodejs",  ".js");
+
+    /** Normalised language key, or a refusal naming what is supported. */
+    private static String languageKey(String language) {
+        String key = language == null ? "" : language.trim().toLowerCase(Locale.ROOT);
+        if (!INTERPRETERS.containsKey(key)) {
+            throw new ToolExecutionException("Skill declares an unsupported language '" + language
+                    + "'. Supported: " + new java.util.TreeSet<>(INTERPRETERS.keySet()) + ".");
+        }
+        return key;
+    }
+
     private static String[] commandFor(String language, String scriptPath, String paramsPath) {
-        return switch (language.toLowerCase()) {
-            case "python", "python3" -> new String[]{"python3", scriptPath, paramsPath};
-            case "node", "nodejs"   -> new String[]{"node", scriptPath, paramsPath};
-            default                  -> new String[]{"/bin/bash", scriptPath, paramsPath};
-        };
+        return new String[]{INTERPRETERS.get(languageKey(language)), scriptPath, paramsPath};
     }
 
     private static String extensionFor(String language) {
-        return switch (language.toLowerCase()) {
-            case "python", "python3" -> ".py";
-            case "node", "nodejs"   -> ".js";
-            default                  -> ".sh";
-        };
+        return EXTENSIONS.get(languageKey(language));
     }
 
     private static void drain(java.io.InputStream in, StringBuilder out) {

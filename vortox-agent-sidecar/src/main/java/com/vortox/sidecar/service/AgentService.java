@@ -340,14 +340,23 @@ public class AgentService {
         // A run that produced an implausible number of files is more likely looping than delivering.
         // Truncate, but never silently: a dropped file the user was told about is exactly the failure
         // this method just stopped causing.
-        List<String> paths = new java.util.ArrayList<>(keptPaths.values());
+        // Every path is confined to this run's own workspace before it is read or deleted. The raw
+        // values above come from a skill's output or from the model-supplied tool input, so without
+        // this the two loops below are an arbitrary file read and an arbitrary file delete — see
+        // ScriptToolExecutor.resolveDeliverablePath. Anything that escapes is dropped and logged
+        // there, and simply does not become an artifact.
+        List<Path> paths = keptPaths.values().stream()
+                .map(raw -> scriptToolExecutor.resolveDeliverablePath(tenantCode, runId, raw))
+                .flatMap(java.util.Optional::stream)
+                .collect(java.util.stream.Collectors.toCollection(java.util.ArrayList::new));
+
         if (paths.size() > MAX_ARTIFACTS_PER_RUN) {
-            List<String> dropped = paths.subList(MAX_ARTIFACTS_PER_RUN, paths.size());
+            List<Path> dropped = paths.subList(MAX_ARTIFACTS_PER_RUN, paths.size());
             log.warn("Run {}: produced {} artifacts, keeping the first {}. Not delivered: {}",
                     runId, paths.size(), MAX_ARTIFACTS_PER_RUN, dropped);
-            for (String extra : dropped) {
+            for (Path extra : dropped) {
                 try {
-                    Files.deleteIfExists(Path.of(extra));
+                    Files.deleteIfExists(extra);
                 } catch (Exception e) {
                     log.warn("Run {}: failed to clean up undelivered artifact '{}': {}",
                             runId, extra, e.getMessage());
@@ -357,9 +366,8 @@ public class AgentService {
         }
 
         List<AgentRunResponse.ArtifactDto> artifacts = new java.util.ArrayList<>();
-        for (String pathStr : paths) {
+        for (Path path : paths) {
             try {
-                Path path = Path.of(pathStr);
                 if (!Files.isRegularFile(path)) continue;
 
                 long size = Files.size(path);
@@ -378,7 +386,7 @@ public class AgentService {
 
                 Files.deleteIfExists(path);
             } catch (Exception e) {
-                log.warn("Run {}: failed to read artifact at '{}': {}", runId, pathStr, e.getMessage());
+                log.warn("Run {}: failed to read artifact at '{}': {}", runId, path, e.getMessage());
             }
         }
         return artifacts;

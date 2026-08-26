@@ -131,6 +131,7 @@ public class VortoxChatProxyController implements Controller {
             return;
         }
 
+        stripClientControlledRouting(payload);
         enricher.enrich(payload, contextFrom(request));
 
         try {
@@ -141,6 +142,28 @@ public class VortoxChatProxyController implements Controller {
             writeJson(response, HttpServletResponse.SC_BAD_GATEWAY,
                     "{\"error\":\"The assistant is temporarily unavailable.\"}");
         }
+    }
+
+    /**
+     * Fields naming where the run sends its conversation, removed before anything else looks at the
+     * payload.
+     *
+     * <p>{@code HostChatContextEnricher} already strips these, and that was the whole control — but
+     * an enricher is optional. {@link ChatContextEnricher#NOOP} forwards the payload unchanged and
+     * is the default in {@code VortoxChatProxy.fromEnvironment(null)} and in the constructors that
+     * take no enricher, so a host that wired the proxy up without one handed the browser
+     * {@code llmBaseUrl}. The sidecar honours it: the run's system prompt, the host page snapshot
+     * and every tool result go to that URL, and whatever tool calls come back get executed.
+     *
+     * <p>That is not a decision a host application should be able to opt out of by omission, so it
+     * happens here, unconditionally, before {@code enrich}. An enricher that wants to <em>set</em>
+     * these deliberately still can — it runs after this and its choice stands.
+     */
+    private static void stripClientControlledRouting(ObjectNode payload) {
+        payload.remove("llmProvider");
+        payload.remove("llmBaseUrl");
+        payload.remove("llmApiKey");
+        payload.remove("systemPrompt");
     }
 
     private void handleGet(HttpServletRequest request, HttpServletResponse response) throws IOException {

@@ -27,8 +27,34 @@ public class VortoxSkillWebhookController {
 
     private final VortoxSkillSyncService syncService;
 
+    /**
+     * One worker, one queued reload.
+     *
+     * <p>This was a bare {@code new Thread(...)} per request. Every sync serialises on a single lock
+     * inside {@link VortoxSkillSyncService}, so N calls parked N threads waiting their turn to do
+     * work that had already been done — and while this route was unauthenticated, that was the whole
+     * denial-of-service. A single worker with a one-slot queue is also the honest model of the job:
+     * reloads are idempotent, so a reload already waiting to run covers any that arrive behind it,
+     * and dropping those is correct rather than lossy.
+     */
+    private final java.util.concurrent.ThreadPoolExecutor reloadExecutor =
+            new java.util.concurrent.ThreadPoolExecutor(
+                    1, 1, 0L, java.util.concurrent.TimeUnit.MILLISECONDS,
+                    new java.util.concurrent.ArrayBlockingQueue<>(1),
+                    r -> {
+                        Thread t = new Thread(r, "skill-sync-webhook");
+                        t.setDaemon(true);
+                        return t;
+                    },
+                    new java.util.concurrent.ThreadPoolExecutor.DiscardPolicy());
+
     public VortoxSkillWebhookController(VortoxSkillSyncService syncService) {
         this.syncService = syncService;
+    }
+
+    @jakarta.annotation.PreDestroy
+    void shutdown() {
+        reloadExecutor.shutdownNow();
     }
 
     /**
@@ -44,8 +70,10 @@ public class VortoxSkillWebhookController {
         String tenantCode = body != null && body.get("tenantCode") instanceof String s && !s.isBlank()
                 ? s : null;
         log.info("Received skill reload signal from Vortox (tenant={})", tenantCode);
-        // Fire-and-forget: respond immediately, sync runs in background
-        new Thread(() -> syncService.syncOnWebhook(tenantCode), "skill-sync-webhook").start();
+        // Fire-and-forget: respond immediately, sync runs on the single reload worker. A reload
+        // dropped because one is already queued is not a lost update — the queued one will pull the
+        // same current state, and the five-minute fallback poll covers anything stranger than that.
+        reloadExecutor.execute(() -> syncService.syncOnWebhook(tenantCode));
         return ResponseEntity.ok(Map.of("status", "reload triggered",
                 "scope", tenantCode == null ? "shared+known-tenants" : tenantCode));
     }

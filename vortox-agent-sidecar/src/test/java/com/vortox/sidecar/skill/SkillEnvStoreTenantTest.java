@@ -42,6 +42,66 @@ class SkillEnvStoreTenantTest {
         assertThat(store.hasTenant("tenant-never-synced")).isFalse();
     }
 
+    /**
+     * The case the test above missed, and the reason the bug survived: it only ever populated a
+     * tenant bucket, so the untenanted one was empty and the fallback had nothing to leak.
+     *
+     * <p>A real deployment fills it on startup — {@code sync("startup", null)} runs before any
+     * tenant is known — and those values belong to whichever tenant the key resolves to. Falling
+     * back to them for a different tenant code is the "succeeds against the wrong database" failure
+     * this class exists to prevent.
+     */
+    @Test
+    void aNamedTenantNeverReadsTheUntenantedBucketByDefault() {
+        SkillEnvStore store = new SkillEnvStore();
+        store.reset(oracleFor("first-tenant-db"));         // what an untenanted startup sync leaves
+        store.resetTenant("tenant-arena", Map.of());       // synced, but no values for this skill
+
+        assertThat(store.get("tenant-arena", "oracle_query"))
+                .as("must not inherit the untenanted bucket's credentials")
+                .isEmpty();
+        assertThat(store.get("tenant-never-synced", "oracle_query")).isEmpty();
+        // The untenanted bucket itself still reads, for genuinely untenanted runs.
+        assertThat(store.get("oracle_query")).containsEntry("ORACLE_HOST", "first-tenant-db");
+    }
+
+    /** The fallback is available, but only where someone has asserted there is one tenant. */
+    @Test
+    void theUntenantedBucketIsReachableOnlyWhenSingleTenantIsDeclared() {
+        SkillEnvStore store = new SkillEnvStore();
+        org.springframework.test.util.ReflectionTestUtils.setField(store, "singleTenant", true);
+        store.reset(oracleFor("the-one-db"));
+
+        assertThat(store.get("tenant-arena", "oracle_query"))
+                .containsEntry("ORACLE_HOST", "the-one-db");
+    }
+
+    /** A tenant's own value always wins, flag or no flag — the fallback is only for absence. */
+    @Test
+    void aTenantsOwnValueIsNeverDisplacedByTheUntenantedBucket() {
+        SkillEnvStore store = new SkillEnvStore();
+        org.springframework.test.util.ReflectionTestUtils.setField(store, "singleTenant", true);
+        store.reset(oracleFor("the-one-db"));
+        store.resetTenant("tenant-cube", oracleFor("cube-db"));
+
+        assertThat(store.get("tenant-cube", "oracle_query")).containsEntry("ORACLE_HOST", "cube-db");
+    }
+
+    /**
+     * {@code " shared"} was the sentinel key for the untenanted bucket, and it is not blank — so it
+     * sat in the same namespace as real tenant ids and a tenant of that name would have read and
+     * overwritten it. The bucket is a separate field now.
+     */
+    @Test
+    void aTenantNamedLikeTheOldSentinelDoesNotCollideWithTheUntenantedBucket() {
+        SkillEnvStore store = new SkillEnvStore();
+        store.reset(oracleFor("untenanted-db"));
+        store.resetTenant(" shared", oracleFor("impostor-db"));
+
+        assertThat(store.get("oracle_query")).containsEntry("ORACLE_HOST", "untenanted-db");
+        assertThat(store.get(" shared", "oracle_query")).containsEntry("ORACLE_HOST", "impostor-db");
+    }
+
     @Test
     void syncingOneTenantDoesNotClearAnother() {
         SkillEnvStore store = new SkillEnvStore();

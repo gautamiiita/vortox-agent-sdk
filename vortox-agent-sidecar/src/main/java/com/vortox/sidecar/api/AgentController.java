@@ -508,24 +508,51 @@ public class AgentController {
     }
 
     /**
-     * Proxy to a local LLM's model-listing endpoint.
-     * GET /agent/llm/models?baseUrl=https://ai.svc.elca.ch&apiKey=sk-...
+     * Hosts this sidecar may list models from, comma-separated — {@code SIDECAR_LLM_ALLOWED_HOSTS}.
+     *
+     * <p>Empty means the endpoint is off. That is the right default for a proxy: it exists to serve
+     * one or two known internal LLM endpoints, and a deployment that hasn't named them has no use
+     * for it. Compare the alternative, which is what this was — an unvalidated
+     * {@code GET {baseUrl}/api/models} whose body came back verbatim, i.e. an arbitrary-URL fetch
+     * from the sidecar's network position for anyone holding the sidecar key.
+     */
+    @org.springframework.beans.factory.annotation.Value("${sidecar.llm.allowed-hosts:}")
+    private String llmAllowedHostsRaw;
+
+    private final com.fasterxml.jackson.databind.ObjectMapper objectMapper =
+            new com.fasterxml.jackson.databind.ObjectMapper();
+
+    /**
+     * Proxy to a local LLM's model-listing endpoint, restricted to configured hosts.
+     * GET /agent/llm/models?baseUrl=https://ai.example.internal
+     *
+     * <p>The key travels in the {@code Authorization} header, not the query string. It used to be a
+     * {@code @RequestParam}, which put a live credential into every access log, proxy log and
+     * browser history entry along the way.
      */
     @GetMapping("/llm/models")
     public ResponseEntity<String> listLlmModels(
             @RequestParam String baseUrl,
-            @RequestParam String apiKey) {
+            @RequestHeader(value = "X-Llm-Api-Key", required = false) String apiKey) {
+
+        URI target;
         try {
-            String root = baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl;
+            target = resolveAllowedModelsUri(baseUrl, allowedLlmHosts());
+        } catch (IllegalArgumentException refused) {
+            log.warn("Refused LLM model listing for baseUrl='{}': {}", baseUrl, refused.getMessage());
+            return jsonError(HttpStatus.FORBIDDEN, refused.getMessage());
+        }
+
+        try {
             HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
-            HttpResponse<String> res = http.send(
-                    HttpRequest.newBuilder()
-                            .uri(URI.create(root + "/api/models"))
-                            .timeout(Duration.ofSeconds(15))
-                            .GET()
-                            .headers("Authorization", "Bearer " + apiKey)
-                            .build(),
-                    HttpResponse.BodyHandlers.ofString());
+            HttpRequest.Builder req = HttpRequest.newBuilder()
+                    .uri(target)
+                    .timeout(Duration.ofSeconds(15))
+                    .GET();
+            if (apiKey != null && !apiKey.isBlank()) {
+                req.header("Authorization", "Bearer " + apiKey.trim());
+            }
+            HttpResponse<String> res = http.send(req.build(), HttpResponse.BodyHandlers.ofString());
 
             if (res.statusCode() != 200) {
                 return ResponseEntity.status(res.statusCode()).body(res.body());
@@ -534,9 +561,77 @@ public class AgentController {
                     .header("Content-Type", "application/json")
                     .body(res.body());
         } catch (Exception e) {
-            log.error("Failed to list LLM models from {}: {}", baseUrl, e.getMessage());
-            return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
-                    .body("{\"error\":\"" + e.getMessage() + "\"}");
+            log.error("Failed to list LLM models from {}: {}", target, e.getMessage());
+            return jsonError(HttpStatus.BAD_GATEWAY, "Could not reach the model endpoint");
+        }
+    }
+
+    /** Configured allow-list, lower-cased, blanks dropped. */
+    private java.util.Set<String> allowedLlmHosts() {
+        if (llmAllowedHostsRaw == null || llmAllowedHostsRaw.isBlank()) return java.util.Set.of();
+        return java.util.Arrays.stream(llmAllowedHostsRaw.split(","))
+                .map(String::trim)
+                .filter(s -> !s.isEmpty())
+                .map(s -> s.toLowerCase(java.util.Locale.ROOT))
+                .collect(java.util.stream.Collectors.toSet());
+    }
+
+    /**
+     * Builds the models URI for {@code baseUrl}, or throws if it isn't one we're allowed to fetch.
+     *
+     * <p>The old version appended {@code /api/models} to the caller's string and trusted that to
+     * constrain the target. It didn't: a {@code baseUrl} carrying its own query or fragment simply
+     * absorbs the suffix, so {@code http://169.254.169.254/latest/meta-data/#} reached the cloud
+     * metadata service and returned its body to the caller. Parsing the URL and checking the host —
+     * rather than pattern-matching the string — is what makes the appended path mean anything.
+     */
+    /* package-private for testability */
+    static URI resolveAllowedModelsUri(String baseUrl, java.util.Set<String> allowedHosts) {
+        if (allowedHosts.isEmpty()) {
+            throw new IllegalArgumentException(
+                    "Model listing is not enabled on this sidecar. Set sidecar.llm.allowed-hosts "
+                  + "(SIDECAR_LLM_ALLOWED_HOSTS) to the LLM host(s) it may query.");
+        }
+        URI parsed;
+        try {
+            parsed = new URI(baseUrl.trim());
+        } catch (Exception e) {
+            throw new IllegalArgumentException("baseUrl is not a valid URL");
+        }
+        String scheme = parsed.getScheme() == null ? "" : parsed.getScheme().toLowerCase(java.util.Locale.ROOT);
+        if (!scheme.equals("http") && !scheme.equals("https")) {
+            throw new IllegalArgumentException("baseUrl must be http or https");
+        }
+        String host = parsed.getHost();
+        if (host == null || host.isBlank()) {
+            throw new IllegalArgumentException("baseUrl has no host");
+        }
+        String normalisedHost = host.toLowerCase(java.util.Locale.ROOT);
+        if (!allowedHosts.contains(normalisedHost)) {
+            throw new IllegalArgumentException("Host '" + host + "' is not in sidecar.llm.allowed-hosts");
+        }
+        // Rebuilt from the parsed parts, so any query or fragment the caller attached is dropped
+        // rather than carried into the request. The host is normalised on the way through as well:
+        // DNS doesn't care, but a log line that always spells the target the same way does.
+        String path = parsed.getPath() == null ? "" : parsed.getPath();
+        while (path.endsWith("/")) path = path.substring(0, path.length() - 1);
+        try {
+            return new URI(scheme, null, normalisedHost, parsed.getPort(), path + "/api/models", null, null);
+        } catch (Exception e) {
+            throw new IllegalArgumentException("baseUrl could not be resolved to a models URL");
+        }
+    }
+
+    /** JSON built by the mapper, not by concatenation — a quote in the message used to break it. */
+    private ResponseEntity<String> jsonError(HttpStatus status, String message) {
+        try {
+            return ResponseEntity.status(status)
+                    .header("Content-Type", "application/json")
+                    .body(objectMapper.writeValueAsString(Map.of("error", message)));
+        } catch (Exception e) {
+            return ResponseEntity.status(status)
+                    .header("Content-Type", "application/json")
+                    .body("{\"error\":\"Request failed\"}");
         }
     }
 }

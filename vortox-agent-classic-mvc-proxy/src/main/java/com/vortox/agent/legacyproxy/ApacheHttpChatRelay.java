@@ -31,6 +31,15 @@ public final class ApacheHttpChatRelay implements ChatRelay {
     /** Header the sidecar's SidecarApiKeyFilter requires on every /agent/** call. */
     private static final String API_KEY_HEADER = "X-Sidecar-Key";
 
+    /**
+     * Asked for explicitly, because Spring Boot's error handling answers a request that states no
+     * preference with the whitelabel <em>HTML</em> page — {@code BasicErrorController.errorHtml}
+     * matches a wildcard Accept. HttpClient sends no Accept header of its own, so every sidecar-side
+     * error was arriving here as HTML and, forwarded on, reached the browser as an unparseable
+     * response with no status left in it.
+     */
+    private static final String ACCEPT_JSON = "application/json";
+
     /** Generous ceiling for the stream socket — mirrors the widget's own MAX_WAIT_MS default. */
     private static final int STREAM_SOCKET_TIMEOUT_MS = 20 * 60 * 1000;
     private static final int CONNECT_TIMEOUT_MS = 10_000;
@@ -121,6 +130,7 @@ public final class ApacheHttpChatRelay implements ChatRelay {
     }
 
     private void applyApiKey(HttpUriRequest request) {
+        request.setHeader("Accept", ACCEPT_JSON);
         if (apiKey != null) {
             request.setHeader(API_KEY_HEADER, apiKey);
         }

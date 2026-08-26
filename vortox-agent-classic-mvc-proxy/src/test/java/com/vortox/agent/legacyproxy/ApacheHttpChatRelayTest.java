@@ -26,9 +26,15 @@ class ApacheHttpChatRelayTest {
     private final java.util.Map<String, String> keysSeen =
             new java.util.concurrent.ConcurrentHashMap<String, String>();
 
+    /** Accept header seen by the stub, per request path — null when the header was absent. */
+    private final java.util.Map<String, String> acceptSeen =
+            new java.util.concurrent.ConcurrentHashMap<String, String>();
+
     private void recordKey(HttpExchange exchange) {
         String key = exchange.getRequestHeaders().getFirst("X-Sidecar-Key");
         keysSeen.put(exchange.getRequestURI().getPath(), key == null ? "<absent>" : key);
+        String accept = exchange.getRequestHeaders().getFirst("Accept");
+        acceptSeen.put(exchange.getRequestURI().getPath(), accept == null ? "<absent>" : accept);
     }
 
     @BeforeEach
@@ -121,6 +127,21 @@ class ApacheHttpChatRelayTest {
         keyless.start("{\"message\":\"hi\"}");
 
         assertThat(keysSeen).containsEntry("/agent/chat", "<absent>");
+    }
+
+    /**
+     * Stated explicitly because the sidecar is a Spring Boot application: its error handling serves
+     * the whitelabel <em>HTML</em> page to a caller that expresses no preference, and HttpClient
+     * expresses none by default. Every sidecar-side failure then arrives as HTML, and by the time it
+     * has been forwarded to the browser there is nothing left to read but "unexpected response".
+     */
+    @Test
+    void asksForJsonSoSidecarErrorsComeBackAsJsonNotAnHtmlErrorPage() throws IOException {
+        relay.start("{\"message\":\"hi\"}");
+        relay.poll("run-1");
+
+        assertThat(acceptSeen.get("/agent/chat")).contains("application/json");
+        assertThat(acceptSeen.get("/agent/chat/run-1")).contains("application/json");
     }
 
     @Test

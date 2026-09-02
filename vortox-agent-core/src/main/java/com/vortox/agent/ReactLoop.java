@@ -6,6 +6,7 @@ import com.vortox.agent.spi.ControlHook;
 import com.vortox.agent.spi.MemoryStore;
 import com.vortox.agent.spi.TaskSpawner;
 import com.vortox.agent.spi.ToolExecutor;
+import com.vortox.agent.spi.ToolGate;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -195,14 +196,59 @@ public final class ReactLoop {
         log.info("ReactLoop [{}] resuming after approval", runTag(runId, runLabel));
         List<Map<String, Object>> messages = new ArrayList<>(sanitizeMessages(conversationSnapshot));
         messages.add(Map.of("role", "assistant", "content", assistantContent));
-
-        Map<String, Object> toolResult = new HashMap<>();
-        toolResult.put("type", "tool_result");
-        toolResult.put("tool_use_id", toolUseId);
-        toolResult.put("content", decisionMessage);
-        messages.add(Map.of("role", "user", "content", List.of(toolResult)));
+        messages.add(Map.of("role", "user", "content",
+                approvalToolResults(assistantContent, toolUseId, decisionMessage)));
 
         return runInternal(null, runId, null, messages, runLabel);
+    }
+
+    /**
+     * One {@code tool_result} block for every {@code tool_use} in the paused assistant turn.
+     *
+     * <p><strong>Why not just the gated one.</strong> The Messages API requires a result for each
+     * tool_use in the preceding assistant turn and rejects the request otherwise. This path used to
+     * answer only the id that paused the run, which is correct exactly when the model asked for one
+     * thing and nothing else — and a resumed run would fail on {@code tool_use} ids without
+     * {@code tool_result} the moment the model called two tools at once. That was reachable before
+     * (the model could pair {@code request_approval} with another call) and is routine now that a
+     * host policy can hold any call: a guarded agent that reads a file and writes one in the same
+     * turn pauses on the write with the read still outstanding.
+     *
+     * <p>The others are answered honestly rather than fabricated: they did not run, and the model is
+     * told to call them again if it still needs them.
+     */
+    static List<Map<String, Object>> approvalToolResults(List<Map<String, Object>> assistantContent,
+                                                          String gatedToolUseId,
+                                                          String decisionMessage) {
+        List<Map<String, Object>> results = new ArrayList<>();
+        if (assistantContent != null) {
+            for (Map<String, Object> block : assistantContent) {
+                if (block == null || !"tool_use".equals(block.get("type"))) continue;
+                Object id = block.get("id");
+                if (!(id instanceof String useId) || useId.isBlank()) continue;
+
+                Map<String, Object> result = new HashMap<>();
+                result.put("type", "tool_result");
+                result.put("tool_use_id", useId);
+                result.put("content", useId.equals(gatedToolUseId)
+                        ? decisionMessage
+                        : "Not executed — the turn was paused while another call in it waited for "
+                          + "approval. Call this again if you still need it.");
+                results.add(result);
+            }
+        }
+
+        // A snapshot with no recognisable tool_use block still has to answer the id that paused the
+        // run, or the resume is malformed in the other direction.
+        if (results.stream().noneMatch(r -> gatedToolUseId != null
+                && gatedToolUseId.equals(r.get("tool_use_id")))) {
+            Map<String, Object> result = new HashMap<>();
+            result.put("type", "tool_result");
+            result.put("tool_use_id", gatedToolUseId);
+            result.put("content", decisionMessage);
+            results.add(result);
+        }
+        return results;
     }
 
     /**
@@ -481,6 +527,40 @@ public final class ReactLoop {
                             totalIn, totalOut, totalCC, totalCR);
                     listener.onComplete(runId, r);
                     return r;
+                }
+            }
+
+            // ── Host tool gate ────────────────────────────────────────────────
+            // Consulted before the assistant turn is persisted, so the snapshot handed back has the
+            // same shape as an agent-initiated approval: messages without the assistant turn, plus
+            // that turn separately. Checked before dispatch because the block below executes every
+            // tool in the turn in parallel — a refusal that arrives from inside the executor arrives
+            // after the write it was meant to stop.
+            ToolGate gate = config.getToolGate();
+            if (gate != null && gate != ToolGate.OPEN) {
+                for (AnthropicClient.ContentBlock use : uses) {
+                    String request;
+                    try {
+                        request = gate.approvalRequestFor(use.getToolName(), use.getToolInput());
+                    } catch (Exception e) {
+                        // A gate that cannot answer is not a licence to proceed: an unreadable
+                        // policy has to stop the call, the same way an unreadable approval gate does.
+                        log.error("ReactLoop [{}] tool gate threw for {} — pausing rather than "
+                                + "running ungated: {}", runTag(runId, runLabel), use.getToolName(),
+                                e.getMessage(), e);
+                        request = "The permission policy for this run could not be evaluated, so `"
+                                + use.getToolName() + "` was held.\n\nReason: " + e.getMessage()
+                                + "\n\nApprove to run it anyway; reject to stop the task.";
+                    }
+                    if (request != null) {
+                        log.info("ReactLoop [{}] tool gate held {} for approval",
+                                runTag(runId, runLabel), use.getToolName());
+                        AgentResult r = AgentResult.needsApproval(request,
+                                use.getToolId(), toContentList(response),
+                                new ArrayList<>(messages), totalIn, totalOut, totalCC, totalCR);
+                        listener.onComplete(runId, r);
+                        return r;
+                    }
                 }
             }
 

@@ -6,6 +6,7 @@ import com.vortox.agent.spi.MemoryStore;
 import com.vortox.agent.spi.InMemoryStore;
 import com.vortox.agent.spi.TaskSpawner;
 import com.vortox.agent.spi.ToolExecutor;
+import com.vortox.agent.spi.ToolGate;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -68,6 +69,8 @@ public final class AgentConfig {
     private final ActivityListener activityListener;
     private final ControlHook controlHook;
     private final TaskSpawner taskSpawner;
+    /** Host policy consulted before each tool call. Never null — defaults to {@link ToolGate#OPEN}. */
+    private final ToolGate toolGate;
 
     private AgentConfig(Builder b) {
         this.agentId             = b.agentId;
@@ -90,6 +93,7 @@ public final class AgentConfig {
         this.activityListener    = b.activityListener;
         this.controlHook         = b.controlHook;
         this.taskSpawner         = b.taskSpawner;
+        this.toolGate            = b.toolGate != null ? b.toolGate : ToolGate.OPEN;
     }
 
     public static Builder builder() { return new Builder(); }
@@ -116,6 +120,7 @@ public final class AgentConfig {
     public ActivityListener getActivityListener() { return activityListener; }
     public ControlHook getControlHook()    { return controlHook; }
     public TaskSpawner getTaskSpawner()    { return taskSpawner; }
+    public ToolGate getToolGate()          { return toolGate; }
 
     // ── Builder ───────────────────────────────────────────────────────────────
 
@@ -142,6 +147,7 @@ public final class AgentConfig {
         private ActivityListener activityListener = ActivityListener.NOOP;
         private ControlHook controlHook      = ControlHook.NOOP;
         private TaskSpawner taskSpawner      = null;
+        private ToolGate toolGate            = ToolGate.OPEN;
 
         /** Identifies the agent in the log lines this run emits. Optional. */
         public Builder agentId(String agentId)                 { this.agentId = agentId; return this; }
@@ -155,6 +161,9 @@ public final class AgentConfig {
         public Builder activityListener(ActivityListener l)    { this.activityListener = l; return this; }
         public Builder controlHook(ControlHook h)              { this.controlHook = h; return this; }
         public Builder taskSpawner(TaskSpawner spawner)        { this.taskSpawner = spawner; this.enableSpawnTask = true; return this; }
+
+        /** Host policy consulted before each tool call; see {@link ToolGate}. Null means open. */
+        public Builder toolGate(ToolGate gate)                 { this.toolGate = gate; return this; }
 
         /** Register a single tool definition (Claude {@code tool_use} format). */
         public Builder tool(Map<String, Object> toolDefinition) {

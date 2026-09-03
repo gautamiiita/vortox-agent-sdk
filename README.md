@@ -54,7 +54,7 @@ Then add to your `pom.xml`:
 </dependency>
 ```
 
-**Runtime dependencies:** `jackson-databind` and `slf4j-api` only. Java 21+.
+**Runtime dependencies:** `jackson-databind` and `slf4j-api` only. Java 17+.
 
 ---
 

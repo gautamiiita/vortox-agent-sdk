@@ -278,6 +278,50 @@ public final class ReactLoop {
         return results;
     }
 
+    /** The stop reason for a reply that ran out of output tokens (OpenAI's "length" maps to it). */
+    static final String MAX_TOKENS_STOP = "max_tokens";
+
+    static final String TRUNCATED_TOOL_CALL =
+            "Not executed — your reply hit the output token limit and was cut off while writing "
+            + "this call, so its arguments are incomplete. Do not repeat it at the same size: it "
+            + "will be cut off again. Split the work into smaller calls — for a large file, "
+            + "file_write the first part (a few hundred lines at most) and file_append the rest "
+            + "in further calls of similar size.";
+
+    static final String TRUNCATED_TEXT =
+            "Your previous reply hit the output token limit and was cut off. Continue from where "
+            + "it stopped, and keep each reply shorter. If you were about to write a large file, "
+            + "write it in several smaller file_write / file_append calls.";
+
+    /**
+     * What to send back after a reply that ran out of output tokens.
+     *
+     * <p>Every {@code tool_use} in the cut-off turn is answered with an error, because the Messages
+     * API rejects a request that leaves one unanswered — and none of them is run, because the last
+     * one is certainly incomplete and there is no reliable way to tell which of the others were
+     * finished. A turn with no tool call gets a plain instruction to continue instead.
+     */
+    static List<Map<String, Object>> truncatedTurnReply(List<Map<String, Object>> assistantContent) {
+        List<Map<String, Object>> results = new ArrayList<>();
+        if (assistantContent != null) {
+            for (Map<String, Object> block : assistantContent) {
+                if (block == null || !"tool_use".equals(block.get("type"))) continue;
+                Object id = block.get("id");
+                if (!(id instanceof String useId) || useId.isBlank()) continue;
+                Map<String, Object> result = new HashMap<>();
+                result.put("type", "tool_result");
+                result.put("tool_use_id", useId);
+                result.put("content", TRUNCATED_TOOL_CALL);
+                result.put("is_error", true);
+                results.add(result);
+            }
+        }
+        if (results.isEmpty()) {
+            return List.of(Map.of("type", "text", "text", TRUNCATED_TEXT));
+        }
+        return results;
+    }
+
     /**
      * Adds the "carry on from here" instruction to a resumed conversation without creating two
      * {@code user} turns in a row.
@@ -450,6 +494,26 @@ public final class ReactLoop {
             String iterationText = response.getTextContent();
             if (iterationText != null && !iterationText.isBlank()) {
                 lastAssistantText = iterationText.trim();
+            }
+
+            // The reply ran out of output tokens. Whatever it holds is incomplete: a tool call cut
+            // mid-input arrives with its arguments missing, and a text-only reply is half an
+            // answer. Running the call made the model retry the same oversized write blind — a
+            // "$.content is missing" validation error says nothing about why — and accepting the
+            // text completed tasks that had not finished. Tell the model what happened instead.
+            if (MAX_TOKENS_STOP.equals(response.getStopReason())) {
+                List<Map<String, Object>> assistantContent = toContentList(response);
+                log.warn("ReactLoop [{}] reply cut off at the output token limit on iteration {} "
+                                + "({} output tokens, {} tool call(s) discarded)",
+                        tag, iterations, response.getOutputTokens(), response.getToolUses().size());
+                for (AnthropicClient.ContentBlock cut : response.getToolUses()) {
+                    toolCalls.add(new AgentResult.ToolCall(cut.getToolName(), cut.getToolInput(),
+                            TRUNCATED_TOOL_CALL, false, 0));
+                }
+                messages.add(Map.of("role", "assistant", "content", assistantContent));
+                messages.add(Map.of("role", "user", "content", truncatedTurnReply(assistantContent)));
+                pruneConversationHistory(messages);
+                continue;
             }
 
             if (!response.hasToolUse()) {

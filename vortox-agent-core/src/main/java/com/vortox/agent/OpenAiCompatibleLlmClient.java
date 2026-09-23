@@ -286,7 +286,9 @@ public final class OpenAiCompatibleLlmClient implements LlmClient {
             AnthropicClient.ClaudeResponse r = new AnthropicClient.ClaudeResponse();
             r.setContent(blocks);
             // Map OpenAI finish_reason back to Anthropic stop_reason
-            r.setStopReason("tool_calls".equals(finishReason) ? "tool_use" : "end_turn");
+            // "length" is the same cut-off as Anthropic's max_tokens — ReactLoop must see it as one.
+            r.setStopReason("tool_calls".equals(finishReason) ? "tool_use"
+                    : "length".equals(finishReason) ? "max_tokens" : "end_turn");
 
             JsonNode usage = root.path("usage");
             r.setInputTokens(usage.path("prompt_tokens").asInt());

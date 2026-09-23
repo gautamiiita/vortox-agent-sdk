@@ -96,16 +96,43 @@ public final class ReactLoop {
     // forcing agents to blindly probe the database's own metadata tables instead — which is both
     // slower and, for skills that export a CSV as a side effect of every query, needlessly
     // generates one throwaway file per exploratory probe. 40,000 comfortably covers that guide
-    // with room for it to grow (its own header calls it an "append-only living doc"). This is
-    // safe to raise now: pruneConversationHistory() still shrinks anything older than the most
-    // recent PRUNE_KEEP_RECENT_ROUNDS down to PRUNED_RESULT_MAX_CHARS regardless, and prompt
-    // caching (see AnthropicClient.withCacheBreakpoint) means resending this larger content
-    // across iterations mostly hits cheap cache reads rather than fresh full-price tokens.
+    // with room for it to grow (its own header calls it an "append-only living doc"). What keeps
+    // it safe is the character budget below: one 40,000-char result simply spends more of the
+    // budget and pushes the pruning boundary later, rather than multiplying against a round count.
+    // (This comment used to justify the size by saying prompt caching made resending it cheap.
+    // That was true of the intent and false of the behaviour — see the pruning constants below.)
     private static final int MAX_TOOL_RESULT_CHARS         = 40_000;
     private static final int MAX_REPORT_CHARS              = 12_000;
-    private static final int PRUNE_KEEP_RECENT_ROUNDS      = 5;
-    private static final int PRUNED_RESULT_MAX_CHARS       = 400;
-    private static final int PRUNED_ASSISTANT_TEXT_MAX_CHARS = 200;
+
+    // Pruning is driven by how much the conversation actually weighs, not by how many rounds it
+    // has, and it runs on a hysteresis rather than on every round. Both were needed.
+    //
+    // **Counting rounds could not be made safe.** A single tool result may be MAX_TOOL_RESULT_CHARS,
+    // so "keep the last N rounds" is a promise to keep up to N × 40,000 characters — at N = 16 that
+    // is more than a 200K-token window holds. Any N large enough to be useful for small results is
+    // unsafe for large ones. A character budget is the same rule stated in the unit that matters,
+    // and it self-adjusts: many small rounds survive, a few enormous ones do not.
+    //
+    // **Pruning every round was fighting the prompt cache.** The cache breakpoint sits on the last
+    // message, so the cached prefix is the whole history; rewriting any earlier message invalidates
+    // it from that point. The old rule stubbed one more round on every single iteration past the
+    // fifth, so from round six onward each call changed the prefix, missed the cache for everything
+    // after the change, and paid the cache-write surcharge on content the next round would
+    // invalidate again. The comment above — that caching makes resending large results cheap — was
+    // true of the design and false in practice.
+    //
+    // So: touch nothing until the conversation crosses HIGH, then prune back to LOW in one pass.
+    // Between crossings the prefix is byte-identical and the cache does what it was added to do.
+    // Most runs never reach HIGH at all and are now never mutated.
+    private static final int PRUNE_HIGH_WATER_CHARS        = 320_000;
+    private static final int PRUNE_LOW_WATER_CHARS         = 160_000;
+    /** Never stub the most recent rounds, however large — an agent must see what it just did. */
+    private static final int PRUNE_ALWAYS_KEEP_ROUNDS      = 3;
+    // Room for a usable gist rather than a fragment. At 400 a stubbed file listing or test output
+    // was one truncated line, which tells a later iteration that something happened and nothing
+    // about what.
+    private static final int PRUNED_RESULT_MAX_CHARS       = 1_500;
+    private static final int PRUNED_ASSISTANT_TEXT_MAX_CHARS = 600;
 
     /** A task title is free text; keep the log line readable rather than letting one run own it. */
     private static final int RUN_LABEL_MAX_CHARS = 70;
@@ -893,12 +920,19 @@ public final class ReactLoop {
     }
 
     /**
-     * Truncate old conversation rounds to reduce input tokens on every subsequent call.
-     * Keeps the last {@value #PRUNE_KEEP_RECENT_ROUNDS} rounds intact; older rounds
-     * have tool_result content and assistant reasoning text replaced with stubs.
+     * Shrink old rounds once the conversation gets heavy, and otherwise leave it entirely alone.
+     *
+     * <p>Does nothing at all below {@link #PRUNE_HIGH_WATER_CHARS}: no mutation means a
+     * byte-identical prefix, which is what the prompt cache needs to hit. Above it, walks back from
+     * the newest round keeping full content until {@link #PRUNE_LOW_WATER_CHARS} is spent and stubs
+     * everything older in one pass — so the next several rounds fit under HIGH again and change
+     * nothing. The last {@link #PRUNE_ALWAYS_KEEP_ROUNDS} rounds are kept whatever they weigh.
      */
+    /** Static and package-visible: it reads no instance state, and this is worth testing directly. */
     @SuppressWarnings("unchecked")
-    private void pruneConversationHistory(List<Map<String, Object>> messages) {
+    static void pruneConversationHistory(List<Map<String, Object>> messages) {
+        if (charsOf(messages, 0, messages.size()) <= PRUNE_HIGH_WATER_CHARS) return;
+
         List<Integer> toolResultRounds = new ArrayList<>();
         for (int i = 0; i < messages.size(); i++) {
             Map<String, Object> msg = messages.get(i);
@@ -909,9 +943,24 @@ public final class ReactLoop {
                     .anyMatch(b -> b instanceof Map && "tool_result".equals(((Map<?,?>) b).get("type")));
             if (hasToolResult) toolResultRounds.add(i);
         }
-        if (toolResultRounds.size() <= PRUNE_KEEP_RECENT_ROUNDS) return;
+        if (toolResultRounds.size() <= PRUNE_ALWAYS_KEEP_ROUNDS) return;
 
-        int pruneUntilIdx = toolResultRounds.get(toolResultRounds.size() - PRUNE_KEEP_RECENT_ROUNDS);
+        // Walk back from the newest round, spending the low-water budget. The boundary lands where
+        // the budget runs out, never later than the always-keep rounds.
+        int newest = toolResultRounds.size() - 1;
+        int keepFrom = newest - (PRUNE_ALWAYS_KEEP_ROUNDS - 1);
+        long spent = charsOf(messages, toolResultRounds.get(keepFrom), messages.size());
+
+        while (keepFrom > 0) {
+            int candidate = keepFrom - 1;
+            long extra = charsOf(messages, toolResultRounds.get(candidate), toolResultRounds.get(keepFrom));
+            if (spent + extra > PRUNE_LOW_WATER_CHARS) break;
+            spent += extra;
+            keepFrom = candidate;
+        }
+        if (keepFrom == 0) return;
+
+        int pruneUntilIdx = toolResultRounds.get(keepFrom);
         for (int i = 0; i < pruneUntilIdx; i++) {
             Map<String, Object> msg = messages.get(i);
             Object content = msg.get("content");
@@ -948,6 +997,35 @@ public final class ReactLoop {
                 if (changed) { Map<String, Object> u = new HashMap<>(msg); u.put("content", pruned); messages.set(i, u); }
             }
         }
+    }
+
+    /**
+     * Roughly what messages {@code [from, to)} weigh, in characters.
+     *
+     * <p>Characters rather than tokens on purpose: a tokeniser here would cost more than the
+     * decision is worth, and every threshold this feeds is a rule of thumb about a budget, not an
+     * accounting of one. Roughly four characters to the token is close enough to size a window.
+     */
+    @SuppressWarnings("unchecked")
+    static long charsOf(List<Map<String, Object>> messages, int from, int to) {
+        long total = 0;
+        for (int i = Math.max(0, from); i < Math.min(to, messages.size()); i++) {
+            Object content = messages.get(i).get("content");
+            if (content instanceof String s) { total += s.length(); continue; }
+            if (!(content instanceof List)) continue;
+            for (Object block : (List<Object>) content) {
+                if (!(block instanceof Map)) continue;
+                Map<String, Object> b = (Map<String, Object>) block;
+                Object text = b.get("text");
+                if (text instanceof String s) total += s.length();
+                Object inner = b.get("content");
+                if (inner instanceof String s) total += s.length();
+                else if (inner != null) total += String.valueOf(inner).length();
+                Object input = b.get("input");
+                if (input != null) total += String.valueOf(input).length();
+            }
+        }
+        return total;
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

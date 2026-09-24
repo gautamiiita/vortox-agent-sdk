@@ -363,9 +363,9 @@ public final class AnthropicClient implements LlmClient {
      * fresh input tokens. (Anthropic allows up to 4 cache_control breakpoints per request; this
      * is the 3rd, alongside the system prompt and last tool definition.)
      */
-    /** Package-visible for tests. */
+    /** Public so the backend's chat path (AnthropicService) applies the same rule rather than a copy. */
     @SuppressWarnings("unchecked")
-    static List<Map<String, Object>> withCacheBreakpoint(List<Map<String, Object>> messages) {
+    public static List<Map<String, Object>> withCacheBreakpoint(List<Map<String, Object>> messages) {
         if (messages == null || messages.isEmpty()) return messages;
 
         int lastIdx = messages.size() - 1;

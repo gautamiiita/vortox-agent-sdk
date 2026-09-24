@@ -705,12 +705,14 @@ public final class ReactLoop {
             for (IndexedOutcome indexed : futures) {
                 AnthropicClient.ContentBlock toolUse = indexed.toolUse();
                 ToolOutcome outcome;
+                int waitSec = toolWaitSeconds(toolUse.getToolInput());
                 try {
-                    outcome = indexed.future().get(120, TimeUnit.SECONDS);
+                    outcome = indexed.future().get(waitSec, TimeUnit.SECONDS);
                 } catch (TimeoutException te) {
                     indexed.future().cancel(true);
-                    listener.onError(runId, toolUse.getToolName() + " timed out after 120s");
-                    outcome = new ToolOutcome("Tool timed out after 120 seconds", false, 120_000);
+                    listener.onError(runId, toolUse.getToolName() + " timed out after " + waitSec + "s");
+                    outcome = new ToolOutcome("Tool timed out after " + waitSec + " seconds", false,
+                            waitSec * 1000L);
                 } catch (InterruptedException ie) {
                     Thread.currentThread().interrupt();
                     outcome = new ToolOutcome("Tool execution was interrupted", false, 0);
@@ -796,6 +798,28 @@ public final class ReactLoop {
 
         // Delegate everything else to the caller-supplied ToolExecutor
         return config.getToolExecutor().execute(name, input, runId);
+    }
+
+    /**
+     * How long the loop waits for one tool call before giving up on it.
+     *
+     * <p>This was a flat 120 s while {@code execute_command} accepts {@code timeout_seconds} up to
+     * 600. A 300 s install was reported to the model as "timed out after 120s" while it kept running;
+     * the model usually retried, stacking a second install on the first, and the cancelled future
+     * never interrupted the thread that was still waiting on the process. A tool that says how long
+     * it may take is now waited for that long, plus a margin so its own timeout — which kills the
+     * process and returns a real result — fires first.
+     */
+    static int toolWaitSeconds(Map<String, Object> toolInput) {
+        final int defaultWait = 120, maxToolTimeout = 600, margin = 30;
+        Object requested = toolInput != null ? toolInput.get("timeout_seconds") : null;
+        int seconds = 0;
+        if (requested instanceof Number n) seconds = n.intValue();
+        else if (requested instanceof String s) {
+            try { seconds = Integer.parseInt(s.trim()); } catch (NumberFormatException ignored) {}
+        }
+        if (seconds <= 0) return defaultWait;
+        return Math.max(defaultWait, Math.min(maxToolTimeout, seconds) + margin);
     }
 
     // ── execute_command (host, Windows + Linux) ───────────────────────────────

@@ -104,7 +104,7 @@ public final class OpenAiCompatibleLlmClient implements LlmClient {
             HttpResponse<String> res = HTTP.send(
                     HttpRequest.newBuilder()
                             .uri(URI.create(completionsUrl))
-                            .timeout(Duration.ofSeconds(120))
+                            .timeout(Duration.ofSeconds(AnthropicClient.requestTimeoutSeconds(maxTokens)))
                             .POST(HttpRequest.BodyPublishers.ofString(json))
                             .headers("Content-Type", "application/json",
                                      "Authorization", "Bearer " + apiKey)

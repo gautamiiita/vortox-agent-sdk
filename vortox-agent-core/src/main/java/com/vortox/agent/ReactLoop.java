@@ -133,6 +133,21 @@ public final class ReactLoop {
     // about what.
     private static final int PRUNED_RESULT_MAX_CHARS       = 1_500;
     private static final int PRUNED_ASSISTANT_TEXT_MAX_CHARS = 600;
+    // Stubbing results and text alone did not keep the hysteresis. A stubbed round still carries
+    // its tool_use input in full — write_file/edit_file content, whole commands — and a long run
+    // accumulates enough of that residue that the stubbed history alone stayed over HIGH. Every
+    // later iteration then re-entered the prune, moved the boundary one round, rewrote a message
+    // deep in the history and missed the cache for everything after it: measured as 25–54K
+    // cache-write tokens per iteration instead of ~1K, the bulk of all cache writes. So stubbed
+    // rounds also get their input values cut, and if the stubbed history still weighs more than
+    // PRUNE_RESIDUE_MAX_CHARS the oldest whole rounds are dropped. After a prune the conversation
+    // is at most LOW + RESIDUE (+ the first message), which leaves real headroom under HIGH.
+    private static final int PRUNED_INPUT_VALUE_MAX_CHARS  = 300;
+    private static final int PRUNE_RESIDUE_MAX_CHARS       = 60_000;
+    private static final String PRUNED_MARKER              = " ... [pruned]";
+    static final String DROPPED_ROUNDS_NOTE =
+            "[Note: earlier rounds of this run were dropped to fit the context window. "
+            + "Rely on the current state of files and the recent rounds below.]";
 
     /** A task title is free text; keep the log line readable rather than letting one run own it. */
     private static final int RUN_LABEL_MAX_CHARS = 70;
@@ -1040,7 +1055,7 @@ public final class ReactLoop {
                     String text = c instanceof String ? (String) c : String.valueOf(c);
                     if (text.length() > PRUNED_RESULT_MAX_CHARS) {
                         Map<String, Object> t = new HashMap<>(block);
-                        t.put("content", text.substring(0, PRUNED_RESULT_MAX_CHARS) + " ... [pruned]");
+                        t.put("content", text.substring(0, PRUNED_RESULT_MAX_CHARS) + PRUNED_MARKER);
                         pruned.add(t); changed = true;
                     } else { pruned.add(block); }
                 }
@@ -1050,15 +1065,86 @@ public final class ReactLoop {
                 boolean changed = false;
                 List<Map<String, Object>> pruned = new ArrayList<>();
                 for (Map<String, Object> block : blocks) {
+                    if ("tool_use".equals(block.get("type")) && block.get("input") instanceof Map) {
+                        Map<String, Object> input = stubInputValues((Map<String, Object>) block.get("input"));
+                        if (input != null) {
+                            Map<String, Object> t = new HashMap<>(block);
+                            t.put("input", input);
+                            pruned.add(t); changed = true;
+                        } else { pruned.add(block); }
+                        continue;
+                    }
                     if (!"text".equals(block.get("type"))) { pruned.add(block); continue; }
                     String text = (String) block.getOrDefault("text", "");
                     if (text.length() > PRUNED_ASSISTANT_TEXT_MAX_CHARS) {
                         Map<String, Object> t = new HashMap<>(block);
-                        t.put("text", text.substring(0, PRUNED_ASSISTANT_TEXT_MAX_CHARS) + " ... [pruned]");
+                        t.put("text", text.substring(0, PRUNED_ASSISTANT_TEXT_MAX_CHARS) + PRUNED_MARKER);
                         pruned.add(t); changed = true;
                     } else { pruned.add(block); }
                 }
                 if (changed) { Map<String, Object> u = new HashMap<>(msg); u.put("content", pruned); messages.set(i, u); }
+            }
+        }
+
+        dropOldestRoundsOverResidue(messages, pruneUntilIdx);
+    }
+
+    /**
+     * A copy of a stubbed round's tool input with its long string values cut, or {@code null} when
+     * nothing needed cutting. The input stays an object — the API requires one — with its keys intact,
+     * so a later iteration can still tell which file was written or which command ran.
+     */
+    private static Map<String, Object> stubInputValues(Map<String, Object> input) {
+        Map<String, Object> out = null;
+        for (Map.Entry<String, Object> e : input.entrySet()) {
+            if (!(e.getValue() instanceof String s)) continue;
+            if (s.length() <= PRUNED_INPUT_VALUE_MAX_CHARS + PRUNED_MARKER.length()) continue;
+            if (out == null) out = new LinkedHashMap<>(input);
+            out.put(e.getKey(), s.substring(0, PRUNED_INPUT_VALUE_MAX_CHARS) + PRUNED_MARKER);
+        }
+        return out;
+    }
+
+    /**
+     * If the stubbed part of the history ({@code [1, pruneUntilIdx)}) still weighs more than
+     * {@link #PRUNE_RESIDUE_MAX_CHARS}, drop its oldest whole rounds until it fits.
+     *
+     * <p>The cut always lands just before an assistant message that follows a user message, so the
+     * roles still alternate and no tool_use is separated from its tool_result. The first message —
+     * the task itself — is always kept, and gets a one-time note that history was dropped.
+     */
+    @SuppressWarnings("unchecked")
+    private static void dropOldestRoundsOverResidue(List<Map<String, Object>> messages, int pruneUntilIdx) {
+        if (charsOf(messages, 1, pruneUntilIdx) <= PRUNE_RESIDUE_MAX_CHARS) return;
+
+        int cut = -1;
+        for (int j = 2; j < pruneUntilIdx; j++) {
+            if (!"assistant".equals(messages.get(j).get("role"))) continue;
+            if (!"user".equals(messages.get(j - 1).get("role"))) continue;
+            cut = j;
+            if (charsOf(messages, j, pruneUntilIdx) <= PRUNE_RESIDUE_MAX_CHARS) break;
+        }
+        if (cut < 2) return;
+
+        messages.subList(1, cut).clear();
+
+        Map<String, Object> first = messages.get(0);
+        Object content = first.get("content");
+        if (content instanceof String s) {
+            if (!s.contains(DROPPED_ROUNDS_NOTE)) {
+                Map<String, Object> f = new HashMap<>(first);
+                f.put("content", s + "\n\n" + DROPPED_ROUNDS_NOTE);
+                messages.set(0, f);
+            }
+        } else if (content instanceof List<?> list) {
+            boolean noted = list.stream().anyMatch(b -> b instanceof Map
+                    && DROPPED_ROUNDS_NOTE.equals(((Map<?, ?>) b).get("text")));
+            if (!noted) {
+                List<Object> withNote = new ArrayList<>((List<Object>) list);
+                withNote.add(Map.of("type", "text", "text", DROPPED_ROUNDS_NOTE));
+                Map<String, Object> f = new HashMap<>(first);
+                f.put("content", withNote);
+                messages.set(0, f);
             }
         }
     }

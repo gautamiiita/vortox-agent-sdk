@@ -104,11 +104,25 @@ public final class AnthropicClient implements LlmClient {
         if (blank(apiKey)) return ClaudeResponse.error("API key not configured");
         List<Map<String, Object>> t = (tools != null && !tools.isEmpty()) ? tools : null;
         try {
-            return retry(() -> callApi(systemPrompt, messages, t, defaultMaxTokens, apiKey, mdl, 120));
+            return retry(() -> callApi(systemPrompt, messages, t, defaultMaxTokens, apiKey, mdl,
+                    requestTimeoutSeconds(defaultMaxTokens)));
         } catch (Exception e) {
             log.error("send() failed", e);
             return ClaudeResponse.error("Exception: " + e.getMessage());
         }
+    }
+
+    /**
+     * How long a non-streaming request may take, given how many tokens it is allowed to write.
+     *
+     * <p>A flat 120 s was sized for a 2,048-token cap. Output arrives at very roughly 30–80 tokens a
+     * second, so a reply allowed 16,000 tokens can legitimately need several minutes, and a flat
+     * limit turns every long write into a timeout plus three retries. The ceiling scales with the
+     * cap and never drops below the old 120 s; a reply that finishes early returns early whatever
+     * this says.
+     */
+    public static int requestTimeoutSeconds(int maxTokens) {
+        return Math.max(120, 60 + maxTokens / 30);
     }
 
     /**

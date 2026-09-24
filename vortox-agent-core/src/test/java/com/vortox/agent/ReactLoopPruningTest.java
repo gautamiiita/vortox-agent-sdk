@@ -165,6 +165,88 @@ class ReactLoopPruningTest {
         }
     }
 
+    @Nested
+    @DisplayName("long runs whose tool inputs are heavy")
+    class HeavyInputs {
+
+        /** A round that writes a file: the weight is in the tool_use input, not the result. */
+        private void addWriteRound(List<Map<String, Object>> messages, int contentChars) {
+            Map<String, Object> input = new LinkedHashMap<>();
+            input.put("path", "src/File" + messages.size() + ".java");
+            input.put("content", filler(contentChars));
+
+            Map<String, Object> toolUse = new LinkedHashMap<>();
+            toolUse.put("type", "tool_use");
+            toolUse.put("id", "w" + messages.size());
+            toolUse.put("name", "write_file");
+            toolUse.put("input", input);
+            Map<String, Object> assistant = new LinkedHashMap<>();
+            assistant.put("role", "assistant");
+            assistant.put("content", new ArrayList<>(List.of(toolUse)));
+            messages.add(assistant);
+
+            Map<String, Object> toolResult = new LinkedHashMap<>();
+            toolResult.put("type", "tool_result");
+            toolResult.put("tool_use_id", "w" + (messages.size() - 1));
+            toolResult.put("content", "{\"success\":true}");
+            Map<String, Object> user = new LinkedHashMap<>();
+            user.put("role", "user");
+            user.put("content", new ArrayList<>(List.of(toolResult)));
+            messages.add(user);
+        }
+
+        @Test
+        @DisplayName("after one prune, the next rounds leave the history alone")
+        void keepsHysteresisWhenInputsAreHeavy() {
+            // 150 rounds × 4,000 chars of write_file content: the stubbed residue alone used to stay
+            // over HIGH, so every subsequent round re-pruned and rewrote the prefix.
+            List<Map<String, Object>> messages = conversation(0, 0);
+            int prunes = 0;
+            for (int i = 0; i < 400 && prunes < 2; i++) {
+                addWriteRound(messages, 4_000);
+                long before = ReactLoop.charsOf(messages, 0, messages.size());
+                prune(messages);
+                if (ReactLoop.charsOf(messages, 0, messages.size()) < before) prunes++;
+            }
+            assertEquals(2, prunes, "fixture should have pruned twice");
+            String afterPrune = snapshot(messages);
+
+            for (int i = 0; i < 10; i++) {
+                addWriteRound(messages, 4_000);
+                prune(messages);
+            }
+
+            assertTrue(snapshot(messages).startsWith(afterPrune.substring(0, afterPrune.length() - 1)),
+                    "ten more rounds rewrote earlier history, so every one of them missed the cache");
+        }
+
+        @Test
+        @DisplayName("dropping rounds keeps the task, role alternation and tool_use/tool_result pairs")
+        void droppingRoundsKeepsTheConversationValid() {
+            List<Map<String, Object>> messages = conversation(0, 0);
+            for (int i = 0; i < 300; i++) addWriteRound(messages, 4_000);
+
+            prune(messages);
+
+            assertTrue(String.valueOf(messages.get(0).get("content")).startsWith("Do the thing."));
+            assertTrue(String.valueOf(messages.get(0).get("content")).contains(ReactLoop.DROPPED_ROUNDS_NOTE));
+            for (int i = 1; i < messages.size(); i++) {
+                String expected = (i % 2 == 1) ? "assistant" : "user";
+                assertEquals(expected, messages.get(i).get("role"), "roles must alternate at " + i);
+            }
+            for (int i = 1; i < messages.size(); i += 2) {
+                Map<?, ?> use = (Map<?, ?>) ((List<?>) messages.get(i).get("content")).get(0);
+                Map<?, ?> result = (Map<?, ?>) ((List<?>) messages.get(i + 1).get("content")).get(0);
+                assertEquals(use.get("id"), result.get("tool_use_id"), "tool_use split from its result");
+            }
+            assertTrue(ReactLoop.charsOf(messages, 0, messages.size()) < 240_000);
+
+            // The file path survives stubbing even where the content does not.
+            Map<?, ?> oldestUse = (Map<?, ?>) ((List<?>) messages.get(1).get("content")).get(0);
+            assertTrue(((Map<?, ?>) oldestUse.get("input")).get("path").toString().startsWith("src/File"));
+        }
+    }
+
     private static long unprunedRounds(List<Map<String, Object>> messages) {
         return messages.stream()
                 .filter(m -> "user".equals(m.get("role")))

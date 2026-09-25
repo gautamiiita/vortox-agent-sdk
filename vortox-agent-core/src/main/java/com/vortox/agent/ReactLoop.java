@@ -450,6 +450,7 @@ public final class ReactLoop {
         }
 
         List<AgentResult.ToolCall> toolCalls = new ArrayList<>();
+        RepeatedFailureGuard repeats = new RepeatedFailureGuard();
         int totalIn = 0, totalOut = 0, totalCC = 0, totalCR = 0;
         boolean outcomeCheckDone = false;
         /** The last non-blank prose the model produced, in any turn — see chooseReply. */
@@ -524,10 +525,18 @@ public final class ReactLoop {
                 for (AnthropicClient.ContentBlock cut : response.getToolUses()) {
                     toolCalls.add(new AgentResult.ToolCall(cut.getToolName(), cut.getToolInput(),
                             TRUNCATED_TOOL_CALL, false, 0));
+                    repeats.record(cut.getToolName(), cut.getToolInput(), false, TRUNCATED_TOOL_CALL);
                 }
                 messages.add(Map.of("role", "assistant", "content", assistantContent));
                 messages.add(Map.of("role", "user", "content", truncatedTurnReply(assistantContent)));
                 pruneConversationHistory(messages);
+                // A reply that keeps being cut off at the same size is the same stuck loop.
+                if (repeats.stopReason() != null) {
+                    log.warn("ReactLoop [{}] {}", tag, repeats.stopReason());
+                    AgentResult r = AgentResult.error(repeats.stopReason(), totalIn, totalOut);
+                    listener.onComplete(runId, r);
+                    return r;
+                }
                 continue;
             }
 
@@ -728,13 +737,22 @@ public final class ReactLoop {
                 Map<String, Object> tr = new HashMap<>();
                 tr.put("type", "tool_result");
                 tr.put("tool_use_id", toolUse.getToolId());
-                tr.put("content", formatToolResult(outcome.result()));
+                int sameFailure = repeats.record(toolUse.getToolName(), toolUse.getToolInput(),
+                        outcome.success(), outcome.result());
+                tr.put("content", formatToolResult(RepeatedFailureGuard.annotate(outcome.result(), sameFailure)));
                 if (!outcome.success()) tr.put("is_error", true);
                 toolResults.add(tr);
             }
 
             messages.add(Map.of("role", "user", "content", toolResults));
             pruneConversationHistory(messages);
+
+            if (repeats.stopReason() != null) {
+                log.warn("ReactLoop [{}] {}", tag, repeats.stopReason());
+                AgentResult r = AgentResult.error(repeats.stopReason(), totalIn, totalOut);
+                listener.onComplete(runId, r);
+                return r;
+            }
         }
 
         // Max iterations reached
@@ -764,24 +782,14 @@ public final class ReactLoop {
         // Memory tools
         if (config.isEnableMemoryTools()) {
             if (REMEMBER_TOOL.equals(name)) {
-                memory.store("agent", runId,
-                        str(input, "key", "memory"),
-                        str(input, "content", ""),
-                        str(input, "type", "CONTEXT"),
-                        intVal(input, "importance", 3));
-                return "{\"stored\":true,\"key\":\"" + input.get("key") + "\"}";
+                return storeEntries(memory, "agent", runId, memoryEntries(input), "type", "memory");
             }
             if (RECALL_TOOL.equals(name)) {
                 List<MemoryStore.MemoryEntry> found = memory.recallForAgent(runId, str(input, "query", ""));
                 return found.isEmpty() ? "No memories found." : formatMemories(found);
             }
             if (WRITE_TASK_MEMORY_TOOL.equals(name)) {
-                memory.store("task", runId,
-                        str(input, "key", "context"),
-                        str(input, "content", ""),
-                        str(input, "memoryType", "CONTEXT"),
-                        intVal(input, "importance", 3));
-                return "{\"stored\":true,\"key\":\"" + input.get("key") + "\"}";
+                return storeEntries(memory, "task", runId, memoryEntries(input), "memoryType", "context");
             }
             if (READ_TASK_MEMORY_TOOL.equals(name)) {
                 List<MemoryStore.MemoryEntry> found = memory.loadForRun(runId);
@@ -798,6 +806,48 @@ public final class ReactLoop {
 
         // Delegate everything else to the caller-supplied ToolExecutor
         return config.getToolExecutor().execute(name, input, runId);
+    }
+
+    /**
+     * The entries one memory call carries: its {@code entries} list when it has one, else the call
+     * itself as a single entry.
+     *
+     * <p>A list, because the protocol asks an agent to leave several things for the next one — spec
+     * summary, build result, test result, files changed — and one call per key cost an iteration
+     * each: four to six per run spent on bookkeeping. Anything in the list that is not an object is
+     * skipped rather than failing the whole call.
+     */
+    @SuppressWarnings("unchecked")
+    static List<Map<String, Object>> memoryEntries(Map<String, Object> input) {
+        if (input == null) return List.of();
+        if (input.get("entries") instanceof List<?> list) {
+            List<Map<String, Object>> out = new ArrayList<>();
+            for (Object o : list) if (o instanceof Map<?, ?> m) out.add((Map<String, Object>) m);
+            return out;
+        }
+        return List.of(input);
+    }
+
+    private static String storeEntries(MemoryStore memory, String scope, String runId,
+                                       List<Map<String, Object>> entries, String typeKey, String defaultKey) {
+        List<String> keys = new ArrayList<>();
+        for (Map<String, Object> e : entries) {
+            String content = str(e, "content", "");
+            if (content.isBlank()) continue;
+            String key = str(e, "key", defaultKey);
+            memory.store(scope, runId, key, content, str(e, typeKey, "CONTEXT"), intVal(e, "importance", 3));
+            keys.add(key);
+        }
+        if (keys.isEmpty()) {
+            throw new ToolExecutor.ToolExecutionException(
+                    "Nothing stored: give key and content, or entries=[{key, content, …}, …].");
+        }
+        StringBuilder json = new StringBuilder("{\"stored\":true,\"keys\":[");
+        for (int i = 0; i < keys.size(); i++) {
+            if (i > 0) json.append(',');
+            json.append('"').append(keys.get(i).replace("\\", "\\\\").replace("\"", "\\\"")).append('"');
+        }
+        return json.append("]}").toString();
     }
 
     /**
@@ -952,28 +1002,31 @@ public final class ReactLoop {
     private static List<Map<String, Object>> memoryToolDefs() {
         return List.of(
             Map.of("name", REMEMBER_TOOL,
-                "description", "Store a memory that persists across runs.",
+                "description", "Store a memory that persists across runs. Several at once: pass entries.",
                 "input_schema", Map.of("type", "object",
                     "properties", Map.of(
                         "key",        Map.of("type", "string"),
                         "content",    Map.of("type", "string"),
                         "type",       Map.of("type", "string", "enum", List.of("CONTEXT","PATTERN","DECISION","OUTCOME")),
-                        "importance", Map.of("type", "integer")),
-                    "required", List.of("key", "content"))),
+                        "importance", Map.of("type", "integer"),
+                        "entries",    Map.of("type", "array", "items", Map.of("type", "object")))
+                    )),
             Map.of("name", RECALL_TOOL,
                 "description", "Search stored memories.",
                 "input_schema", Map.of("type", "object",
                     "properties", Map.of("query", Map.of("type", "string")),
                     "required", List.of("query"))),
             Map.of("name", WRITE_TASK_MEMORY_TOOL,
-                "description", "Write context for the next agent in this task.",
+                "description", "Write context for the next agent in this task. Write all of it in one "
+                        + "call with entries=[{key, content, memoryType, importance}, …].",
                 "input_schema", Map.of("type", "object",
                     "properties", Map.of(
                         "key",        Map.of("type", "string"),
                         "content",    Map.of("type", "string"),
                         "memoryType", Map.of("type", "string", "enum", List.of("CONTEXT","DECISION","OUTCOME")),
-                        "importance", Map.of("type", "integer")),
-                    "required", List.of("key", "content", "memoryType"))),
+                        "importance", Map.of("type", "integer"),
+                        "entries",    Map.of("type", "array", "items", Map.of("type", "object")))
+                    )),
             Map.of("name", READ_TASK_MEMORY_TOOL,
                 "description", "Read context written by previous agents in this task.",
                 "input_schema", Map.of("type", "object", "properties", Map.of()))

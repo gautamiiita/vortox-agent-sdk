@@ -208,7 +208,18 @@ public final class ReactLoop {
      */
     public AgentResult run(String userMessage, String runId, String expectedOutcome,
                            List<Map<String, Object>> priorMessages, String runLabel) {
-        return runInternal(userMessage, runId, expectedOutcome, priorMessages, runLabel);
+        return runInternal(userMessage, null, runId, expectedOutcome, priorMessages, runLabel);
+    }
+
+    /**
+     * A fresh run whose first message also carries content blocks — images or documents the person
+     * attached, as Anthropic Messages API blocks ({@code {"type":"image","source":{...}}}). They are
+     * placed before the text, as the API recommends. Ignored on a continuation: the prior
+     * conversation already holds them.
+     */
+    public AgentResult run(String userMessage, List<Map<String, Object>> attachmentBlocks, String runId,
+                           String expectedOutcome, List<Map<String, Object>> priorMessages, String runLabel) {
+        return runInternal(userMessage, attachmentBlocks, runId, expectedOutcome, priorMessages, runLabel);
     }
 
     /**
@@ -241,7 +252,7 @@ public final class ReactLoop {
         messages.add(Map.of("role", "user", "content",
                 approvalToolResults(assistantContent, toolUseId, decisionMessage)));
 
-        return runInternal(null, runId, null, messages, runLabel);
+        return runInternal(null, null, runId, null, messages, runLabel);
     }
 
     /**
@@ -371,6 +382,15 @@ public final class ReactLoop {
         messages.add(Map.of("role", "user", "content", instruction));
     }
 
+    /** The first user message: plain text, or the attached blocks followed by the text. */
+    static Object firstUserContent(String userMessage, List<Map<String, Object>> attachmentBlocks) {
+        if (attachmentBlocks == null || attachmentBlocks.isEmpty()) return userMessage;
+        List<Map<String, Object>> content = new ArrayList<>();
+        for (Map<String, Object> block : attachmentBlocks) if (block != null) content.add(block);
+        content.add(Map.of("type", "text", "text", userMessage));
+        return content;
+    }
+
     /**
      * The Anthropic Messages API rejects any message object with keys other than "role"/"content" —
      * a resumed/persisted conversation snapshot may carry extra metadata (e.g. a "timestamp" added
@@ -415,6 +435,7 @@ public final class ReactLoop {
     }
 
     private AgentResult runInternal(String userMessage,
+                                    List<Map<String, Object>> attachmentBlocks,
                                     String runId,
                                     String expectedOutcome,
                                     List<Map<String, Object>> priorMessages,
@@ -446,7 +467,7 @@ public final class ReactLoop {
             if (userMessage == null || userMessage.isBlank()) {
                 return AgentResult.error("userMessage is required for a fresh run");
             }
-            messages.add(Map.of("role", "user", "content", userMessage));
+            messages.add(Map.of("role", "user", "content", firstUserContent(userMessage, attachmentBlocks)));
         }
 
         List<AgentResult.ToolCall> toolCalls = new ArrayList<>();

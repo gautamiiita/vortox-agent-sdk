@@ -139,7 +139,7 @@ public final class OpenAiCompatibleLlmClient implements LlmClient {
     }
 
     @SuppressWarnings("unchecked")
-    private List<Map<String, Object>> translateMessage(Map<String, Object> msg) {
+    List<Map<String, Object>> translateMessage(Map<String, Object> msg) {
         String role    = (String) msg.get("role");
         Object content = msg.get("content");
 
@@ -173,7 +173,22 @@ public final class OpenAiCompatibleLlmClient implements LlmClient {
                 return result;
             }
 
-            // Regular blocks — concatenate text
+            // Regular blocks. Images (an attached screenshot) become OpenAI image_url parts with a
+            // data URL; without one, the text is concatenated into a plain string as before.
+            boolean hasImage = blocks.stream().anyMatch(b -> "image".equals(b.get("type")));
+            if (hasImage) {
+                List<Map<String, Object>> parts = new ArrayList<>();
+                for (Map<String, Object> block : blocks) {
+                    if ("text".equals(block.get("type"))) {
+                        parts.add(Map.of("type", "text", "text", String.valueOf(block.get("text"))));
+                    } else if ("image".equals(block.get("type")) && block.get("source") instanceof Map<?, ?> src
+                            && "base64".equals(src.get("type"))) {
+                        parts.add(Map.of("type", "image_url", "image_url",
+                                Map.of("url", "data:" + src.get("media_type") + ";base64," + src.get("data"))));
+                    }
+                }
+                return List.of(Map.of("role", "user", "content", parts));
+            }
             StringBuilder sb = new StringBuilder();
             for (Map<String, Object> block : blocks) {
                 if ("text".equals(block.get("type"))) sb.append(block.get("text"));

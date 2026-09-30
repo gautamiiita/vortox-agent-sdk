@@ -120,7 +120,7 @@ public final class OpenAiCompatibleLlmClient implements LlmClient {
 
         } catch (Exception e) {
             log.error("OpenAI-compat send() failed", e);
-            return AnthropicClient.ClaudeResponse.error("Exception: " + e.getMessage());
+            return AnthropicClient.ClaudeResponse.error("Exception: " + AnthropicClient.describe(e));
         }
     }
 

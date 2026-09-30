@@ -63,7 +63,33 @@ public final class AnthropicClient implements LlmClient {
             // "timed out" is not a typo for "timeout" above: java.net.http.HttpTimeoutException's
             // message is literally "request timed out", which the substring "timeout" does not
             // match. That one also appeared in the logs, failing runs that a retry would have saved.
-            "EOF reached", "GOAWAY", "connection closed", "Connection closed", "timed out");
+            "EOF reached", "GOAWAY", "connection closed", "Connection closed", "timed out",
+            // Could not reach the host at all: DNS or routing. A ConnectException from java.net.http
+            // carries no message, so these only match now that describe() names the exception and
+            // its causes (2026-09-30: two DNS blips inside Docker, "Exception: null", each failed a
+            // whole benchmark run outright — one of them 46 minutes in).
+            "ConnectException", "UnresolvedAddressException", "UnknownHostException",
+            "NoRouteToHostException", "HttpConnectTimeoutException", "Network is unreachable");
+
+    /**
+     * A failure as text that says what it was: each exception's simple class name and message, down
+     * the cause chain. {@code "Exception: " + e.getMessage()} turned a DNS failure into
+     * "Exception: null", which neither this client's retry nor the platform's could recognise.
+     */
+    static String describe(Throwable e) {
+        StringBuilder sb = new StringBuilder();
+        int open = 0;
+        Throwable t = e;
+        for (int depth = 0; t != null && depth < 4; depth++) {
+            if (depth > 0) { sb.append(" (caused by "); open++; }
+            sb.append(t.getClass().getSimpleName());
+            if (t.getMessage() != null && !t.getMessage().isBlank()) sb.append(": ").append(t.getMessage());
+            Throwable next = t.getCause();
+            t = next == t ? null : next;
+        }
+        sb.append(")".repeat(open));
+        return sb.toString();
+    }
 
     private static final HttpClient HTTP = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(15))
@@ -108,7 +134,7 @@ public final class AnthropicClient implements LlmClient {
                     requestTimeoutSeconds(defaultMaxTokens)));
         } catch (Exception e) {
             log.error("send() failed", e);
-            return ClaudeResponse.error("Exception: " + e.getMessage());
+            return ClaudeResponse.error("Exception: " + describe(e));
         }
     }
 
@@ -157,7 +183,7 @@ public final class AnthropicClient implements LlmClient {
                 // buffered download) never produces a ClaudeResponse at all — without this catch,
                 // it would propagate straight out and skip retry entirely, unlike an error that
                 // comes back as a normal (non-2xx) response.
-                String msg = "Exception: " + e.getMessage();
+                String msg = "Exception: " + describe(e);
                 if (attempt < MAX_RETRIES && isTransient(msg)) {
                     long delay = retryDelayMs(attempt, msg);
                     log.warn("Transient exception (attempt {}/{}): {}. Retrying in {}ms…",

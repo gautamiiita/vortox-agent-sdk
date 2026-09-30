@@ -42,4 +42,30 @@ class AnthropicClientTransientTest {
         assertFalse(AnthropicClient.isTransient("API key not configured"));
         assertFalse(AnthropicClient.isTransient(null));
     }
+
+    /**
+     * 2026-09-30: a DNS blip inside Docker. java.net.http throws a ConnectException with no message,
+     * caused by an UnresolvedAddressException; "Exception: " + getMessage() made that
+     * "Exception: null", which nothing recognised, so a whole run failed instead of retrying.
+     */
+    @Test
+    void aFailedConnectionIsDescribedAndRetried() {
+        Exception dns = new java.net.ConnectException();
+        dns.initCause(new java.nio.channels.UnresolvedAddressException());
+        String described = AnthropicClient.describe(dns);
+        org.junit.jupiter.api.Assertions.assertEquals(
+                "ConnectException (caused by UnresolvedAddressException)", described);
+        assertTrue(AnthropicClient.isTransient("Exception: " + described));
+        assertTrue(AnthropicClient.isTransient("Exception: " + AnthropicClient.describe(
+                new java.net.UnknownHostException("api.anthropic.com"))));
+        assertFalse(AnthropicClient.isTransient("Exception: " + AnthropicClient.describe(
+                new IllegalArgumentException("bad model id"))));
+    }
+
+    @Test
+    void describeKeepsMessagesAndStopsOnACycle() {
+        Exception outer = new RuntimeException("outer", new IllegalStateException("inner"));
+        org.junit.jupiter.api.Assertions.assertEquals(
+                "RuntimeException: outer (caused by IllegalStateException: inner)", AnthropicClient.describe(outer));
+    }
 }

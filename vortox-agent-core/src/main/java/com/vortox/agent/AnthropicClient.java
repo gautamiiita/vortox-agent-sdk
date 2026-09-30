@@ -479,8 +479,17 @@ public final class AnthropicClient implements LlmClient {
     private static boolean blank(String s)         { return s == null || s.isBlank(); }
     /** Package-private so the keyword list can be tested directly — it is easy to get subtly wrong. */
     static boolean isTransient(String err) {
-        return err != null && TRANSIENT_KEYWORDS.stream().anyMatch(err::contains);
+        return err != null && (TRANSIENT_KEYWORDS.stream().anyMatch(err::contains)
+                || SERVER_ERROR.matcher(err).find());
     }
+
+    /**
+     * Any 5xx from the API or the edge in front of it. Only 503 and 529 were listed, so a 502, 504 or
+     * Cloudflare's 520–524 ("error code: 520") failed a run outright (2026-09-30, a migration run ten
+     * minutes in). A server error is the server's, and worth the retry.
+     */
+    private static final java.util.regex.Pattern SERVER_ERROR =
+            java.util.regex.Pattern.compile("API error: 5\\d\\d\\b");
 
     /**
      * Retry delay for the given attempt: the larger of the exponential backoff and any

@@ -62,6 +62,16 @@ class AnthropicClientTransientTest {
                 new IllegalArgumentException("bad model id"))));
     }
 
+    /** 2026-09-30: "API error: 520 - error code: 520" from the edge failed a run ten minutes in. */
+    @Test
+    void anyServerErrorIsTransient() {
+        assertTrue(AnthropicClient.isTransient("API error: 520 - error code: 520"));
+        assertTrue(AnthropicClient.isTransient("API error: 502 - Bad Gateway"));
+        assertTrue(AnthropicClient.isTransient("API error: 504 - Gateway Timeout"));
+        assertFalse(AnthropicClient.isTransient("API error: 401 - invalid x-api-key"));
+        assertFalse(AnthropicClient.isTransient("API error: 404 - model not found"));
+    }
+
     @Test
     void describeKeepsMessagesAndStopsOnACycle() {
         Exception outer = new RuntimeException("outer", new IllegalStateException("inner"));

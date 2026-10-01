@@ -208,7 +208,7 @@ public final class ReactLoop {
      */
     public AgentResult run(String userMessage, String runId, String expectedOutcome,
                            List<Map<String, Object>> priorMessages, String runLabel) {
-        return runInternal(userMessage, null, runId, expectedOutcome, priorMessages, runLabel);
+        return runInternal(userMessage, null, runId, expectedOutcome, priorMessages, runLabel, null);
     }
 
     /**
@@ -219,7 +219,26 @@ public final class ReactLoop {
      */
     public AgentResult run(String userMessage, List<Map<String, Object>> attachmentBlocks, String runId,
                            String expectedOutcome, List<Map<String, Object>> priorMessages, String runLabel) {
-        return runInternal(userMessage, attachmentBlocks, runId, expectedOutcome, priorMessages, runLabel);
+        return runInternal(userMessage, attachmentBlocks, runId, expectedOutcome, priorMessages, runLabel, null);
+    }
+
+    /**
+     * As above, with a {@link CompletionCheck}: before a SUCCESS is accepted, the work is checked
+     * against the requirements in a fresh context, and findings send the run back. When the check
+     * applies it replaces the in-context {@code expectedOutcome} self-check, which is the weaker
+     * version of the same question.
+     */
+    public AgentResult run(String userMessage, List<Map<String, Object>> attachmentBlocks, String runId,
+                           String expectedOutcome, List<Map<String, Object>> priorMessages, String runLabel,
+                           CompletionCheck completionCheck) {
+        return runInternal(userMessage, attachmentBlocks, runId, expectedOutcome, priorMessages, runLabel,
+                completionCheck);
+    }
+
+    /** Resume a run (see {@link #resume}) keeping its completion check. */
+    public AgentResult resume(String userMessage, String runId, List<Map<String, Object>> priorMessages,
+                              CompletionCheck completionCheck) {
+        return runInternal(userMessage, null, runId, null, priorMessages, null, completionCheck);
     }
 
     /**
@@ -252,7 +271,7 @@ public final class ReactLoop {
         messages.add(Map.of("role", "user", "content",
                 approvalToolResults(assistantContent, toolUseId, decisionMessage)));
 
-        return runInternal(null, null, runId, null, messages, runLabel);
+        return runInternal(null, null, runId, null, messages, runLabel, null);
     }
 
     /**
@@ -273,6 +292,42 @@ public final class ReactLoop {
     static List<Map<String, Object>> approvalToolResults(List<Map<String, Object>> assistantContent,
                                                           String gatedToolUseId,
                                                           String decisionMessage) {
+        return answerEveryCall(assistantContent, gatedToolUseId, decisionMessage,
+                "Not executed — the turn was paused while another call in it waited for "
+                + "approval. Call this again if you still need it.");
+    }
+
+    /** Whether a completion check's verdict returns the run for more work. */
+    static boolean sendsBack(CompletionVerdict verdict, int sendBacksSoFar, CompletionCheck check) {
+        return verdict != null && verdict.ran() && !verdict.unmet().isEmpty()
+                && sendBacksSoFar < check.maxSendBacks();
+    }
+
+    /**
+     * The reply, with the completion check's open findings added when the run ended with some — so
+     * whoever reads the report sees the second opinion beside the agent's own.
+     */
+    static String withOpenFindings(String reply, CompletionVerdict verdict) {
+        if (verdict == null || !verdict.ran() || verdict.unmet().isEmpty()) return reply;
+        StringBuilder sb = new StringBuilder(reply == null ? "" : reply.stripTrailing());
+        sb.append("\n\n### Independent completion check\nChecked against the task without this report; still open after ")
+          .append(verdict.sendBacks()).append(" return(s):\n");
+        for (CompletionVerdict.Finding f : verdict.unmet()) {
+            sb.append("- not met: ").append(f.requirement());
+            if (f.evidence() != null) sb.append(" — ").append(f.evidence());
+            sb.append('\n');
+        }
+        return sb.toString();
+    }
+
+    /**
+     * One {@code tool_result} for every {@code tool_use} in {@code assistantContent}: {@code decisionMessage}
+     * for the one with {@code gatedToolUseId}, {@code othersMessage} for the rest — the Messages API
+     * rejects a turn that leaves any of them unanswered.
+     */
+    static List<Map<String, Object>> answerEveryCall(List<Map<String, Object>> assistantContent,
+                                                     String gatedToolUseId, String decisionMessage,
+                                                     String othersMessage) {
         List<Map<String, Object>> results = new ArrayList<>();
         if (assistantContent != null) {
             for (Map<String, Object> block : assistantContent) {
@@ -283,10 +338,7 @@ public final class ReactLoop {
                 Map<String, Object> result = new HashMap<>();
                 result.put("type", "tool_result");
                 result.put("tool_use_id", useId);
-                result.put("content", useId.equals(gatedToolUseId)
-                        ? decisionMessage
-                        : "Not executed — the turn was paused while another call in it waited for "
-                          + "approval. Call this again if you still need it.");
+                result.put("content", useId.equals(gatedToolUseId) ? decisionMessage : othersMessage);
                 results.add(result);
             }
         }
@@ -439,7 +491,8 @@ public final class ReactLoop {
                                     String runId,
                                     String expectedOutcome,
                                     List<Map<String, Object>> priorMessages,
-                                    String runLabel) {
+                                    String runLabel,
+                                    CompletionCheck completionCheck) {
 
         // Prefixes every log line this run emits, so one line names the agent, the task id and the
         // task itself — see runTag.
@@ -474,6 +527,11 @@ public final class ReactLoop {
         RepeatedFailureGuard repeats = new RepeatedFailureGuard();
         int totalIn = 0, totalOut = 0, totalCC = 0, totalCR = 0;
         boolean outcomeCheckDone = false;
+        // A fresh-context check, when given, does the in-context one's job better: skip that one.
+        boolean freshCheck = completionCheck != null && completionCheck.applies();
+        if (freshCheck) outcomeCheckDone = true;
+        int checkSendBacks = 0;
+        CompletionVerdict verdict = null;
         /** The last non-blank prose the model produced, in any turn — see chooseReply. */
         String lastAssistantText = null;
 
@@ -564,10 +622,25 @@ public final class ReactLoop {
             if (!response.hasToolUse()) {
                 // LLM returned plain text — task complete
                 String text = response.getTextContent();
+                if (freshCheck) {
+                    FreshCheck.Outcome checked = FreshCheck.run(client, config.getApiKey(), config.getModel(),
+                            completionCheck, tag);
+                    totalIn += checked.usage().in();   totalOut += checked.usage().out();
+                    totalCC += checked.usage().cacheCreate(); totalCR += checked.usage().cacheRead();
+                    verdict = checked.verdict().withSendBacks(checkSendBacks);
+                    if (sendsBack(verdict, checkSendBacks, completionCheck)) {
+                        checkSendBacks++;
+                        listener.onIteration(runId, iterations, maxIterations,
+                                "Completion check: " + verdict.unmet().size() + " requirement(s) not met — sent back");
+                        messages.add(Map.of("role", "assistant", "content", toContentList(response)));
+                        messages.add(Map.of("role", "user", "content", verdict.sendBackMessage()));
+                        continue;
+                    }
+                }
                 log.info("ReactLoop [{}] completed after {} iterations (stop={})",
                         tag, iterations, response.getStopReason());
-                AgentResult r = AgentResult.success(text, iterations, toolCalls,
-                        messages, totalIn, totalOut, totalCC, totalCR);
+                AgentResult r = AgentResult.success(withOpenFindings(text, verdict), iterations, toolCalls,
+                        messages, totalIn, totalOut, totalCC, totalCR).withCompletionVerdict(verdict);
                 listener.onComplete(runId, r);
                 return r;
             }
@@ -609,12 +682,31 @@ public final class ReactLoop {
                 String reply = chooseReply(lastAssistantText, summary);
                 if ("PARTIAL".equals(outcome)) {
                     AgentResult r = AgentResult.partial(reply, iterations, toolCalls,
-                            messages, totalIn, totalOut, totalCC, totalCR);
+                            messages, totalIn, totalOut, totalCC, totalCR).withCompletionVerdict(verdict);
                     listener.onComplete(runId, r);
                     return r;
                 }
-                AgentResult r = AgentResult.success(reply, iterations, toolCalls,
-                        messages, totalIn, totalOut, totalCC, totalCR);
+                if (freshCheck) {
+                    FreshCheck.Outcome checked = FreshCheck.run(client, config.getApiKey(), config.getModel(),
+                            completionCheck, tag);
+                    totalIn += checked.usage().in();   totalOut += checked.usage().out();
+                    totalCC += checked.usage().cacheCreate(); totalCR += checked.usage().cacheRead();
+                    verdict = checked.verdict().withSendBacks(checkSendBacks);
+                    if (sendsBack(verdict, checkSendBacks, completionCheck)) {
+                        checkSendBacks++;
+                        listener.onIteration(runId, iterations, maxIterations,
+                                "Completion check: " + verdict.unmet().size() + " requirement(s) not met — sent back");
+                        List<Map<String, Object>> assistantContent = toContentList(response);
+                        messages.add(Map.of("role", "assistant", "content", assistantContent));
+                        messages.add(Map.of("role", "user", "content", answerEveryCall(assistantContent,
+                                completeCall.get().getToolId(), verdict.sendBackMessage(),
+                                "Not executed — the completion in this turn was returned for more work. "
+                                + "Call this again if you still need it.")));
+                        continue;
+                    }
+                }
+                AgentResult r = AgentResult.success(withOpenFindings(reply, verdict), iterations, toolCalls,
+                        messages, totalIn, totalOut, totalCC, totalCR).withCompletionVerdict(verdict);
                 listener.onComplete(runId, r);
                 return r;
             }
@@ -782,7 +874,7 @@ public final class ReactLoop {
         AgentResult r = AgentResult.partial(
                 "Task incomplete — max iterations reached",
                 maxIterations, toolCalls, messages,
-                totalIn, totalOut, totalCC, totalCR);
+                totalIn, totalOut, totalCC, totalCR).withCompletionVerdict(verdict);
         listener.onComplete(runId, r);
         return r;
     }

@@ -44,8 +44,33 @@ public record AgentResult(
         int cacheReadTokens,
 
         // Full conversation — preserved for continuation / approval resume
-        List<Map<String, Object>> conversationHistory
+        List<Map<String, Object>> conversationHistory,
+
+        // What a fresh-context completion check found (see CompletionCheck); null when none ran
+        CompletionVerdict completionVerdict
 ) {
+
+    /** The shape before completion checks existed; no verdict. */
+    public AgentResult(Status status, String response, String error, String clarificationQuestion,
+                       String approvalRequest, String approvalToolUseId,
+                       List<Map<String, Object>> approvalAssistantContent,
+                       String handoffTargetRole, String handoffReason, String handoffContext,
+                       int iterations, List<ToolCall> toolCalls,
+                       int inputTokens, int outputTokens, int cacheCreationTokens, int cacheReadTokens,
+                       List<Map<String, Object>> conversationHistory) {
+        this(status, response, error, clarificationQuestion, approvalRequest, approvalToolUseId,
+                approvalAssistantContent, handoffTargetRole, handoffReason, handoffContext, iterations,
+                toolCalls, inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens,
+                conversationHistory, null);
+    }
+
+    /** The same result carrying a completion check's verdict. */
+    public AgentResult withCompletionVerdict(CompletionVerdict verdict) {
+        return new AgentResult(status, response, error, clarificationQuestion, approvalRequest,
+                approvalToolUseId, approvalAssistantContent, handoffTargetRole, handoffReason,
+                handoffContext, iterations, toolCalls, inputTokens, outputTokens, cacheCreationTokens,
+                cacheReadTokens, conversationHistory, verdict);
+    }
 
     public enum Status {
         SUCCESS, PARTIAL, CLARIFICATION_NEEDED, APPROVAL_NEEDED, HANDOFF, ERROR, CANCELLED

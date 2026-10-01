@@ -34,6 +34,12 @@ public record CompletionVerdict(boolean ran, List<Finding> findings, int sendBac
         return findings.stream().filter(f -> f.status() == Status.NOT_MET).toList();
     }
 
+    /** One line for an activity feed: what was found not met, shortened. */
+    String unmetSummary() {
+        String s = String.join("; ", unmet().stream().map(Finding::requirement).toList());
+        return s.length() > 300 ? s.substring(0, 299) + "…" : s;
+    }
+
     CompletionVerdict withSendBacks(int n) {
         return new CompletionVerdict(ran, findings, n, note);
     }

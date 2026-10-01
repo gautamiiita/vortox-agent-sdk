@@ -84,6 +84,9 @@ final class FreshCheck {
         } else {
             log.info("ReactLoop [{}] completion check: {} requirement(s), {} not met",
                     tag, verdict.findings().size(), verdict.unmet().size());
+            for (CompletionVerdict.Finding f : verdict.unmet()) {
+                log.info("ReactLoop [{}] completion check — not met: {} — {}", tag, f.requirement(), f.evidence());
+            }
         }
         return new Outcome(verdict, usage);
     }

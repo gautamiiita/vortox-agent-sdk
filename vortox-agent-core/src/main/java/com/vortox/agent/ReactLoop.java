@@ -631,7 +631,7 @@ public final class ReactLoop {
                     if (sendsBack(verdict, checkSendBacks, completionCheck)) {
                         checkSendBacks++;
                         listener.onIteration(runId, iterations, maxIterations,
-                                "Completion check: " + verdict.unmet().size() + " requirement(s) not met — sent back");
+                                "Completion check: " + verdict.unmet().size() + " requirement(s) not met — sent back: " + verdict.unmetSummary());
                         messages.add(Map.of("role", "assistant", "content", toContentList(response)));
                         messages.add(Map.of("role", "user", "content", verdict.sendBackMessage()));
                         continue;
@@ -695,7 +695,7 @@ public final class ReactLoop {
                     if (sendsBack(verdict, checkSendBacks, completionCheck)) {
                         checkSendBacks++;
                         listener.onIteration(runId, iterations, maxIterations,
-                                "Completion check: " + verdict.unmet().size() + " requirement(s) not met — sent back");
+                                "Completion check: " + verdict.unmet().size() + " requirement(s) not met — sent back: " + verdict.unmetSummary());
                         List<Map<String, Object>> assistantContent = toContentList(response);
                         messages.add(Map.of("role", "assistant", "content", assistantContent));
                         messages.add(Map.of("role", "user", "content", answerEveryCall(assistantContent,
@@ -746,13 +746,37 @@ public final class ReactLoop {
                         .filter(t -> HANDOFF_TOOL.equals(t.getToolName())).findFirst();
                 if (handoffCall.isPresent()) {
                     Map<String, Object> hi = handoffCall.get().getToolInput();
+                    // A hand-off says "my part is done" as much as task_complete does: a developer in a
+                    // workflow hands to QA rather than completing (benchmark g3, 2026-10-01), and the
+                    // check must not depend on which of the two it chose.
+                    if (freshCheck) {
+                        FreshCheck.Outcome checked = FreshCheck.run(client, config.getApiKey(), config.getModel(),
+                                completionCheck, tag);
+                        totalIn += checked.usage().in();   totalOut += checked.usage().out();
+                        totalCC += checked.usage().cacheCreate(); totalCR += checked.usage().cacheRead();
+                        verdict = checked.verdict().withSendBacks(checkSendBacks);
+                        if (sendsBack(verdict, checkSendBacks, completionCheck)) {
+                            checkSendBacks++;
+                            listener.onIteration(runId, iterations, maxIterations,
+                                    "Completion check: " + verdict.unmet().size() + " requirement(s) not met — hand-off sent back: " + verdict.unmetSummary());
+                            List<Map<String, Object>> assistantContent = toContentList(response);
+                            messages.add(Map.of("role", "assistant", "content", assistantContent));
+                            messages.add(Map.of("role", "user", "content", answerEveryCall(assistantContent,
+                                    handoffCall.get().getToolId(),
+                                    verdict.sendBackMessage().replace("call task_complete again", "hand off again"),
+                                    "Not executed — the hand-off in this turn was returned for more work. "
+                                    + "Call this again if you still need it.")));
+                            continue;
+                        }
+                    }
+                    log.info("ReactLoop [{}] hand-off to {}", tag, str(hi, "targetRole", "OTHER"));
                     AgentResult r = AgentResult.handoff(
                             str(hi, "targetRole", "OTHER"),
                             str(hi, "reason", "Handoff requested"),
                             (String) hi.get("context"),
                             str(hi, "reason", ""),
                             iterations, toolCalls, messages,
-                            totalIn, totalOut, totalCC, totalCR);
+                            totalIn, totalOut, totalCC, totalCR).withCompletionVerdict(verdict);
                     listener.onComplete(runId, r);
                     return r;
                 }

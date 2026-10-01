@@ -170,6 +170,35 @@ class ReactLoopCompletionCheckTest {
         assertEquals(400, r.inputTokens(), "two agent turns and two checks");
     }
 
+    static AnthropicClient.ClaudeResponse handoff(String id) {
+        AnthropicClient.ClaudeResponse r = new AnthropicClient.ClaudeResponse();
+        r.setContent(List.of(AnthropicClient.ContentBlock.toolUse(id, ReactLoop.HANDOFF_TOOL,
+                Map.of("targetRole", "QA", "reason", "Built; over to QA"))));
+        r.setStopReason("tool_use");
+        return r;
+    }
+
+    @Test
+    @DisplayName("g3 2026-10-01: a hand-off is checked like a completion, and sent back the same way")
+    void handoffIsChecked() {
+        ScriptedClient client = new ScriptedClient();
+        client.agentTurns.add(handoff("h1"));
+        client.agentTurns.add(handoff("h2"));
+        client.checkAnswers.add(text(NOT_MET));
+        client.checkAnswers.add(text(MET));
+
+        AgentResult r = loop(client).run(TASK, null, "run-1", null, null, "g3", check(2));
+
+        assertEquals(AgentResult.Status.HANDOFF, r.status());
+        assertEquals("QA", r.handoffTargetRole());
+        assertEquals(2, client.checkRequests.size());
+        List<Map<String, Object>> second = client.agentRequests.get(1);
+        String returned = String.valueOf(second.get(second.size() - 1).get("content"));
+        assertTrue(returned.contains("h1") && returned.contains("hand off again"), returned);
+        assertEquals(1, r.completionVerdict().sendBacks());
+        assertTrue(r.completionVerdict().unmet().isEmpty());
+    }
+
     @Test
     @DisplayName("without a check nothing changes: one call, no verdict")
     void noCheckNoCall() {

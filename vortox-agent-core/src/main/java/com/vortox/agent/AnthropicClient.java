@@ -95,18 +95,51 @@ public final class AnthropicClient implements LlmClient {
             .connectTimeout(Duration.ofSeconds(15))
             .build();
 
+    /**
+     * How long a model call may go without receiving anything before the attempt is abandoned and
+     * retried. The tool loop's calls are streamed, and the API sends {@code ping} events while it
+     * works, so silence this long means the connection has stalled, not that the model is thinking.
+     * Before, a call waited for its whole reply under a timeout sized for the longest legitimate
+     * reply (~10 min at 16k tokens), three times over: tasks 717 and 718 sat silent 31 minutes
+     * (2026-10-12) before the run failed and the platform restarted it from iteration 1.
+     *
+     * <p>{@code VORTOX_LLM_IDLE_TIMEOUT_SECONDS} overrides it; {@code 0} turns streaming off and
+     * restores the buffered call.
+     */
+    static final long DEFAULT_IDLE_TIMEOUT_MS = idleTimeoutFromEnv(90);
+
     private final ObjectMapper objectMapper;
     private final String defaultModel;
     private final int defaultMaxTokens;
+    private final String apiUrl;
+    private final long idleTimeoutMs;
 
     public AnthropicClient() {
         this(new ObjectMapper(), "claude-sonnet-4-6", 4096);
     }
 
     public AnthropicClient(ObjectMapper objectMapper, String defaultModel, int defaultMaxTokens) {
+        this(objectMapper, defaultModel, defaultMaxTokens, API_URL, DEFAULT_IDLE_TIMEOUT_MS);
+    }
+
+    /** The endpoint and idle window are injectable for tests; 0 ms means buffered, not streamed. */
+    AnthropicClient(ObjectMapper objectMapper, String defaultModel, int defaultMaxTokens,
+                    String apiUrl, long idleTimeoutMs) {
         this.objectMapper      = objectMapper;
         this.defaultModel      = defaultModel;
         this.defaultMaxTokens  = defaultMaxTokens;
+        this.apiUrl            = apiUrl;
+        this.idleTimeoutMs     = Math.max(0, idleTimeoutMs);
+    }
+
+    private static long idleTimeoutFromEnv(long defaultSeconds) {
+        String v = System.getenv("VORTOX_LLM_IDLE_TIMEOUT_SECONDS");
+        if (v == null || v.isBlank()) return defaultSeconds * 1000L;
+        try {
+            return Math.max(0L, Long.parseLong(v.trim())) * 1000L;
+        } catch (NumberFormatException e) {
+            return defaultSeconds * 1000L;
+        }
     }
 
     // ── Public API ────────────────────────────────────────────────────────────
@@ -130,8 +163,10 @@ public final class AnthropicClient implements LlmClient {
         if (blank(apiKey)) return ClaudeResponse.error("API key not configured");
         List<Map<String, Object>> t = (tools != null && !tools.isEmpty()) ? tools : null;
         try {
-            return retry(() -> callApi(systemPrompt, messages, t, defaultMaxTokens, apiKey, mdl,
-                    requestTimeoutSeconds(defaultMaxTokens)));
+            int ceiling = requestTimeoutSeconds(defaultMaxTokens);
+            return retry(() -> idleTimeoutMs > 0
+                    ? callApiStreamed(systemPrompt, messages, t, defaultMaxTokens, apiKey, mdl, ceiling)
+                    : callApi(systemPrompt, messages, t, defaultMaxTokens, apiKey, mdl, ceiling));
         } catch (Exception e) {
             log.error("send() failed", e);
             return ClaudeResponse.error("Exception: " + describe(e));
@@ -215,7 +250,7 @@ public final class AnthropicClient implements LlmClient {
 
         HttpResponse<String> res = HTTP.send(
                 HttpRequest.newBuilder()
-                        .uri(URI.create(API_URL))
+                        .uri(URI.create(apiUrl))
                         .timeout(Duration.ofSeconds(timeoutSeconds))
                         .POST(HttpRequest.BodyPublishers.ofString(json))
                         .headers(headers(apiKey, false))
@@ -235,6 +270,238 @@ public final class AnthropicClient implements LlmClient {
         return parseResponse(res.body());
     }
 
+    /** Marks the end of a streamed body in {@link #callApiStreamed}'s queue. */
+    private static final Object END_OF_BODY = new Object();
+
+    /**
+     * One streamed attempt: the same request as {@link #callApi} with {@code stream: true}, the
+     * events assembled into the same {@link ClaudeResponse} {@link #parseResponse} would build.
+     *
+     * <p>Every line of the body — and the failure, if the exchange fails — goes through a queue that
+     * is read with the idle window as its timeout, so a connection that stops delivering is noticed
+     * within that window whether it stalls before the headers or in the middle of the reply. The
+     * attempt then throws an exception whose message {@link #isTransient} accepts, and
+     * {@link #retry} makes the next one. {@code ceilingSeconds} still bounds the whole attempt.
+     */
+    ClaudeResponse callApiStreamed(String systemPrompt, List<Map<String, Object>> messages,
+                                   List<Map<String, Object>> tools, int maxTokens,
+                                   String apiKey, String model, int ceilingSeconds) throws Exception {
+        String json = objectMapper.writeValueAsString(body(systemPrompt, messages, tools, maxTokens, apiKey, model, true));
+        log.debug("Claude API (streamed) — model:{} messages:{} tools:{}", model, messages.size(), tools != null ? tools.size() : 0);
+
+        java.util.concurrent.BlockingQueue<Object> queue = new java.util.concurrent.LinkedBlockingQueue<>();
+        int[] status = {0};
+        java.net.http.HttpHeaders[] responseHeaders = {null};
+        java.util.concurrent.atomic.AtomicReference<java.util.concurrent.Flow.Subscription> subscription =
+                new java.util.concurrent.atomic.AtomicReference<>();
+
+        java.util.concurrent.Flow.Subscriber<String> lines = new java.util.concurrent.Flow.Subscriber<>() {
+            @Override public void onSubscribe(java.util.concurrent.Flow.Subscription s) {
+                subscription.set(s);
+                s.request(Long.MAX_VALUE);
+            }
+            @Override public void onNext(String line) { queue.offer(line); }
+            @Override public void onError(Throwable t) { queue.offer(t); }
+            @Override public void onComplete()         { queue.offer(END_OF_BODY); }
+        };
+        HttpResponse.BodyHandler<Void> handler = info -> {
+            status[0] = info.statusCode();
+            responseHeaders[0] = info.headers();
+            return HttpResponse.BodySubscribers.fromLineSubscriber(lines);
+        };
+
+        java.util.concurrent.CompletableFuture<HttpResponse<Void>> exchange = HTTP.sendAsync(
+                HttpRequest.newBuilder()
+                        .uri(URI.create(apiUrl))
+                        .timeout(Duration.ofSeconds(ceilingSeconds))
+                        .POST(HttpRequest.BodyPublishers.ofString(json))
+                        .headers(headers(apiKey, true))
+                        .build(),
+                handler);
+        // A failure before any body arrives (DNS, refused connection) never reaches the subscriber.
+        exchange.whenComplete((r, ex) -> { if (ex != null) queue.offer(unwrap(ex)); });
+
+        long deadline = System.currentTimeMillis() + ceilingSeconds * 1000L;
+        SseAssembler sse = new SseAssembler(objectMapper);
+        StringBuilder errorBody = new StringBuilder();
+        // Read to the body's own end rather than stopping at message_stop: cancelling a body the
+        // server is about to close costs the pooled connection, and the next call its TLS handshake.
+        boolean completed = false;
+        try {
+            while (true) {
+                long now = System.currentTimeMillis();
+                long wait = Math.min(idleTimeoutMs, deadline - now);
+                if (wait <= 0) {
+                    throw new java.io.IOException("request timed out after " + ceilingSeconds + "s");
+                }
+                Object item;
+                try {
+                    item = queue.poll(wait, java.util.concurrent.TimeUnit.MILLISECONDS);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw ie;
+                }
+                if (item == null) {
+                    if (System.currentTimeMillis() >= deadline) {
+                        throw new java.io.IOException("request timed out after " + ceilingSeconds + "s");
+                    }
+                    throw new java.io.IOException("stream idle timeout: nothing received for "
+                            + (idleTimeoutMs / 1000) + "s — the connection stalled");
+                }
+                if (item == END_OF_BODY) { completed = true; break; }
+                if (item instanceof Exception e) throw e;
+                if (item instanceof Throwable t) throw new java.io.IOException(t);
+                String line = (String) item;
+                if (status[0] != 200) { errorBody.append(line).append('\n'); continue; }
+                sse.accept(line);
+            }
+        } finally {
+            if (!completed) {
+                // Abandoned — stalled, timed out or failed: drop the exchange so it stops holding a connection.
+                java.util.concurrent.Flow.Subscription s = subscription.get();
+                if (s != null) s.cancel();
+                exchange.cancel(true);
+            }
+        }
+
+        if (status[0] != 200) {
+            String err = extractApiError(errorBody.toString().strip(), status[0]);
+            if (status[0] == 429 && responseHeaders[0] != null) {
+                long secs = responseHeaders[0].firstValue("retry-after").map(AnthropicClient::parseRetryAfterSeconds).orElse(0L);
+                if (secs > 0) err = err + " [retry-after=" + secs + "s]";
+            }
+            return ClaudeResponse.error(err);
+        }
+        return sse.result();
+    }
+
+    private static Throwable unwrap(Throwable t) {
+        while ((t instanceof java.util.concurrent.CompletionException
+                || t instanceof java.util.concurrent.ExecutionException) && t.getCause() != null) {
+            t = t.getCause();
+        }
+        return t;
+    }
+
+    /**
+     * Builds a {@link ClaudeResponse} from the Messages API's server-sent events, the same one
+     * {@link #parseResponse} builds from the buffered JSON: text and {@code tool_use} blocks in
+     * order (a tool's input is its {@code input_json_delta} pieces joined, then parsed), the stop
+     * reason, and usage. Other block types — none are requested today — are skipped, as there.
+     */
+    static final class SseAssembler {
+        private final ObjectMapper mapper;
+        private final SortedMap<Integer, Map<String, Object>> blocks = new TreeMap<>();
+        private final ClaudeResponse response = new ClaudeResponse();
+        private String error;
+        private boolean done;
+
+        SseAssembler(ObjectMapper mapper) { this.mapper = mapper; }
+
+        /** One line of the event stream; only {@code data:} lines carry anything ({@code event:} repeats the type). */
+        void accept(String line) throws Exception {
+            if (line == null || !line.startsWith("data:")) return;
+            String data = line.substring(5).strip();
+            if (data.isEmpty() || "[DONE]".equals(data)) return;
+            JsonNode ev = mapper.readTree(data);
+            switch (ev.path("type").asText()) {
+                case "message_start" -> {
+                    JsonNode m = ev.path("message");
+                    response.setId(m.path("id").asText());
+                    response.setModel(m.path("model").asText());
+                    usage(m.path("usage"));
+                }
+                case "content_block_start" -> {
+                    JsonNode b = ev.path("content_block");
+                    Map<String, Object> block = new HashMap<>();
+                    block.put("type", b.path("type").asText());
+                    block.put("text", new StringBuilder(b.path("text").asText("")));
+                    block.put("json", new StringBuilder());
+                    block.put("id", b.path("id").asText());
+                    block.put("name", b.path("name").asText());
+                    block.put("input", b.path("input"));
+                    blocks.put(ev.path("index").asInt(), block);
+                }
+                case "content_block_delta" -> {
+                    Map<String, Object> block = blocks.get(ev.path("index").asInt());
+                    if (block == null) return;
+                    JsonNode d = ev.path("delta");
+                    switch (d.path("type").asText()) {
+                        case "text_delta"       -> ((StringBuilder) block.get("text")).append(d.path("text").asText());
+                        case "input_json_delta" -> ((StringBuilder) block.get("json")).append(d.path("partial_json").asText());
+                        default -> { }
+                    }
+                }
+                case "message_delta" -> {
+                    String stop = ev.path("delta").path("stop_reason").asText(null);
+                    if (stop != null) response.setStopReason(stop);
+                    usage(ev.path("usage"));
+                }
+                case "message_stop" -> done = true;
+                case "error" -> {
+                    JsonNode e = ev.path("error");
+                    error = "API error: " + statusFor(e.path("type").asText()) + " - "
+                            + e.path("message").asText(e.path("type").asText());
+                    done = true;
+                }
+                default -> { }   // ping, content_block_stop
+            }
+        }
+
+        /**
+         * The HTTP status the same failure would have come back as unstreamed, so {@link #retry}
+         * classifies a mid-stream {@code overloaded_error} exactly as it does a 529.
+         */
+        private static String statusFor(String type) {
+            return switch (type) {
+                case "overloaded_error"     -> "529";
+                case "api_error"            -> "500";
+                case "rate_limit_error"     -> "429";
+                case "invalid_request_error" -> "400";
+                case "authentication_error" -> "401";
+                case "permission_error"     -> "403";
+                case "not_found_error"      -> "404";
+                case "request_too_large"    -> "413";
+                default -> type;
+            };
+        }
+
+        /** Later events repeat the running totals; a field they leave out keeps its earlier value. */
+        private void usage(JsonNode u) {
+            if (u == null || u.isMissingNode()) return;
+            if (u.has("input_tokens"))                response.setInputTokens(u.path("input_tokens").asInt());
+            if (u.has("output_tokens"))               response.setOutputTokens(u.path("output_tokens").asInt());
+            if (u.has("cache_creation_input_tokens")) response.setCacheCreationInputTokens(u.path("cache_creation_input_tokens").asInt());
+            if (u.has("cache_read_input_tokens"))     response.setCacheReadInputTokens(u.path("cache_read_input_tokens").asInt());
+        }
+
+        @SuppressWarnings("unchecked")
+        ClaudeResponse result() throws Exception {
+            if (error != null) return ClaudeResponse.error(error);
+            if (!done) {
+                // The body ended without message_stop: the server closed the stream early. Worded
+                // like java.net.http's own early-close error, which isTransient already retries.
+                throw new java.io.IOException("EOF reached while reading: the stream ended before message_stop");
+            }
+            List<ContentBlock> content = new ArrayList<>();
+            for (Map<String, Object> b : blocks.values()) {
+                String type = (String) b.get("type");
+                if ("text".equals(type)) {
+                    content.add(ContentBlock.text(b.get("text").toString()));
+                } else if ("tool_use".equals(type)) {
+                    String json = b.get("json").toString();
+                    Map<String, Object> input = json.isBlank()
+                            ? mapper.convertValue(b.get("input"), Map.class)
+                            : mapper.readValue(json, Map.class);
+                    content.add(ContentBlock.toolUse((String) b.get("id"), (String) b.get("name"),
+                            input != null ? input : new LinkedHashMap<>()));
+                }
+            }
+            response.setContent(content);
+            return response;
+        }
+    }
+
     @SuppressWarnings("unchecked")
     private void streamApi(String systemPrompt, List<Map<String, Object>> messages,
                             List<Map<String, Object>> tools, int maxTokens,
@@ -245,7 +512,7 @@ public final class AnthropicClient implements LlmClient {
 
         HttpResponse<java.util.stream.Stream<String>> res = HTTP.send(
                 HttpRequest.newBuilder()
-                        .uri(URI.create(API_URL))
+                        .uri(URI.create(apiUrl))
                         .timeout(Duration.ofSeconds(timeoutSeconds))
                         .POST(HttpRequest.BodyPublishers.ofString(json))
                         .headers(headers(apiKey, true))
@@ -425,7 +692,7 @@ public final class AnthropicClient implements LlmClient {
 
     // ── Response parsing ──────────────────────────────────────────────────────
 
-    private ClaudeResponse parseResponse(String body) {
+    ClaudeResponse parseResponse(String body) {
         try {
             JsonNode root = objectMapper.readTree(body);
             if (root.has("error")) {

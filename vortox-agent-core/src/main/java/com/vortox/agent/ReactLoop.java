@@ -372,6 +372,20 @@ public final class ReactLoop {
             + "write it in several smaller file_write / file_append calls.";
 
     /**
+     * The conversation as it can be resumed: a copy, without trailing assistant turns. At a model
+     * call the history ends on a user turn, but a trailing assistant turn — a {@code tool_use} whose
+     * {@code tool_result} never got appended — would make the resumed request invalid, so it is cut.
+     */
+    static List<Map<String, Object>> resumableHistory(List<Map<String, Object>> messages) {
+        if (messages == null) return List.of();
+        List<Map<String, Object>> out = new ArrayList<>(messages);
+        while (!out.isEmpty() && "assistant".equals(out.get(out.size() - 1).get("role"))) {
+            out.remove(out.size() - 1);
+        }
+        return out;
+    }
+
+    /**
      * What to send back after a reply that ran out of output tokens.
      *
      * <p>Every {@code tool_use} in the cut-off turn is answered with an error, because the Messages
@@ -561,7 +575,10 @@ public final class ReactLoop {
             if (response.hasError()) {
                 log.error("ReactLoop [{}] LLM error: {}", tag, response.getError());
                 listener.onError(runId, "LLM error: " + response.getError());
-                AgentResult r = AgentResult.error("LLM error: " + response.getError(), totalIn, totalOut);
+                // With the conversation so far: a dropped connection forty iterations in used to
+                // send the platform's retry back to iteration 1 with nothing it had read or done.
+                AgentResult r = AgentResult.error("LLM error: " + response.getError(), iterations,
+                        toolCalls, resumableHistory(messages), totalIn, totalOut, totalCC, totalCR);
                 listener.onComplete(runId, r);
                 return r;
             }

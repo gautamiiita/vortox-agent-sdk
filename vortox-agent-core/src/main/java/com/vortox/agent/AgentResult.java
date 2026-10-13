@@ -137,6 +137,20 @@ public record AgentResult(
 
     public static AgentResult error(String error) { return error(error, 0, 0); }
 
+    /**
+     * A run that failed part-way — a model call that could not be completed — with the conversation
+     * it had built up, so the caller can resume it instead of starting again at iteration 1. The
+     * history ends on a user turn (see {@code ReactLoop.resumableHistory}); empty when there is none.
+     */
+    public static AgentResult error(String error, int iterations,
+                                    List<ToolCall> toolCalls,
+                                    List<Map<String, Object>> history,
+                                    int in, int out, int cacheCreate, int cacheRead) {
+        return new AgentResult(Status.ERROR, null, error, null, null, null, null,
+                null, null, null, iterations, toolCalls != null ? toolCalls : List.of(),
+                in, out, cacheCreate, cacheRead, history != null ? history : List.of());
+    }
+
     // ── Convenience predicates ────────────────────────────────────────────────
 
     public boolean isSuccess()             { return status == Status.SUCCESS; }

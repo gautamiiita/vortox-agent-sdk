@@ -71,6 +71,11 @@ public final class AgentConfig {
     private final TaskSpawner taskSpawner;
     /** Host policy consulted before each tool call. Never null — defaults to {@link ToolGate#OPEN}. */
     private final ToolGate toolGate;
+    /**
+     * How long the loop waits for a named tool, in seconds, where the default would cut it off. A
+     * tool that runs a sub-agent of its own takes minutes by design; see {@link ReactLoop#toolWaitSeconds}.
+     */
+    private final Map<String, Integer> toolWaitSeconds;
 
     private AgentConfig(Builder b) {
         this.agentId             = b.agentId;
@@ -94,6 +99,7 @@ public final class AgentConfig {
         this.controlHook         = b.controlHook;
         this.taskSpawner         = b.taskSpawner;
         this.toolGate            = b.toolGate != null ? b.toolGate : ToolGate.OPEN;
+        this.toolWaitSeconds     = Map.copyOf(b.toolWaitSeconds);
     }
 
     public static Builder builder() { return new Builder(); }
@@ -121,6 +127,10 @@ public final class AgentConfig {
     public ControlHook getControlHook()    { return controlHook; }
     public TaskSpawner getTaskSpawner()    { return taskSpawner; }
     public ToolGate getToolGate()          { return toolGate; }
+    /** The wait declared for {@code toolName} with {@link Builder#toolWait}, or null for the default. */
+    public Integer getToolWaitSeconds(String toolName) {
+        return toolName == null ? null : toolWaitSeconds.get(toolName);
+    }
 
     // ── Builder ───────────────────────────────────────────────────────────────
 
@@ -148,6 +158,7 @@ public final class AgentConfig {
         private ControlHook controlHook      = ControlHook.NOOP;
         private TaskSpawner taskSpawner      = null;
         private ToolGate toolGate            = ToolGate.OPEN;
+        private final Map<String, Integer> toolWaitSeconds = new java.util.HashMap<>();
 
         /** Identifies the agent in the log lines this run emits. Optional. */
         public Builder agentId(String agentId)                 { this.agentId = agentId; return this; }
@@ -164,6 +175,12 @@ public final class AgentConfig {
 
         /** Host policy consulted before each tool call; see {@link ToolGate}. Null means open. */
         public Builder toolGate(ToolGate gate)                 { this.toolGate = gate; return this; }
+
+        /** Wait up to {@code seconds} for {@code toolName} — for a tool that is slow by design. */
+        public Builder toolWait(String toolName, int seconds) {
+            if (toolName != null && seconds > 0) this.toolWaitSeconds.put(toolName, seconds);
+            return this;
+        }
 
         /** Register a single tool definition (Claude {@code tool_use} format). */
         public Builder tool(Map<String, Object> toolDefinition) {

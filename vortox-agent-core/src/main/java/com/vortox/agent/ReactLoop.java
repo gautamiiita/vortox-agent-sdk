@@ -868,7 +868,8 @@ public final class ReactLoop {
             for (IndexedOutcome indexed : futures) {
                 AnthropicClient.ContentBlock toolUse = indexed.toolUse();
                 ToolOutcome outcome;
-                int waitSec = toolWaitSeconds(toolUse.getToolInput());
+                int waitSec = toolWaitSeconds(config.getToolWaitSeconds(toolUse.getToolName()),
+                        toolUse.getToolInput());
                 try {
                     outcome = indexed.future().get(waitSec, TimeUnit.SECONDS);
                 } catch (TimeoutException te) {
@@ -1024,6 +1025,17 @@ public final class ReactLoop {
         }
         if (seconds <= 0) return defaultWait;
         return Math.max(defaultWait, Math.min(maxToolTimeout, seconds) + margin);
+    }
+
+    /**
+     * As {@link #toolWaitSeconds(Map)}, but never less than the host declared for this tool
+     * ({@link AgentConfig.Builder#toolWait}). A tool that runs a sub-agent — a read-only explorer
+     * making a dozen model calls of its own — needs minutes; reported as "timed out" at 120 s while
+     * it was still working, its whole answer would be thrown away.
+     */
+    static int toolWaitSeconds(Integer declared, Map<String, Object> toolInput) {
+        int fromInput = toolWaitSeconds(toolInput);
+        return declared == null ? fromInput : Math.max(fromInput, declared);
     }
 
     // ── execute_command (host, Windows + Linux) ───────────────────────────────
@@ -1219,6 +1231,20 @@ public final class ReactLoop {
         for (AnthropicClient.ContentBlock block : response.getContent()) {
             if ("text".equals(block.getType())) {
                 list.add(Map.of("type", "text", "text", block.getText()));
+            } else if ("thinking".equals(block.getType())) {
+                // Kept, and sent back exactly as received. Dropping it — what this did until
+                // 2026-10-14 — left a model that thinks by default (Claude Opus 5) reasoning from
+                // scratch every turn without what it had already worked out: 152k output tokens
+                // over 98 turns on one small task. Unsigned thinking cannot be sent back at all.
+                if (block.getSignature() != null && !block.getSignature().isBlank()) {
+                    Map<String, Object> t = new LinkedHashMap<>();
+                    t.put("type", "thinking");
+                    t.put("thinking", block.getText() == null ? "" : block.getText());
+                    t.put("signature", block.getSignature());
+                    list.add(t);
+                }
+            } else if ("redacted_thinking".equals(block.getType())) {
+                if (block.getData() != null) list.add(Map.of("type", "redacted_thinking", "data", block.getData()));
             } else if ("tool_use".equals(block.getType())) {
                 list.add(Map.of("type", "tool_use",
                         "id", block.getToolId(),

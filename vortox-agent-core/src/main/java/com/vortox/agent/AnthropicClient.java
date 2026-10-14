@@ -113,6 +113,12 @@ public final class AnthropicClient implements LlmClient {
     private final int defaultMaxTokens;
     private final String apiUrl;
     private final long idleTimeoutMs;
+    /**
+     * {@code output_config.effort} for every request, or null to send none (the model's default —
+     * {@code high} on Claude Opus 5, which thinks by default). Effort is how much a model thinks
+     * and writes per reply; see {@link #withEffort}.
+     */
+    private final String effort;
 
     public AnthropicClient() {
         this(new ObjectMapper(), "claude-sonnet-4-6", 4096);
@@ -125,12 +131,30 @@ public final class AnthropicClient implements LlmClient {
     /** The endpoint and idle window are injectable for tests; 0 ms means buffered, not streamed. */
     AnthropicClient(ObjectMapper objectMapper, String defaultModel, int defaultMaxTokens,
                     String apiUrl, long idleTimeoutMs) {
+        this(objectMapper, defaultModel, defaultMaxTokens, apiUrl, idleTimeoutMs, null);
+    }
+
+    private AnthropicClient(ObjectMapper objectMapper, String defaultModel, int defaultMaxTokens,
+                            String apiUrl, long idleTimeoutMs, String effort) {
         this.objectMapper      = objectMapper;
         this.defaultModel      = defaultModel;
         this.defaultMaxTokens  = defaultMaxTokens;
         this.apiUrl            = apiUrl;
         this.idleTimeoutMs     = Math.max(0, idleTimeoutMs);
+        this.effort            = blank(effort) ? null : effort.trim().toLowerCase();
     }
+
+    /**
+     * The same client, asking for {@code effort} ({@code low}, {@code medium}, {@code high},
+     * {@code xhigh}, {@code max}) on every request; null or blank sends none. Lower effort means
+     * less thinking, fewer and more consolidated tool calls, and faster replies — right for a
+     * sub-agent that only looks things up.
+     */
+    public AnthropicClient withEffort(String effort) {
+        return new AnthropicClient(objectMapper, defaultModel, defaultMaxTokens, apiUrl, idleTimeoutMs, effort);
+    }
+
+    public String getEffort() { return effort; }
 
     private static long idleTimeoutFromEnv(long defaultSeconds) {
         String v = System.getenv("VORTOX_LLM_IDLE_TIMEOUT_SECONDS");
@@ -164,9 +188,28 @@ public final class AnthropicClient implements LlmClient {
         List<Map<String, Object>> t = (tools != null && !tools.isEmpty()) ? tools : null;
         try {
             int ceiling = requestTimeoutSeconds(defaultMaxTokens);
-            return retry(() -> idleTimeoutMs > 0
-                    ? callApiStreamed(systemPrompt, messages, t, defaultMaxTokens, apiKey, mdl, ceiling)
-                    : callApi(systemPrompt, messages, t, defaultMaxTokens, apiKey, mdl, ceiling));
+            List<Map<String, Object>> sent = withoutThinkingReplay.get() ? withoutThinking(messages) : messages;
+            ApiCall call = () -> idleTimeoutMs > 0
+                    ? callApiStreamed(systemPrompt, sent, t, defaultMaxTokens, apiKey, mdl, ceiling)
+                    : callApi(systemPrompt, sent, t, defaultMaxTokens, apiKey, mdl, ceiling);
+            ClaudeResponse r = retry(call);
+
+            // Two settings a model may refuse, and neither is worth failing a run over. A model
+            // that does not take effort gets requests without it from here on; one that will not
+            // accept the thinking blocks sent back gets this request without them.
+            if (refused(r, "effort", "output_config") && effort != null && withoutEffort.compareAndSet(false, true)) {
+                log.warn("Model {} refused effort '{}' ({}) — sending requests without it", mdl, effort, r.getError());
+                r = retry(call);
+            }
+            if (refused(r, "thinking", "signature") && hasThinking(sent)
+                    && withoutThinkingReplay.compareAndSet(false, true)) {
+                log.warn("Model {} refused the thinking blocks sent back ({}) — sending none from here on", mdl, r.getError());
+                List<Map<String, Object>> plain = withoutThinking(messages);
+                r = retry(() -> idleTimeoutMs > 0
+                        ? callApiStreamed(systemPrompt, plain, t, defaultMaxTokens, apiKey, mdl, ceiling)
+                        : callApi(systemPrompt, plain, t, defaultMaxTokens, apiKey, mdl, ceiling));
+            }
+            return r;
         } catch (Exception e) {
             log.error("send() failed", e);
             return ClaudeResponse.error("Exception: " + describe(e));
@@ -207,6 +250,15 @@ public final class AnthropicClient implements LlmClient {
 
     @FunctionalInterface
     private interface ApiCall { ClaudeResponse call() throws Exception; }
+
+    /** A 400 whose message names one of {@code words} — the request was refused for that setting. */
+    static boolean refused(ClaudeResponse r, String... words) {
+        if (r == null || !r.hasError()) return false;
+        String e = r.getError().toLowerCase();
+        if (!e.contains("400") && !e.contains("invalid_request")) return false;
+        for (String w : words) if (e.contains(w)) return true;
+        return false;
+    }
 
     private ClaudeResponse retry(ApiCall fn) throws Exception {
         for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
@@ -420,6 +472,13 @@ public final class AnthropicClient implements LlmClient {
                     block.put("id", b.path("id").asText());
                     block.put("name", b.path("name").asText());
                     block.put("input", b.path("input"));
+                    // Thinking: its text (empty when display is omitted) and the signature that
+                    // lets it be sent back. Redacted thinking is one opaque `data` field.
+                    if ("thinking".equals(b.path("type").asText())) {
+                        ((StringBuilder) block.get("text")).append(b.path("thinking").asText(""));
+                        block.put("signature", new StringBuilder(b.path("signature").asText("")));
+                    }
+                    if (b.has("data")) block.put("data", b.path("data").asText());
                     blocks.put(ev.path("index").asInt(), block);
                 }
                 case "content_block_delta" -> {
@@ -429,6 +488,12 @@ public final class AnthropicClient implements LlmClient {
                     switch (d.path("type").asText()) {
                         case "text_delta"       -> ((StringBuilder) block.get("text")).append(d.path("text").asText());
                         case "input_json_delta" -> ((StringBuilder) block.get("json")).append(d.path("partial_json").asText());
+                        case "thinking_delta"   -> ((StringBuilder) block.get("text")).append(d.path("thinking").asText());
+                        case "signature_delta"  -> {
+                            Object sig = block.get("signature");
+                            if (sig instanceof StringBuilder sb) sb.append(d.path("signature").asText());
+                            else block.put("signature", new StringBuilder(d.path("signature").asText()));
+                        }
                         default -> { }
                     }
                 }
@@ -488,6 +553,11 @@ public final class AnthropicClient implements LlmClient {
                 String type = (String) b.get("type");
                 if ("text".equals(type)) {
                     content.add(ContentBlock.text(b.get("text").toString()));
+                } else if ("thinking".equals(type)) {
+                    Object sig = b.get("signature");
+                    content.add(ContentBlock.thinking(b.get("text").toString(), sig == null ? "" : sig.toString()));
+                } else if ("redacted_thinking".equals(type)) {
+                    content.add(ContentBlock.redactedThinking((String) b.get("data")));
                 } else if ("tool_use".equals(type)) {
                     String json = b.get("json").toString();
                     Map<String, Object> input = json.isBlank()
@@ -591,8 +661,50 @@ public final class AnthropicClient implements LlmClient {
             b.put("tools", cached);
         }
 
+        if (effort != null && !withoutEffort.get()) b.put("output_config", Map.of("effort", effort));
         if (stream) b.put("stream", true);
         return b;
+    }
+
+    /** Set once a model has refused {@code output_config.effort}: this client stops sending it. */
+    private final java.util.concurrent.atomic.AtomicBoolean withoutEffort = new java.util.concurrent.atomic.AtomicBoolean();
+    /** Set once a model has refused the thinking blocks sent back: this client strips them from then on. */
+    private final java.util.concurrent.atomic.AtomicBoolean withoutThinkingReplay = new java.util.concurrent.atomic.AtomicBoolean();
+
+    /** Whether any assistant turn in {@code messages} carries a thinking block. */
+    static boolean hasThinking(List<Map<String, Object>> messages) {
+        if (messages == null) return false;
+        for (Map<String, Object> m : messages) {
+            if (m != null && m.get("content") instanceof List<?> blocks) {
+                for (Object b : blocks) {
+                    if (b instanceof Map<?, ?> block && isThinking(block.get("type"))) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /** The conversation without its thinking blocks — a fallback when a request carrying them is refused. */
+    static List<Map<String, Object>> withoutThinking(List<Map<String, Object>> messages) {
+        List<Map<String, Object>> out = new ArrayList<>(messages.size());
+        for (Map<String, Object> m : messages) {
+            if (m != null && m.get("content") instanceof List<?> blocks) {
+                List<Object> kept = new ArrayList<>();
+                for (Object b : blocks) {
+                    if (!(b instanceof Map<?, ?> block && isThinking(block.get("type")))) kept.add(b);
+                }
+                Map<String, Object> copy = new LinkedHashMap<>(m);
+                copy.put("content", kept);
+                out.add(copy);
+            } else {
+                out.add(m);
+            }
+        }
+        return out;
+    }
+
+    private static boolean isThinking(Object type) {
+        return "thinking".equals(type) || "redacted_thinking".equals(type);
     }
 
     private String[] headers(String apiKey, boolean streaming) {
@@ -710,6 +822,10 @@ public final class AnthropicClient implements LlmClient {
                 String type = block.path("type").asText();
                 if ("text".equals(type)) {
                     blocks.add(ContentBlock.text(block.path("text").asText()));
+                } else if ("thinking".equals(type)) {
+                    blocks.add(ContentBlock.thinking(block.path("thinking").asText(""), block.path("signature").asText("")));
+                } else if ("redacted_thinking".equals(type)) {
+                    blocks.add(ContentBlock.redactedThinking(block.path("data").asText()));
                 } else if ("tool_use".equals(type)) {
                     blocks.add(ContentBlock.toolUse(
                             block.path("id").asText(),
@@ -839,12 +955,21 @@ public final class AnthropicClient implements LlmClient {
     }
 
     public static class ContentBlock {
-        private String type, text, toolId, toolName;
+        private String type, text, toolId, toolName, signature, data;
         private Map<String, Object> toolInput;
 
         public static ContentBlock text(String t) {
             ContentBlock b = new ContentBlock(); b.type = "text"; b.text = t; return b;
         }
+        /** The model's reasoning — {@code thinking} may be empty (display omitted); the signature is what counts. */
+        public static ContentBlock thinking(String thinking, String signature) {
+            ContentBlock b = new ContentBlock(); b.type = "thinking"; b.text = thinking; b.signature = signature; return b;
+        }
+        public static ContentBlock redactedThinking(String data) {
+            ContentBlock b = new ContentBlock(); b.type = "redacted_thinking"; b.data = data; return b;
+        }
+        public String getSignature()                    { return signature; }
+        public String getData()                         { return data; }
         public static ContentBlock toolUse(String id, String name, Map<String, Object> input) {
             ContentBlock b = new ContentBlock();
             b.type = "tool_use"; b.toolId = id; b.toolName = name; b.toolInput = input; return b;

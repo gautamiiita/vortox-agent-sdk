@@ -46,4 +46,17 @@ class ReactLoopToolWaitTest {
         assertEquals(120, ReactLoop.toolWaitSeconds(nullValue));
         assertEquals(330, ReactLoop.toolWaitSeconds(Map.of("timeout_seconds", "300")));
     }
+
+    @Test
+    @DisplayName("a tool the host declared slow is waited for that long; others keep the default")
+    void declaredWait() {
+        assertEquals(330, ReactLoop.toolWaitSeconds(330, Map.of("question", "where is X")));
+        assertEquals(120, ReactLoop.toolWaitSeconds(null, Map.of("command", "ls")));
+        // a declared wait never shortens what the call itself asked for
+        assertEquals(630, ReactLoop.toolWaitSeconds(200, Map.of("timeout_seconds", 600)));
+
+        AgentConfig config = AgentConfig.builder().apiKey("k").toolWait("explore", 330).build();
+        assertEquals(330, config.getToolWaitSeconds("explore"));
+        assertEquals(null, config.getToolWaitSeconds("read_file"));
+    }
 }

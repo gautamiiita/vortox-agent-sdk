@@ -116,6 +116,38 @@ class AnthropicClientStreamingTest {
         assertTrue(AnthropicClient.isTransient("Exception: " + AnthropicClient.describe(e)), e.getMessage());
     }
 
+    private static List<String> toolCallCutAt(String stopReason) {
+        return List.of(
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":1}}}",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"edit_file\",\"input\":{}}}",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\": \\\"a.ts\\\", \\\"edits\\\": [{\"}}",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"" + stopReason + "\"},\"usage\":{\"output_tokens\":9}}",
+                "data: {\"type\":\"message_stop\"}");
+    }
+
+    @Test
+    @DisplayName("a tool call whose input breaks off mid-stream is a retried early close, not a failed run")
+    void incompleteToolInputIsRetried() throws Exception {
+        // task 920 (2026-10-15): JsonEOFException ended a 20-minute run as a model error
+        AnthropicClient.SseAssembler sse = new AnthropicClient.SseAssembler(MAPPER);
+        for (String line : toolCallCutAt("tool_use")) sse.accept(line);
+
+        IOException e = assertThrows(IOException.class, sse::result);
+        assertTrue(AnthropicClient.isTransient("Exception: " + AnthropicClient.describe(e)), e.getMessage());
+    }
+
+    @Test
+    @DisplayName("cut off at the output limit, the call is kept without input, for the loop's truncated-turn answer")
+    void incompleteToolInputAtTheLimitIsATruncatedTurn() throws Exception {
+        AnthropicClient.SseAssembler sse = new AnthropicClient.SseAssembler(MAPPER);
+        for (String line : toolCallCutAt("max_tokens")) sse.accept(line);
+
+        AnthropicClient.ClaudeResponse r = sse.result();
+        assertEquals("max_tokens", r.getStopReason());
+        assertEquals("edit_file", r.getToolUses().get(0).getToolName());
+        assertTrue(r.getToolUses().get(0).getToolInput().isEmpty());
+    }
+
     @Test
     @DisplayName("over HTTP: a full stream comes back as the buffered response")
     void streamsOverHttp() throws Exception {

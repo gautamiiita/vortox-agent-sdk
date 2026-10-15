@@ -560,9 +560,23 @@ public final class AnthropicClient implements LlmClient {
                     content.add(ContentBlock.redactedThinking((String) b.get("data")));
                 } else if ("tool_use".equals(type)) {
                     String json = b.get("json").toString();
-                    Map<String, Object> input = json.isBlank()
-                            ? mapper.convertValue(b.get("input"), Map.class)
-                            : mapper.readValue(json, Map.class);
+                    Map<String, Object> input;
+                    try {
+                        input = json.isBlank()
+                                ? mapper.convertValue(b.get("input"), Map.class)
+                                : mapper.readValue(json, Map.class);
+                    } catch (com.fasterxml.jackson.core.JsonProcessingException incomplete) {
+                        // A tool call whose input JSON stops part-way. Task 920 (2026-10-15) lost a
+                        // 20-minute run to this: the parse error ended the run as a model error.
+                        // Cut off at the output limit, it is a truncated turn the loop already
+                        // answers (MAX_TOKENS_STOP) — kept, with no input. Otherwise the stream
+                        // broke in transit: said as the early close it is, which retry() repeats.
+                        if (!ReactLoop.MAX_TOKENS_STOP.equals(response.getStopReason())) {
+                            throw new java.io.IOException("EOF reached while reading: tool call '" + b.get("name")
+                                    + "' arrived with incomplete input (" + json.length() + " chars)");
+                        }
+                        input = new LinkedHashMap<>();
+                    }
                     content.add(ContentBlock.toolUse((String) b.get("id"), (String) b.get("name"),
                             input != null ? input : new LinkedHashMap<>()));
                 }

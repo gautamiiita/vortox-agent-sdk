@@ -35,8 +35,12 @@ class ReactLoopThinkingTest {
             }
             return r;
         };
+        List<com.vortox.agent.spi.ActivityListener.CallUsage> usage = new ArrayList<>();
         AgentConfig config = AgentConfig.builder().apiKey("k").maxIterations(5)
                 .toolExecutor((name, params, runId) -> "found")
+                .activityListener(new com.vortox.agent.spi.ActivityListener() {
+                    @Override public void onCallUsage(String runId, int iteration, CallUsage u) { usage.add(u); }
+                })
                 .enableMemoryTools(false).build();
 
         AgentResult result = new ReactLoop(config, client, Runnable::run).run("Find x.", "run-1");
@@ -49,5 +53,12 @@ class ReactLoopThinkingTest {
         assertEquals("sig-1", assistant.get(0).get("signature"));
         assertEquals("", assistant.get(0).get("thinking"));
         assertEquals("tool_use", assistant.get(1).get("type"));
+
+        // each call reports its own usage, and the thinking the conversation carries into it
+        assertEquals(2, usage.size());
+        assertEquals(0, usage.get(0).thinkingBlocks());
+        assertEquals(1, usage.get(1).thinkingBlocks());
+        assertEquals("sig-1".length(), usage.get(1).thinkingChars());
+        assertTrue(usage.get(1).conversationChars() > 0);
     }
 }

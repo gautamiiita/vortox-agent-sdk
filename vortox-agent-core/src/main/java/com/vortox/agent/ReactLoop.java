@@ -569,8 +569,10 @@ public final class ReactLoop {
             log.info("ReactLoop [{}] iteration {}/{}", tag, iterations, maxIterations);
             listener.onIteration(runId, iterations, maxIterations, "LLM call");
 
+            long callStarted = System.currentTimeMillis();
             AnthropicClient.ClaudeResponse response = client.send(
                     sysPrompt, messages, tools, config.getApiKey(), config.getModel());
+            long callMs = System.currentTimeMillis() - callStarted;
 
             if (response.hasError()) {
                 log.error("ReactLoop [{}] LLM error: {}", tag, response.getError());
@@ -588,6 +590,11 @@ public final class ReactLoop {
             totalCC  += response.getCacheCreationInputTokens();
             totalCR  += response.getCacheReadInputTokens();
             listener.onTokens(runId, iterations, totalIn, totalOut);
+            long[] thinking = thinkingKept(messages);
+            listener.onCallUsage(runId, iterations, new ActivityListener.CallUsage(
+                    response.getInputTokens(), response.getOutputTokens(),
+                    response.getCacheCreationInputTokens(), response.getCacheReadInputTokens(),
+                    callMs, charsOf(messages, 0, messages.size()), (int) thinking[0], thinking[1]));
 
             // What actually went over the wire this turn. Tagged like every other line, so a reader
             // can follow one agent's conversation about one task through a log holding many.
@@ -1414,6 +1421,28 @@ public final class ReactLoop {
      * accounting of one. Roughly four characters to the token is close enough to size a window.
      */
     @SuppressWarnings("unchecked")
+    /**
+     * How much thinking the conversation carries from earlier turns: {blocks, chars}. A thinking
+     * block's weight is its signature (the encrypted reasoning) plus any visible text. Measured so
+     * the cost of keeping it (abb5730) can be seen per turn instead of guessed.
+     */
+    static long[] thinkingKept(List<Map<String, Object>> messages) {
+        long blocks = 0, chars = 0;
+        for (Map<String, Object> m : messages) {
+            if (m == null || !"assistant".equals(m.get("role")) || !(m.get("content") instanceof List<?> content)) continue;
+            for (Object b : content) {
+                if (!(b instanceof Map<?, ?> block)) continue;
+                Object type = block.get("type");
+                if (!"thinking".equals(type) && !"redacted_thinking".equals(type)) continue;
+                blocks++;
+                for (String key : List.of("thinking", "signature", "data")) {
+                    if (block.get(key) instanceof String s) chars += s.length();
+                }
+            }
+        }
+        return new long[]{blocks, chars};
+    }
+
     static long charsOf(List<Map<String, Object>> messages, int from, int to) {
         long total = 0;
         for (int i = Math.max(0, from); i < Math.min(to, messages.size()); i++) {

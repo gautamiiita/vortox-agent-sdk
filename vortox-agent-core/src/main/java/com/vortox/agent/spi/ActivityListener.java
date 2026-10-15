@@ -19,6 +19,17 @@ public interface ActivityListener {
     /** Running token totals after an iteration's LLM call — for a live cost/usage meter. */
     default void onTokens(String runId, int iteration, int totalInputTokens, int totalOutputTokens) {}
 
+    /**
+     * What one model call cost and carried — its own tokens (not running totals), how long it took,
+     * and the size of the conversation it was sent, including the thinking kept from earlier turns.
+     * The per-turn record a run's cost can be explained from.
+     */
+    record CallUsage(int inputTokens, int outputTokens, int cacheCreationTokens, int cacheReadTokens,
+                     long durationMs, long conversationChars, int thinkingBlocks, long thinkingChars) {}
+
+    /** Called after each successful model call, with that call's {@link CallUsage}. */
+    default void onCallUsage(String runId, int iteration, CallUsage usage) {}
+
     /** Called just before a tool is dispatched to the {@link ToolExecutor}. */
     default void onToolCall(String runId, String toolName, Map<String, Object> params) {}
 

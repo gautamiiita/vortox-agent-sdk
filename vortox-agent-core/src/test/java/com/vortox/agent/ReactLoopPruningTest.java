@@ -120,6 +120,84 @@ class ReactLoopPruningTest {
         }
     }
 
+    /** A round whose assistant turn also carries a (signed) thinking block. */
+    private static void addThinkingRound(List<Map<String, Object>> messages, int thinkingChars, String result) {
+        addRound(messages, "reasoning", result);
+        @SuppressWarnings("unchecked")
+        List<Object> content = (List<Object>) messages.get(messages.size() - 2).get("content");
+        content.add(0, new LinkedHashMap<>(Map.of("type", "thinking", "thinking", "", "signature", filler(thinkingChars))));
+    }
+
+    private static long thinkingBlocksIn(List<Map<String, Object>> messages) {
+        return ReactLoop.thinkingKept(messages)[0];
+    }
+
+    @Nested
+    @DisplayName("kept thinking (task 940: ~40% of each request, never trimmed)")
+    class Thinking {
+
+        @Test
+        @DisplayName("below the limit, thinking is left alone")
+        void untouchedBelowTheLimit() {
+            List<Map<String, Object>> messages = conversation(2, 500);
+            for (int i = 0; i < 10; i++) addThinkingRound(messages, 5_000, filler(500));
+            String before = snapshot(messages);
+
+            prune(messages);
+
+            assertEquals(before, snapshot(messages));
+        }
+
+        @Test
+        @DisplayName("thinking counts toward the limit, and only the last turns keep theirs")
+        void countsAndIsTrimmed() {
+            // Conversation alone is well under HIGH; the thinking it carries puts it over.
+            List<Map<String, Object>> messages = conversation(2, 500);
+            for (int i = 0; i < 40; i++) addThinkingRound(messages, 8_000, filler(1_000));
+            assertTrue(ReactLoop.charsOf(messages, 0, messages.size()) < 320_000);
+            assertEquals(40, thinkingBlocksIn(messages));
+
+            prune(messages);
+
+            assertEquals(ReactLoop.PRUNE_KEEP_THINKING_TURNS, thinkingBlocksIn(messages));
+            // the most recent assistant turn still has its own
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> last = (List<Map<String, Object>>) messages.get(messages.size() - 2).get("content");
+            assertEquals("thinking", last.get(0).get("type"));
+        }
+
+        @Test
+        @DisplayName("after a trim, the next turns leave the older history byte-identical")
+        void cacheStableAfterTrimming() {
+            List<Map<String, Object>> messages = conversation(2, 500);
+            for (int i = 0; i < 40; i++) addThinkingRound(messages, 8_000, filler(1_000));
+            prune(messages);
+            String after = snapshot(messages);
+
+            addThinkingRound(messages, 8_000, filler(1_000));
+            prune(messages);
+            addThinkingRound(messages, 8_000, filler(1_000));
+            prune(messages);
+
+            assertTrue(snapshot(messages).startsWith(after.substring(0, after.length() - 2)),
+                    "the history before the new rounds was rewritten — the cached prefix was lost");
+        }
+
+        @Test
+        @DisplayName("a turn that held only thinking keeps a placeholder, never empty content")
+        void neverEmpty() {
+            List<Map<String, Object>> messages = new ArrayList<>();
+            messages.add(new LinkedHashMap<>(Map.of("role", "user", "content", "go")));
+            messages.add(new LinkedHashMap<>(Map.of("role", "assistant", "content",
+                    new ArrayList<>(List.of(Map.of("type", "thinking", "thinking", "", "signature", "s")))))) ;
+            messages.add(new LinkedHashMap<>(Map.of("role", "user", "content", "more")));
+
+            ReactLoop.stripOldThinking(messages, 0);
+
+            assertEquals("text", ((List<Map<String, Object>>) messages.get(1).get("content")).get(0).get("type"));
+        }
+    }
+
     @Nested
     @DisplayName("budgeting in characters, not rounds")
     class Budget {

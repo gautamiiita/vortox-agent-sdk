@@ -144,6 +144,11 @@ public final class ReactLoop {
     // is at most LOW + RESIDUE (+ the first message), which leaves real headroom under HIGH.
     private static final int PRUNED_INPUT_VALUE_MAX_CHARS  = 300;
     private static final int PRUNE_RESIDUE_MAX_CHARS       = 60_000;
+    /**
+     * Assistant turns whose thinking survives a prune. The model needs its recent reasoning — and
+     * the turn it is in the middle of must keep its own — not what it thought forty turns ago.
+     */
+    static final int PRUNE_KEEP_THINKING_TURNS = 3;
     private static final String PRUNED_MARKER              = " ... [pruned]";
     static final String DROPPED_ROUNDS_NOTE =
             "[Note: earlier rounds of this run were dropped to fit the context window. "
@@ -1274,7 +1279,13 @@ public final class ReactLoop {
     /** Static and package-visible: it reads no instance state, and this is worth testing directly. */
     @SuppressWarnings("unchecked")
     static void pruneConversationHistory(List<Map<String, Object>> messages) {
-        if (charsOf(messages, 0, messages.size()) <= PRUNE_HIGH_WATER_CHARS) return;
+        // Kept thinking counts: charsOf sees none of it, and on task 940 (2026-10-15) it had grown
+        // to ~183k characters — roughly 40% of a 219k-token request — while the conversation sat at
+        // the limit, untouched. Over the limit, older turns' thinking goes first, then the usual
+        // prune runs in the same pass, so the result lands well under HIGH and stays cache-stable.
+        long thinking = thinkingKept(messages)[1];
+        if (charsOf(messages, 0, messages.size()) + thinking <= PRUNE_HIGH_WATER_CHARS) return;
+        if (thinking > 0) stripOldThinking(messages, PRUNE_KEEP_THINKING_TURNS);
 
         List<Integer> toolResultRounds = new ArrayList<>();
         for (int i = 0; i < messages.size(); i++) {
@@ -1414,13 +1425,37 @@ public final class ReactLoop {
     }
 
     /**
-     * Roughly what messages {@code [from, to)} weigh, in characters.
-     *
-     * <p>Characters rather than tokens on purpose: a tokeniser here would cost more than the
-     * decision is worth, and every threshold this feeds is a rule of thumb about a budget, not an
-     * accounting of one. Roughly four characters to the token is close enough to size a window.
+     * Removes the thinking blocks of every assistant turn but the last {@code keep}. A turn left
+     * with nothing (it held only thinking) gets a short text block: an empty assistant turn is
+     * refused by the API.
      */
-    @SuppressWarnings("unchecked")
+    static void stripOldThinking(List<Map<String, Object>> messages, int keep) {
+        List<Integer> assistantTurns = new ArrayList<>();
+        for (int i = 0; i < messages.size(); i++) {
+            if ("assistant".equals(messages.get(i).get("role"))) assistantTurns.add(i);
+        }
+        for (int t = 0; t < assistantTurns.size() - keep; t++) {
+            int i = assistantTurns.get(t);
+            Map<String, Object> msg = messages.get(i);
+            if (!(msg.get("content") instanceof List<?> content)) continue;
+            List<Object> kept = new ArrayList<>();
+            boolean changed = false;
+            for (Object b : content) {
+                if (b instanceof Map<?, ?> block
+                        && ("thinking".equals(block.get("type")) || "redacted_thinking".equals(block.get("type")))) {
+                    changed = true;
+                    continue;
+                }
+                kept.add(b);
+            }
+            if (!changed) continue;
+            if (kept.isEmpty()) kept.add(Map.of("type", "text", "text", "(earlier reasoning omitted)"));
+            Map<String, Object> copy = new HashMap<>(msg);
+            copy.put("content", kept);
+            messages.set(i, copy);
+        }
+    }
+
     /**
      * How much thinking the conversation carries from earlier turns: {blocks, chars}. A thinking
      * block's weight is its signature (the encrypted reasoning) plus any visible text. Measured so
@@ -1443,6 +1478,14 @@ public final class ReactLoop {
         return new long[]{blocks, chars};
     }
 
+    /**
+     * Roughly what messages {@code [from, to)} weigh, in characters.
+     *
+     * <p>Characters rather than tokens on purpose: a tokeniser here would cost more than the
+     * decision is worth, and every threshold this feeds is a rule of thumb about a budget, not an
+     * accounting of one. Roughly four characters to the token is close enough to size a window.
+     */
+    @SuppressWarnings("unchecked")
     static long charsOf(List<Map<String, Object>> messages, int from, int to) {
         long total = 0;
         for (int i = Math.max(0, from); i < Math.min(to, messages.size()); i++) {

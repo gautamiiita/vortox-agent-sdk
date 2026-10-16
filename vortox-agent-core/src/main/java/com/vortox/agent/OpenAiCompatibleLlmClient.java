@@ -143,6 +143,10 @@ public final class OpenAiCompatibleLlmClient implements LlmClient {
         String role    = (String) msg.get("role");
         Object content = msg.get("content");
 
+        // A system-role message with blocks is an Anthropic tool change (tool_addition): nothing to
+        // say here, where every tool is sent in full from the start.
+        if ("system".equals(role) && content instanceof List) return List.of();
+
         // Plain string content (most user messages)
         if (content instanceof String s) {
             return List.of(Map.of("role", role, "content", s));

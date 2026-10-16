@@ -162,6 +162,11 @@ public final class ReactLoop {
     private final ObjectMapper objectMapper;
     private final Executor executor;
 
+    /** The tools of this run declared deferred, and those load_tools has asked for since the last turn. See ToolLoading. */
+    private volatile Set<String> deferredTools = Set.of();
+    private final Set<String> surfacedTools = ConcurrentHashMap.newKeySet();
+    private final Set<String> pendingLoads = ConcurrentHashMap.newKeySet();
+
     public ReactLoop(AgentConfig config) {
         this(config,
              config.getLlmClient() != null ? config.getLlmClient()
@@ -542,6 +547,15 @@ public final class ReactLoop {
             messages.add(Map.of("role", "user", "content", firstUserContent(userMessage, attachmentBlocks)));
         }
 
+        deferredTools = ToolLoading.deferredNames(tools);
+        surfacedTools.clear();
+        surfacedTools.addAll(ToolLoading.surfaced(messages));
+        pendingLoads.clear();
+        // What a compaction continues from: the task as it was first given.
+        final Map<String, Object> firstUser = messages.isEmpty() ? null : messages.get(0);
+        // The size of the last request plus its reply: what the next request starts from.
+        long lastContext = 0;
+
         List<AgentResult.ToolCall> toolCalls = new ArrayList<>();
         RepeatedFailureGuard repeats = new RepeatedFailureGuard();
         int totalIn = 0, totalOut = 0, totalCC = 0, totalCR = 0;
@@ -594,6 +608,8 @@ public final class ReactLoop {
             totalOut += response.getOutputTokens();
             totalCC  += response.getCacheCreationInputTokens();
             totalCR  += response.getCacheReadInputTokens();
+            lastContext = (long) response.getInputTokens() + response.getCacheCreationInputTokens()
+                    + response.getCacheReadInputTokens() + response.getOutputTokens();
             listener.onTokens(runId, iterations, totalIn, totalOut);
             long[] thinking = thinkingKept(messages);
             listener.onCallUsage(runId, iterations, new ActivityListener.CallUsage(
@@ -637,7 +653,11 @@ public final class ReactLoop {
                 }
                 messages.add(Map.of("role", "assistant", "content", assistantContent));
                 messages.add(Map.of("role", "user", "content", truncatedTurnReply(assistantContent)));
-                pruneConversationHistory(messages);
+                long[] spent = compactIfDue(messages, firstUser, lastContext, sysPrompt, tools, runId,
+                        iterations, maxIterations, listener, tag);
+                if (spent != null) {
+                    totalIn += (int) spent[0]; totalOut += (int) spent[1]; totalCC += (int) spent[2]; totalCR += (int) spent[3];
+                }
                 // A reply that keeps being cut off at the same size is the same stuck loop.
                 if (repeats.stopReason() != null) {
                     log.warn("ReactLoop [{}] {}", tag, repeats.stopReason());
@@ -912,7 +932,18 @@ public final class ReactLoop {
             }
 
             messages.add(Map.of("role", "user", "content", toolResults));
-            pruneConversationHistory(messages);
+            // Tools load_tools asked for this turn, surfaced for the next one — appended, so the cache holds.
+            if (!pendingLoads.isEmpty()) {
+                List<String> surfacing = new ArrayList<>(pendingLoads);
+                pendingLoads.clear();
+                messages.add(ToolLoading.additionMessage(surfacing));
+                surfacedTools.addAll(surfacing);
+            }
+            long[] spent = compactIfDue(messages, firstUser, lastContext, sysPrompt, tools, runId,
+                    iterations, maxIterations, listener, tag);
+            if (spent != null) {
+                totalIn += (int) spent[0]; totalOut += (int) spent[1]; totalCC += (int) spent[2]; totalCR += (int) spent[3];
+            }
 
             if (repeats.stopReason() != null) {
                 log.warn("ReactLoop [{}] {}", tag, repeats.stopReason());
@@ -933,6 +964,45 @@ public final class ReactLoop {
         return r;
     }
 
+    // ── Compaction ────────────────────────────────────────────────────────────
+
+    /**
+     * Compacts the conversation in place when the next request would reach the configured context size
+     * (see {@link Compaction}): the model summarises its own conversation, and the run continues from the
+     * first task message plus that summary. Returns the summary call's usage {in, out, cacheWrite,
+     * cacheRead}, or null when nothing was due. A summary that cannot be had falls back to the old prune,
+     * so a run is never left over its limit.
+     */
+    private long[] compactIfDue(List<Map<String, Object>> messages, Map<String, Object> firstUser, long lastContext,
+                                String sysPrompt, List<Map<String, Object>> tools, String runId,
+                                int iteration, int maxIterations, ActivityListener listener, String tag) {
+        // The last request and its reply, plus what this turn added on top of them (~3 chars a token).
+        long estimate = lastContext + charsOf(messages, Math.max(0, messages.size() - 2), messages.size()) / 3;
+        if (!Compaction.due(estimate, config.getCompactAtTokens())) return null;
+
+        log.info("ReactLoop [{}] compacting at ~{} tokens (threshold {})", tag, estimate, config.getCompactAtTokens());
+        AnthropicClient.ClaudeResponse r = client.send(sysPrompt, Compaction.summaryRequest(messages), tools,
+                config.getApiKey(), config.getModel());
+        long[] usage = r.hasError() ? new long[4] : new long[] {
+                r.getInputTokens(), r.getOutputTokens(), r.getCacheCreationInputTokens(), r.getCacheReadInputTokens()};
+        String summary = r.hasError() ? null : r.getTextContent();
+        if (summary == null || summary.isBlank()) {
+            log.warn("ReactLoop [{}] compaction got no summary ({}) — pruning instead", tag,
+                    r.hasError() ? r.getError() : "the reply had no text");
+            pruneConversationHistory(messages);
+            listener.onIteration(runId, iteration, maxIterations,
+                    "Context near its limit; no summary could be written, so old tool results were shortened");
+            return usage;
+        }
+        Set<String> loaded = new LinkedHashSet<>(ToolLoading.surfaced(messages));
+        List<Map<String, Object>> compacted = Compaction.compacted(firstUser, summary, loaded);
+        messages.clear();
+        messages.addAll(compacted);
+        listener.onIteration(runId, iteration, maxIterations, "Context compacted at ~" + estimate
+                + " tokens: continuing from a " + summary.length() + "-character summary");
+        return usage;
+    }
+
     // ── Tool dispatch ─────────────────────────────────────────────────────────
 
     private String dispatchTool(AnthropicClient.ContentBlock toolUse,
@@ -940,6 +1010,11 @@ public final class ReactLoop {
                                  MemoryStore memory) {
         String name  = toolUse.getToolName();
         Map<String, Object> input = toolUse.getToolInput();
+
+        // load_tools — answered here; what it loads is surfaced after this turn's results (runInternal)
+        if (ToolLoading.NAME.equals(name) && !deferredTools.isEmpty()) {
+            return ToolLoading.load(input != null ? input.get("names") : null, deferredTools, surfacedTools, pendingLoads);
+        }
 
         // execute_command — built-in, runs on host
         if (EXECUTE_COMMAND_TOOL.equals(name) && config.isEnableExecuteCommand()) {
@@ -1131,6 +1206,9 @@ public final class ReactLoop {
         if (config.isEnableExecuteCommand() && seen.add(EXECUTE_COMMAND_TOOL)) all.add(executeCommandToolDef());
         if (config.isEnableSpawnTask() && config.getTaskSpawner() != null && seen.add(SPAWN_TASK_TOOL))
             all.add(spawnTaskToolDef());
+
+        // The way to the deferred tools, whenever there are any.
+        if (!ToolLoading.deferredNames(all).isEmpty() && seen.add(ToolLoading.NAME)) all.add(ToolLoading.definition(all));
 
         return all;
     }

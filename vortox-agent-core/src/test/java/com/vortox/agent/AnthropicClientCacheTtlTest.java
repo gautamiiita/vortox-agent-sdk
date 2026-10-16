@@ -73,6 +73,47 @@ class AnthropicClientCacheTtlTest {
         assertEquals(Map.of("type", "ephemeral"), block.get("cache_control"));
     }
 
+    // ── deferred tools ────────────────────────────────────────────────────────
+
+    private static List<Map<String, Object>> toolsWithDeferred() {
+        Map<String, Object> deferred = new java.util.LinkedHashMap<>(Map.of("name", "browser_navigate",
+                "description", "browse", "input_schema", Map.of("type", "object")));
+        deferred.put("defer_loading", true);
+        return List.of(Map.of("name", "grep", "description", "search", "input_schema", Map.of("type", "object")), deferred);
+    }
+
+    @Test
+    @DisplayName("deferred tools go out with the tool-changes beta, and the cache marker on the last loaded tool")
+    void deferredToolsCarryTheBeta() throws Exception {
+        AnthropicClient c = new AnthropicClient(MAPPER, "claude-opus-5", 1024, serve(false), 2000);
+        assertFalse(c.send("sys", hi(), toolsWithDeferred(), "sk-test", "claude-opus-5").hasError());
+        assertTrue(betas.get(0).contains(AnthropicClient.BETA_TOOL_CHANGES), betas.get(0));
+        assertTrue(requests.get(0).contains("\"defer_loading\":true"));
+        String toolsJson = requests.get(0).substring(requests.get(0).indexOf("\"tools\""));
+        assertEquals(1, count(toolsJson, ONE_HOUR), toolsJson);
+        assertTrue(toolsJson.indexOf(ONE_HOUR) < toolsJson.indexOf("browser_navigate"), "the marker is on grep: " + toolsJson);
+
+        assertFalse(c.send("sys", hi(), tools(), "sk-test", "claude-opus-5").hasError());
+        assertFalse(betas.get(1).contains(AnthropicClient.BETA_TOOL_CHANGES), "no deferred tools, no beta");
+    }
+
+    @Test
+    @DisplayName("an endpoint that refuses deferral gets every tool in full and no tool changes, from then on")
+    void refusedDeferralSendsEverythingInFull() throws Exception {
+        AnthropicClient c = new AnthropicClient(MAPPER, "claude-opus-5", 1024, serve(false, true), 2000);
+        List<Map<String, Object>> msgs = new ArrayList<>(hi());
+        msgs.add(ToolLoading.additionMessage(List.of("browser_navigate")));
+
+        assertFalse(c.send("sys", msgs, toolsWithDeferred(), "sk-test", "claude-opus-5").hasError());
+        assertTrue(requests.get(0).contains("defer_loading"));
+        assertFalse(requests.get(1).contains("defer_loading"));
+        assertFalse(requests.get(1).contains("tool_addition"));
+        assertFalse(betas.get(1).contains(AnthropicClient.BETA_TOOL_CHANGES));
+
+        assertFalse(c.send("sys", msgs, toolsWithDeferred(), "sk-test", "claude-opus-5").hasError());
+        assertEquals(3, requests.size(), "no refused call on the next turn");
+    }
+
     // ── harness ───────────────────────────────────────────────────────────────
 
     private static int count(String s, String needle) {
@@ -92,13 +133,25 @@ class AnthropicClientCacheTtlTest {
     }
 
     /** Answers with a short stream; refuses a cache ttl with a 400 when told to. */
-    private String serve(boolean refuseTtl) throws IOException {
+    private String serve(boolean refuseTtl) throws IOException { return serve(refuseTtl, false); }
+
+    private final List<String> betas = new CopyOnWriteArrayList<>();
+
+    private String serve(boolean refuseTtl, boolean refuseDeferral) throws IOException {
         server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.setExecutor(Executors.newCachedThreadPool(r -> { Thread t = new Thread(r); t.setDaemon(true); return t; }));
         server.createContext("/v1/messages", exchange -> {
             try {
                 String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
                 requests.add(body);
+                betas.add(String.valueOf(exchange.getRequestHeaders().getFirst("anthropic-beta")));
+                if (refuseDeferral && body.contains("defer_loading")) {
+                    byte[] err = ("{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":"
+                            + "\"tools.1.defer_loading: Extra inputs are not permitted\"}}").getBytes(StandardCharsets.UTF_8);
+                    exchange.sendResponseHeaders(400, err.length);
+                    try (OutputStream out = exchange.getResponseBody()) { out.write(err); }
+                    return;
+                }
                 if (refuseTtl && body.contains("\"ttl\"")) {
                     byte[] err = ("{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":"
                             + "\"system.0.cache_control.ttl: Extra inputs are not permitted\"}}").getBytes(StandardCharsets.UTF_8);

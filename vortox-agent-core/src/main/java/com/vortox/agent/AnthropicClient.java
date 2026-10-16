@@ -197,6 +197,11 @@ public final class AnthropicClient implements LlmClient {
             // Two settings a model may refuse, and neither is worth failing a run over. A model
             // that does not take effort gets requests without it from here on; one that will not
             // accept the thinking blocks sent back gets this request without them.
+            if (refused(r, "defer_loading", "tool_addition", "tool_reference", BETA_TOOL_CHANGES, "'system'", "\"system\"")
+                    && hasDeferred(t) && withoutDeferredTools.compareAndSet(false, true)) {
+                log.warn("Model {} refused deferred tools ({}) — sending every tool in full", mdl, r.getError());
+                r = retry(call);
+            }
             if (refused(r, "ttl") && withoutLongCache.compareAndSet(false, true)) {
                 log.warn("Model {} refused the one-hour cache ({}) — using the default cache lifetime", mdl, r.getError());
                 r = retry(call);
@@ -309,7 +314,7 @@ public final class AnthropicClient implements LlmClient {
                         .uri(URI.create(apiUrl))
                         .timeout(Duration.ofSeconds(timeoutSeconds))
                         .POST(HttpRequest.BodyPublishers.ofString(json))
-                        .headers(headers(apiKey, false))
+                        .headers(headers(apiKey, false, tools))
                         .build(),
                 HttpResponse.BodyHandlers.ofString());
 
@@ -371,7 +376,7 @@ public final class AnthropicClient implements LlmClient {
                         .uri(URI.create(apiUrl))
                         .timeout(Duration.ofSeconds(ceilingSeconds))
                         .POST(HttpRequest.BodyPublishers.ofString(json))
-                        .headers(headers(apiKey, true))
+                        .headers(headers(apiKey, true, tools))
                         .build(),
                 handler);
         // A failure before any body arrives (DNS, refused connection) never reaches the subscriber.
@@ -603,7 +608,7 @@ public final class AnthropicClient implements LlmClient {
                         .uri(URI.create(apiUrl))
                         .timeout(Duration.ofSeconds(timeoutSeconds))
                         .POST(HttpRequest.BodyPublishers.ofString(json))
-                        .headers(headers(apiKey, true))
+                        .headers(headers(apiKey, true, tools))
                         .build(),
                 HttpResponse.BodyHandlers.ofLines());
 
@@ -668,15 +673,20 @@ public final class AnthropicClient implements LlmClient {
                 "type", "text", "text", sysText,
                 "cache_control", cache)));
 
+        boolean deferring = deferring(tools);
+        List<Map<String, Object>> sentMessages = deferring ? messages : withoutToolChanges(messages);
         List<Map<String, Object>> effectiveMessages = (oauth && !blank(systemPrompt))
-                ? oauthMessages(messages, systemPrompt) : messages;
+                ? oauthMessages(sentMessages, systemPrompt) : sentMessages;
         b.put("messages", withCacheBreakpoint(effectiveMessages, cache));
 
         if (tools != null && !tools.isEmpty()) {
-            List<Map<String, Object>> cached = new ArrayList<>(tools);
-            Map<String, Object> last = new LinkedHashMap<>(cached.get(cached.size() - 1));
+            List<Map<String, Object>> cached = new ArrayList<>(deferring ? tools : withoutDeferral(tools));
+            // On the last tool that is loaded: a deferred one is not in the cached prefix.
+            int at = cached.size() - 1;
+            while (at > 0 && Boolean.TRUE.equals(cached.get(at).get("defer_loading"))) at--;
+            Map<String, Object> last = new LinkedHashMap<>(cached.get(at));
             last.put("cache_control", cache);
-            cached.set(cached.size() - 1, last);
+            cached.set(at, last);
             b.put("tools", cached);
         }
 
@@ -757,22 +767,75 @@ public final class AnthropicClient implements LlmClient {
         return "thinking".equals(type) || "redacted_thinking".equals(type);
     }
 
-    private String[] headers(String apiKey, boolean streaming) {
+    private String[] headers(String apiKey, boolean streaming, List<Map<String, Object>> tools) {
         List<String> h = new ArrayList<>(List.of(
                 "content-type", "application/json",
                 "anthropic-version", ANTHROPIC_VERSION));
         if (streaming) { h.add("accept"); h.add("text/event-stream"); }
+        String toolChanges = deferring(tools) ? "," + BETA_TOOL_CHANGES : "";
         if (isOAuth(apiKey)) {
             h.addAll(List.of(
                     "Authorization",    "Bearer " + apiKey,
-                    "anthropic-beta",   BETA_OAUTH,
+                    "anthropic-beta",   BETA_OAUTH + toolChanges,
                     "user-agent",       "claude-cli/" + CLAUDE_CODE_VER + " (external, cli)",
                     "x-app",            "cli",
                     "anthropic-dangerous-direct-browser-access", "true"));
         } else {
-            h.addAll(List.of("x-api-key", apiKey, "anthropic-beta", BETA_REGULAR));
+            h.addAll(List.of("x-api-key", apiKey, "anthropic-beta", BETA_REGULAR + toolChanges));
         }
         return h.toArray(String[]::new);
+    }
+
+    // ── Deferred tools ────────────────────────────────────────────────────────
+    //
+    // A run is offered ~46 tools and uses a handful: the browser, Docker, PR and task-spawning tools
+    // were ~10k tokens on every turn of a task that never touched them. Those are declared with
+    // "defer_loading": true — known to the request, not loaded into the model's context — and the loop
+    // surfaces one when the agent asks (ReactLoop's load_tools), with a tool_addition block on a
+    // system-role message appended to the conversation. Appended, not swapped in, so the cache holds;
+    // that is the point of the beta. An endpoint that refuses it gets every tool in full from then on.
+
+    static final String BETA_TOOL_CHANGES = "mid-conversation-tool-changes-2026-07-01";
+
+    /** Set once the endpoint has refused deferred tools: every tool is sent in full from then on. */
+    private final java.util.concurrent.atomic.AtomicBoolean withoutDeferredTools = new java.util.concurrent.atomic.AtomicBoolean();
+
+    /** Whether this request declares deferred tools, and this client still sends them as such. */
+    boolean deferring(List<Map<String, Object>> tools) {
+        return !withoutDeferredTools.get() && hasDeferred(tools);
+    }
+
+    static boolean hasDeferred(List<Map<String, Object>> tools) {
+        if (tools == null) return false;
+        for (Map<String, Object> t : tools) if (t != null && Boolean.TRUE.equals(t.get("defer_loading"))) return true;
+        return false;
+    }
+
+    /** The tools with every one in full — no defer_loading flag. */
+    static List<Map<String, Object>> withoutDeferral(List<Map<String, Object>> tools) {
+        if (!hasDeferred(tools)) return tools;
+        List<Map<String, Object>> out = new ArrayList<>(tools.size());
+        for (Map<String, Object> t : tools) {
+            if (t != null && t.containsKey("defer_loading")) {
+                Map<String, Object> copy = new LinkedHashMap<>(t);
+                copy.remove("defer_loading");
+                out.add(copy);
+            } else {
+                out.add(t);
+            }
+        }
+        return out;
+    }
+
+    /** The conversation without its system-role tool-change messages, for a request that defers nothing. */
+    static List<Map<String, Object>> withoutToolChanges(List<Map<String, Object>> messages) {
+        if (messages == null) return null;
+        boolean any = false;
+        for (Map<String, Object> m : messages) if (m != null && "system".equals(m.get("role"))) { any = true; break; }
+        if (!any) return messages;
+        List<Map<String, Object>> out = new ArrayList<>(messages.size());
+        for (Map<String, Object> m : messages) if (m == null || !"system".equals(m.get("role"))) out.add(m);
+        return out;
     }
 
     @SuppressWarnings("unchecked")
@@ -829,7 +892,10 @@ public final class AnthropicClient implements LlmClient {
                                                          Map<String, Object> cacheControl) {
         if (messages == null || messages.isEmpty()) return messages;
 
+        // On the last user or assistant turn: a trailing system-role message carries tool changes,
+        // whose blocks are not cache points.
         int lastIdx = messages.size() - 1;
+        while (lastIdx > 0 && messages.get(lastIdx) != null && "system".equals(messages.get(lastIdx).get("role"))) lastIdx--;
         Map<String, Object> lastMessage = new LinkedHashMap<>(messages.get(lastIdx));
         Object content = lastMessage.get("content");
 

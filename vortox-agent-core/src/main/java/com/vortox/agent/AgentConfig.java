@@ -76,6 +76,14 @@ public final class AgentConfig {
      * tool that runs a sub-agent of its own takes minutes by design; see {@link ReactLoop#toolWaitSeconds}.
      */
     private final Map<String, Integer> toolWaitSeconds;
+    /**
+     * The context size, in tokens, at which the loop compacts the conversation into a summary and
+     * continues from it. Nothing is removed below it: every turn appends, so the cache holds. 0 = never.
+     */
+    private final int compactAtTokens;
+
+    /** Where compaction starts by default: close to, and safely under, a 1M-token context window. */
+    public static final int DEFAULT_COMPACT_AT_TOKENS = 800_000;
 
     private AgentConfig(Builder b) {
         this.agentId             = b.agentId;
@@ -100,6 +108,7 @@ public final class AgentConfig {
         this.taskSpawner         = b.taskSpawner;
         this.toolGate            = b.toolGate != null ? b.toolGate : ToolGate.OPEN;
         this.toolWaitSeconds     = Map.copyOf(b.toolWaitSeconds);
+        this.compactAtTokens     = b.compactAtTokens;
     }
 
     public static Builder builder() { return new Builder(); }
@@ -127,6 +136,7 @@ public final class AgentConfig {
     public ControlHook getControlHook()    { return controlHook; }
     public TaskSpawner getTaskSpawner()    { return taskSpawner; }
     public ToolGate getToolGate()          { return toolGate; }
+    public int getCompactAtTokens()        { return compactAtTokens; }
     /** The wait declared for {@code toolName} with {@link Builder#toolWait}, or null for the default. */
     public Integer getToolWaitSeconds(String toolName) {
         return toolName == null ? null : toolWaitSeconds.get(toolName);
@@ -159,6 +169,10 @@ public final class AgentConfig {
         private TaskSpawner taskSpawner      = null;
         private ToolGate toolGate            = ToolGate.OPEN;
         private final Map<String, Integer> toolWaitSeconds = new java.util.HashMap<>();
+        private int compactAtTokens          = DEFAULT_COMPACT_AT_TOKENS;
+
+        /** See {@link AgentConfig#getCompactAtTokens()}. 0 turns compaction off. */
+        public Builder compactAtTokens(int tokens)             { this.compactAtTokens = Math.max(0, tokens); return this; }
 
         /** Identifies the agent in the log lines this run emits. Optional. */
         public Builder agentId(String agentId)                 { this.agentId = agentId; return this; }

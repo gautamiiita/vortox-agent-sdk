@@ -27,7 +27,8 @@ import static org.junit.jupiter.api.Assertions.*;
 class AnthropicClientCacheTtlTest {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
-    private static final String ONE_HOUR = "\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"1h\"}";
+    // Requests serialise with sorted keys (2026-10-16): ttl before type.
+    private static final String ONE_HOUR = "\"cache_control\":{\"ttl\":\"1h\",\"type\":\"ephemeral\"}";
     private static final String DEFAULT  = "\"cache_control\":{\"type\":\"ephemeral\"}";
 
     private HttpServer server;

@@ -70,7 +70,8 @@ final class FreshCheck {
         String message = "## The task as written\n\n" + check.requirements().strip()
                 + "\n\n## Evidence of what was done\n\n" + evidence;
 
-        AnthropicClient.ClaudeResponse response = client.send(SYSTEM_PROMPT,
+        // One-shot: the evidence changes after every send-back, so a cache write here is never read.
+        AnthropicClient.ClaudeResponse response = client.sendWithoutCache(SYSTEM_PROMPT,
                 List.of(Map.of("role", "user", "content", message)), List.of(), apiKey, model);
         Usage usage = new Usage(response.getInputTokens(), response.getOutputTokens(),
                 response.getCacheCreationInputTokens(), response.getCacheReadInputTokens());

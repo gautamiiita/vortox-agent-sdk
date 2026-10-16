@@ -30,4 +30,17 @@ public interface LlmClient {
             List<Map<String, Object>> tools,
             String apiKey,
             String model);
+
+    /**
+     * A one-shot call whose request is never read again: no prompt-cache markers, so it is billed as
+     * plain input rather than as a cache write. Clients without caching just send.
+     */
+    default AnthropicClient.ClaudeResponse sendWithoutCache(
+            String systemPrompt,
+            List<Map<String, Object>> messages,
+            List<Map<String, Object>> tools,
+            String apiKey,
+            String model) {
+        return send(systemPrompt, messages, tools, apiKey, model);
+    }
 }

@@ -157,6 +157,20 @@ public final class ReactLoop {
     /** A task title is free text; keep the log line readable rather than letting one run own it. */
     private static final int RUN_LABEL_MAX_CHARS = 70;
 
+    /**
+     * How much of a tool's raw output the run's record of the call keeps (AgentResult.ToolCall).
+     * Plain text — a file read, mostly — is cut; a JSON result is kept whole up to a generous limit,
+     * because a host may read a field out of it (the sidecar takes a produced file's path from it).
+     */
+    static final int TOOL_CALL_OUTPUT_KEPT_CHARS = 2_000;
+    static final int TOOL_CALL_JSON_KEPT_CHARS   = 64_000;
+
+    static String capped(String s, int max) {
+        if (s == null) return null;
+        int limit = s.startsWith("{") ? Math.max(max, TOOL_CALL_JSON_KEPT_CHARS) : max;
+        return s.length() <= limit ? s : s.substring(0, limit) + " … [" + (s.length() - limit) + " more chars]";
+    }
+
     private final AgentConfig config;
     private final LlmClient client;
     private final ObjectMapper objectMapper;
@@ -555,6 +569,8 @@ public final class ReactLoop {
         final Map<String, Object> firstUser = messages.isEmpty() ? null : messages.get(0);
         // The size of the last request plus its reply: what the next request starts from.
         long lastContext = 0;
+        // The conversation's size in characters so far {chars, messages counted} — see onCallUsage below.
+        final long[] counted = {0, 0};
 
         List<AgentResult.ToolCall> toolCalls = new ArrayList<>();
         RepeatedFailureGuard repeats = new RepeatedFailureGuard();
@@ -612,10 +628,16 @@ public final class ReactLoop {
                     + response.getCacheReadInputTokens() + response.getOutputTokens();
             listener.onTokens(runId, iterations, totalIn, totalOut);
             long[] thinking = thinkingKept(messages);
+            // Counted as the conversation grows, not walked whole every turn: near the compaction
+            // threshold a full walk stringified megabytes of past tool inputs per turn. A shorter list
+            // than last time means it was rewritten (compaction): count it again from the start.
+            if (counted[1] > messages.size()) { counted[0] = 0; counted[1] = 0; }
+            counted[0] += charsOf(messages, (int) counted[1], messages.size());
+            counted[1] = messages.size();
             listener.onCallUsage(runId, iterations, new ActivityListener.CallUsage(
                     response.getInputTokens(), response.getOutputTokens(),
                     response.getCacheCreationInputTokens(), response.getCacheReadInputTokens(),
-                    callMs, charsOf(messages, 0, messages.size()), (int) thinking[0], thinking[1]));
+                    callMs, counted[0], (int) thinking[0], thinking[1]));
 
             // What actually went over the wire this turn. Tagged like every other line, so a reader
             // can follow one agent's conversation about one task through a log holding many.
@@ -657,6 +679,7 @@ public final class ReactLoop {
                         iterations, maxIterations, listener, tag);
                 if (spent != null) {
                     totalIn += (int) spent[0]; totalOut += (int) spent[1]; totalCC += (int) spent[2]; totalCR += (int) spent[3];
+                    counted[0] = 0; counted[1] = 0;   // rewritten: count it again
                 }
                 // A reply that keeps being cut off at the same size is the same stuck loop.
                 if (repeats.stopReason() != null) {
@@ -871,10 +894,14 @@ public final class ReactLoop {
             // ── Execute all tools in parallel ─────────────────────────────────
             record ToolOutcome(String result, boolean success, long durationMs) {}
             record IndexedOutcome(AnthropicClient.ContentBlock toolUse,
-                                   CompletableFuture<ToolOutcome> future) {}
+                                   Future<ToolOutcome> future) {}
 
+            // One clock for the whole batch: each tool's wait is measured from when the batch was
+            // dispatched, not from when the previous get() returned — two hung tools used to cost
+            // twice the timeout. And a FutureTask, so cancelling a timed-out tool interrupts it.
+            final long dispatchedAt = System.currentTimeMillis();
             List<IndexedOutcome> futures = uses.stream().map(toolUse -> {
-                CompletableFuture<ToolOutcome> f = CompletableFuture.supplyAsync(() -> {
+                FutureTask<ToolOutcome> f = new FutureTask<>(() -> {
                     long t0 = System.currentTimeMillis();
                     listener.onToolCall(runId, toolUse.getToolName(), toolUse.getToolInput());
                     try {
@@ -892,7 +919,8 @@ public final class ReactLoop {
                         listener.onToolResult(runId, toolUse.getToolName(), false, dur);
                         return new ToolOutcome("Tool execution failed: " + e.getMessage(), false, dur);
                     }
-                }, executor);
+                });
+                executor.execute(f);
                 return new IndexedOutcome(toolUse, f);
             }).toList();
 
@@ -902,8 +930,9 @@ public final class ReactLoop {
                 ToolOutcome outcome;
                 int waitSec = toolWaitSeconds(config.getToolWaitSeconds(toolUse.getToolName()),
                         toolUse.getToolInput());
+                long remainingMs = Math.max(1, waitSec * 1000L - (System.currentTimeMillis() - dispatchedAt));
                 try {
-                    outcome = indexed.future().get(waitSec, TimeUnit.SECONDS);
+                    outcome = indexed.future().get(remainingMs, TimeUnit.MILLISECONDS);
                 } catch (TimeoutException te) {
                     indexed.future().cancel(true);
                     listener.onError(runId, toolUse.getToolName() + " timed out after " + waitSec + "s");
@@ -917,8 +946,10 @@ public final class ReactLoop {
                     outcome = new ToolOutcome("Tool execution failed: " + msg, false, 0);
                 }
 
+                // A record of the call, not a second copy of its output: the conversation already holds
+                // what the model saw, and a long run kept every raw result alongside it.
                 toolCalls.add(new AgentResult.ToolCall(
-                        toolUse.getToolName(), toolUse.getToolInput(), outcome.result(),
+                        toolUse.getToolName(), toolUse.getToolInput(), capped(outcome.result(), TOOL_CALL_OUTPUT_KEPT_CHARS),
                         outcome.success(), outcome.durationMs()));
 
                 Map<String, Object> tr = new HashMap<>();
@@ -943,6 +974,7 @@ public final class ReactLoop {
                     iterations, maxIterations, listener, tag);
             if (spent != null) {
                 totalIn += (int) spent[0]; totalOut += (int) spent[1]; totalCC += (int) spent[2]; totalCR += (int) spent[3];
+                    counted[0] = 0; counted[1] = 0;   // rewritten: count it again
             }
 
             if (repeats.stopReason() != null) {

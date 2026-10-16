@@ -306,7 +306,7 @@ public final class AnthropicClient implements LlmClient {
     private ClaudeResponse callApi(String systemPrompt, List<Map<String, Object>> messages,
                                     List<Map<String, Object>> tools, int maxTokens,
                                     String apiKey, String model, int timeoutSeconds) throws Exception {
-        String json = objectMapper.writeValueAsString(body(systemPrompt, messages, tools, maxTokens, apiKey, model, false));
+        String json = requestJson(body(systemPrompt, messages, tools, maxTokens, apiKey, model, false));
         log.debug("Claude API — model:{} messages:{} tools:{}", model, messages.size(), tools != null ? tools.size() : 0);
 
         HttpResponse<String> res = HTTP.send(
@@ -347,7 +347,7 @@ public final class AnthropicClient implements LlmClient {
     ClaudeResponse callApiStreamed(String systemPrompt, List<Map<String, Object>> messages,
                                    List<Map<String, Object>> tools, int maxTokens,
                                    String apiKey, String model, int ceilingSeconds) throws Exception {
-        String json = objectMapper.writeValueAsString(body(systemPrompt, messages, tools, maxTokens, apiKey, model, true));
+        String json = requestJson(body(systemPrompt, messages, tools, maxTokens, apiKey, model, true));
         log.debug("Claude API (streamed) — model:{} messages:{} tools:{}", model, messages.size(), tools != null ? tools.size() : 0);
 
         java.util.concurrent.BlockingQueue<Object> queue = new java.util.concurrent.LinkedBlockingQueue<>();
@@ -601,7 +601,7 @@ public final class AnthropicClient implements LlmClient {
                             String apiKey, String model, int timeoutSeconds,
                             Consumer<String> onDelta,
                             Consumer<ClaudeResponse> onComplete) throws Exception {
-        String json = objectMapper.writeValueAsString(body(systemPrompt, messages, tools, maxTokens, apiKey, model, true));
+        String json = requestJson(body(systemPrompt, messages, tools, maxTokens, apiKey, model, true));
 
         HttpResponse<java.util.stream.Stream<String>> res = HTTP.send(
                 HttpRequest.newBuilder()
@@ -667,26 +667,30 @@ public final class AnthropicClient implements LlmClient {
         b.put("model",      model);
         b.put("max_tokens", maxTokens);
 
+        // A one-shot call (sendWithoutCache) carries no markers at all: nothing would read them back.
+        boolean uncached = UNCACHED.get();
         Map<String, Object> cache = cacheControl();
         String sysText = oauth ? CLAUDE_CODE_SYS : (systemPrompt != null ? systemPrompt : "");
-        b.put("system", List.of(Map.of(
-                "type", "text", "text", sysText,
-                "cache_control", cache)));
+        b.put("system", List.of(uncached
+                ? Map.of("type", "text", "text", sysText)
+                : Map.of("type", "text", "text", sysText, "cache_control", cache)));
 
         boolean deferring = deferring(tools);
         List<Map<String, Object>> sentMessages = deferring ? messages : withoutToolChanges(messages);
         List<Map<String, Object>> effectiveMessages = (oauth && !blank(systemPrompt))
                 ? oauthMessages(sentMessages, systemPrompt) : sentMessages;
-        b.put("messages", withCacheBreakpoint(effectiveMessages, cache));
+        b.put("messages", uncached ? effectiveMessages : withCacheBreakpoints(effectiveMessages, cache));
 
         if (tools != null && !tools.isEmpty()) {
             List<Map<String, Object>> cached = new ArrayList<>(deferring ? tools : withoutDeferral(tools));
-            // On the last tool that is loaded: a deferred one is not in the cached prefix.
-            int at = cached.size() - 1;
-            while (at > 0 && Boolean.TRUE.equals(cached.get(at).get("defer_loading"))) at--;
-            Map<String, Object> last = new LinkedHashMap<>(cached.get(at));
-            last.put("cache_control", cache);
-            cached.set(at, last);
+            if (!uncached) {
+                // On the last tool that is loaded: a deferred one is not in the cached prefix.
+                int at = cached.size() - 1;
+                while (at > 0 && Boolean.TRUE.equals(cached.get(at).get("defer_loading"))) at--;
+                Map<String, Object> last = new LinkedHashMap<>(cached.get(at));
+                last.put("cache_control", cache);
+                cached.set(at, last);
+            }
             b.put("tools", cached);
         }
 
@@ -718,6 +722,38 @@ public final class AnthropicClient implements LlmClient {
         CACHE_ONE_HOUR = java.util.Collections.unmodifiableMap(m);
     }
     static final Map<String, Object> CACHE_DEFAULT  = Map.of("type", "ephemeral");
+
+    /**
+     * A request's JSON, with every object's keys in sorted order (2026-10-16). A cache matches bytes:
+     * the tool schemas and content blocks are built with {@code Map.of}, whose iteration order is
+     * seeded per JVM, so after a restart the same conversation serialised differently and its cached
+     * prefix missed. Sorted, a given request has one rendering everywhere.
+     */
+    private String requestJson(Object body) throws com.fasterxml.jackson.core.JsonProcessingException {
+        return objectMapper.writer()
+                .with(com.fasterxml.jackson.databind.SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS)
+                .writeValueAsString(body);
+    }
+
+    /** Set by {@link #sendWithoutCache} for the request it makes; read by body(). */
+    private static final ThreadLocal<Boolean> UNCACHED = ThreadLocal.withInitial(() -> false);
+
+    /**
+     * A ONE-SHOT call: as {@link #send}, with no cache markers. A request that is never read again —
+     * the fresh-context completion check, whose evidence of up to 300k characters changes after every
+     * send-back — paid the cache WRITE price (2x at the one-hour lifetime) for an entry nobody reads,
+     * against 1x for plain input.
+     */
+    @Override
+    public ClaudeResponse sendWithoutCache(String systemPrompt, List<Map<String, Object>> messages,
+                                           List<Map<String, Object>> tools, String apiKey, String model) {
+        UNCACHED.set(true);
+        try {
+            return send(systemPrompt, messages, tools, apiKey, model);
+        } finally {
+            UNCACHED.remove();
+        }
+    }
 
     /** Set once the endpoint has refused {@code cache_control.ttl}: this client sends the default from then on. */
     private final java.util.concurrent.atomic.AtomicBoolean withoutLongCache = new java.util.concurrent.atomic.AtomicBoolean();
@@ -886,6 +922,31 @@ public final class AnthropicClient implements LlmClient {
         return withCacheBreakpoint(messages, CACHE_DEFAULT);
     }
 
+    /**
+     * The tool loop's markers: the conversation's tail, and the end of the previous user turn too.
+     *
+     * <p>The API finds a cached prefix by looking back about 20 content blocks from a marker. One turn
+     * adds an assistant turn (thinking, text, a tool_use per call) and a user turn (a tool_result per
+     * call); with nine or more parallel calls the previous turn's marker fell out of that window and the
+     * whole conversation was written again. A second marker at the previous turn's end keeps a read
+     * point inside it. Four markers in all with the system prompt and the tools — the API's limit.
+     */
+    static List<Map<String, Object>> withCacheBreakpoints(List<Map<String, Object>> messages,
+                                                          Map<String, Object> cacheControl) {
+        List<Map<String, Object>> out = withCacheBreakpoint(messages, cacheControl);
+        if (out == null || out.size() < 3) return out;
+        // The user turn before the newest assistant turn, if any.
+        int lastAssistant = -1;
+        for (int i = out.size() - 1; i >= 0; i--) if ("assistant".equals(out.get(i).get("role"))) { lastAssistant = i; break; }
+        int prevUser = -1;
+        for (int i = lastAssistant - 1; i >= 0; i--) if ("user".equals(out.get(i).get("role"))) { prevUser = i; break; }
+        if (prevUser < 0) return out;
+        List<Map<String, Object>> head = withCacheBreakpoint(new ArrayList<>(out.subList(0, prevUser + 1)), cacheControl);
+        List<Map<String, Object>> merged = new ArrayList<>(head);
+        merged.addAll(out.subList(prevUser + 1, out.size()));
+        return merged;
+    }
+
     /** As above, with the given {@code cache_control} — the tool loop's is {@link #cacheControl()}. */
     @SuppressWarnings("unchecked")
     static List<Map<String, Object>> withCacheBreakpoint(List<Map<String, Object>> messages,
@@ -984,9 +1045,21 @@ public final class AnthropicClient implements LlmClient {
     private static boolean blank(String s)         { return s == null || s.isBlank(); }
     /** Package-private so the keyword list can be tested directly — it is easy to get subtly wrong. */
     static boolean isTransient(String err) {
-        return err != null && (TRANSIENT_KEYWORDS.stream().anyMatch(err::contains)
-                || SERVER_ERROR.matcher(err).find());
+        if (err == null) return false;
+        // An API error says what it is in its status, and only the status is believed: the keywords
+        // below matched anywhere in the text, so "400 - prompt is too long: 205291 tokens" (it holds
+        // "529") was retried three times, re-uploading the whole conversation each time.
+        java.util.regex.Matcher api = API_STATUS.matcher(err);
+        if (api.lookingAt()) {
+            int status = Integer.parseInt(api.group(1));
+            return status == 408 || status == 429 || status >= 500;
+        }
+        // Everything else is an exception from the network or the client, worded by whoever threw it.
+        return TRANSIENT_KEYWORDS.stream().anyMatch(err::contains) || SERVER_ERROR.matcher(err).find();
     }
+
+    /** The status of an "API error: NNN - ..." message, as extractApiError and the stream parser write it. */
+    private static final java.util.regex.Pattern API_STATUS = java.util.regex.Pattern.compile("API error: (\\d{3})\\b");
 
     /**
      * Any 5xx from the API or the edge in front of it. Only 503 and 529 were listed, so a 502, 504 or

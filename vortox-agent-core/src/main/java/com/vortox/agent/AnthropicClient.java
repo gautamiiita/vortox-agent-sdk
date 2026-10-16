@@ -197,6 +197,10 @@ public final class AnthropicClient implements LlmClient {
             // Two settings a model may refuse, and neither is worth failing a run over. A model
             // that does not take effort gets requests without it from here on; one that will not
             // accept the thinking blocks sent back gets this request without them.
+            if (refused(r, "ttl") && withoutLongCache.compareAndSet(false, true)) {
+                log.warn("Model {} refused the one-hour cache ({}) — using the default cache lifetime", mdl, r.getError());
+                r = retry(call);
+            }
             if (refused(r, "effort", "output_config") && effort != null && withoutEffort.compareAndSet(false, true)) {
                 log.warn("Model {} refused effort '{}' ({}) — sending requests without it", mdl, effort, r.getError());
                 r = retry(call);
@@ -658,19 +662,20 @@ public final class AnthropicClient implements LlmClient {
         b.put("model",      model);
         b.put("max_tokens", maxTokens);
 
+        Map<String, Object> cache = cacheControl();
         String sysText = oauth ? CLAUDE_CODE_SYS : (systemPrompt != null ? systemPrompt : "");
         b.put("system", List.of(Map.of(
                 "type", "text", "text", sysText,
-                "cache_control", Map.of("type", "ephemeral"))));
+                "cache_control", cache)));
 
         List<Map<String, Object>> effectiveMessages = (oauth && !blank(systemPrompt))
                 ? oauthMessages(messages, systemPrompt) : messages;
-        b.put("messages", withCacheBreakpoint(effectiveMessages));
+        b.put("messages", withCacheBreakpoint(effectiveMessages, cache));
 
         if (tools != null && !tools.isEmpty()) {
             List<Map<String, Object>> cached = new ArrayList<>(tools);
             Map<String, Object> last = new LinkedHashMap<>(cached.get(cached.size() - 1));
-            last.put("cache_control", Map.of("type", "ephemeral"));
+            last.put("cache_control", cache);
             cached.set(cached.size() - 1, last);
             b.put("tools", cached);
         }
@@ -678,6 +683,37 @@ public final class AnthropicClient implements LlmClient {
         if (effort != null && !withoutEffort.get()) b.put("output_config", Map.of("effort", effort));
         if (stream) b.put("stream", true);
         return b;
+    }
+
+    /**
+     * THE CACHE LIVES AN HOUR, not five minutes — on the tools, the system prompt and the tail alike.
+     *
+     * <p>Task 944 (2026-10-15): a run's system-prompt entry is written on its first turn and never read
+     * again — every later turn reads the longer entry at the tail — so it expired five minutes in, and
+     * each later prune of old messages fell back to the tools alone and rewrote ~130k tokens. The tail
+     * entry was the same story between runs: the platform's gates and merges took 2–8 minutes, and the
+     * resumed run rewrote 120–182k tokens. A one-hour write costs 2x instead of 1.25x on the few
+     * thousand tokens a turn adds; a miss costs 1.25x on the whole conversation.
+     *
+     * <p>All three markers carry the same TTL, so the rule that a longer-lived entry must come before a
+     * shorter one holds. A model or endpoint that refuses the field gets the default from then on.
+     */
+    static final Map<String, Object> CACHE_ONE_HOUR;
+    static {
+        // Ordered: Map.of iterates in a per-JVM random order, and the bytes of a request are what a
+        // cache is keyed on and what a test compares.
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("type", "ephemeral");
+        m.put("ttl", "1h");
+        CACHE_ONE_HOUR = java.util.Collections.unmodifiableMap(m);
+    }
+    static final Map<String, Object> CACHE_DEFAULT  = Map.of("type", "ephemeral");
+
+    /** Set once the endpoint has refused {@code cache_control.ttl}: this client sends the default from then on. */
+    private final java.util.concurrent.atomic.AtomicBoolean withoutLongCache = new java.util.concurrent.atomic.AtomicBoolean();
+
+    Map<String, Object> cacheControl() {
+        return withoutLongCache.get() ? CACHE_DEFAULT : CACHE_ONE_HOUR;
     }
 
     /** Set once a model has refused {@code output_config.effort}: this client stops sending it. */
@@ -783,8 +819,14 @@ public final class AnthropicClient implements LlmClient {
      * is the 3rd, alongside the system prompt and last tool definition.)
      */
     /** Public so the backend's chat path (AnthropicService) applies the same rule rather than a copy. */
-    @SuppressWarnings("unchecked")
     public static List<Map<String, Object>> withCacheBreakpoint(List<Map<String, Object>> messages) {
+        return withCacheBreakpoint(messages, CACHE_DEFAULT);
+    }
+
+    /** As above, with the given {@code cache_control} — the tool loop's is {@link #cacheControl()}. */
+    @SuppressWarnings("unchecked")
+    static List<Map<String, Object>> withCacheBreakpoint(List<Map<String, Object>> messages,
+                                                         Map<String, Object> cacheControl) {
         if (messages == null || messages.isEmpty()) return messages;
 
         int lastIdx = messages.size() - 1;
@@ -808,7 +850,7 @@ public final class AnthropicClient implements LlmClient {
         if (blocks.isEmpty()) return messages;
 
         Map<String, Object> lastBlock = blocks.get(blocks.size() - 1);
-        lastBlock.put("cache_control", Map.of("type", "ephemeral"));
+        lastBlock.put("cache_control", cacheControl);
         lastMessage.put("content", blocks);
 
         List<Map<String, Object>> result = new ArrayList<>(messages);

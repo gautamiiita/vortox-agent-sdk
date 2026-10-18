@@ -810,7 +810,7 @@ public final class ReactLoop {
                 Optional<AnthropicClient.ContentBlock> clarCall = uses.stream()
                         .filter(t -> CLARIFICATION_TOOL.equals(t.getToolName())).findFirst();
                 if (clarCall.isPresent()) {
-                    String question = str(clarCall.get().getToolInput(), "question", "More information needed.");
+                    String question = Clarification.text(clarCall.get().getToolInput(), "More information needed.");
                     AgentResult r = AgentResult.needsClarification(question, totalIn, totalOut, totalCC, totalCR);
                     listener.onComplete(runId, r);
                     return r;
@@ -1282,10 +1282,9 @@ public final class ReactLoop {
 
     private static Map<String, Object> clarificationToolDef() {
         return Map.of("name", CLARIFICATION_TOOL,
-            "description", "Pause and ask the user a clarifying question when the task is ambiguous.",
-            "input_schema", Map.of("type", "object",
-                "properties", Map.of("question", Map.of("type", "string")),
-                "required", List.of("question")));
+            "description", "Pause and ask the user a clarifying question when the task is ambiguous."
+                    + Clarification.HOW_TO_ASK,
+            "input_schema", Clarification.inputSchema());
     }
 
     private static Map<String, Object> approvalToolDef() {

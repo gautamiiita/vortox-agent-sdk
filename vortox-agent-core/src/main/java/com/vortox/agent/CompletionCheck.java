@@ -30,16 +30,34 @@ public final class CompletionCheck {
     private final String requirements;
     private final Supplier<String> evidence;
     private final int maxSendBacks;
+    private final String model;
 
     public CompletionCheck(String requirements, Supplier<String> evidence, int maxSendBacks) {
+        this(requirements, evidence, maxSendBacks, null);
+    }
+
+    private CompletionCheck(String requirements, Supplier<String> evidence, int maxSendBacks, String model) {
         this.requirements = requirements;
         this.evidence = evidence;
         this.maxSendBacks = Math.max(0, maxSendBacks);
+        this.model = model == null || model.isBlank() ? null : model;
     }
 
     public static CompletionCheck of(String requirements, Supplier<String> evidence) {
         return new CompletionCheck(requirements, evidence, DEFAULT_SEND_BACKS);
     }
+
+    /**
+     * The same check, made with {@code model} rather than the run's own. Judging "is this done?"
+     * against a diff does not need the model that wrote it: the run's client is reused, so the model
+     * must be one its endpoint serves. Null or blank keeps the run's model.
+     */
+    public CompletionCheck withModel(String model) {
+        return new CompletionCheck(requirements, evidence, maxSendBacks, model);
+    }
+
+    /** The model the check is made with, or null for the run's own. */
+    public String model() { return model; }
 
     /** What the work must satisfy: the task as it was written. */
     public String requirements() { return requirements; }

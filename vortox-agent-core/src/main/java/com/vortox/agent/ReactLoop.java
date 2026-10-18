@@ -178,6 +178,25 @@ public final class ReactLoop {
 
     /** The tools of this run declared deferred, and those load_tools has asked for since the last turn. See ToolLoading. */
     private volatile Set<String> deferredTools = Set.of();
+
+    /*
+     * Usage the result's four totals cannot say, kept across every run() of this loop (a capped run's
+     * continuations reuse it) so the host can price it: one-hour cache writes cost 2x input, not the
+     * 1.25x of a five-minute one, and the completion check may run on a cheaper model than the loop.
+     * Both are also inside the totals.
+     */
+    private volatile long cacheWrite1h;
+    private final long[] checkUsage = new long[4];
+
+    /** Cache-write tokens of this loop's own calls that went to one-hour entries. */
+    public long cacheWrite1hTokens() { return cacheWrite1h; }
+
+    /** What the completion checks cost: {input, output, cache write, cache read}. */
+    public synchronized long[] completionCheckUsage() { return checkUsage.clone(); }
+
+    private synchronized void addCheckUsage(FreshCheck.Usage u) {
+        checkUsage[0] += u.in(); checkUsage[1] += u.out(); checkUsage[2] += u.cacheCreate(); checkUsage[3] += u.cacheRead();
+    }
     private final Set<String> surfacedTools = ConcurrentHashMap.newKeySet();
     private final Set<String> pendingLoads = ConcurrentHashMap.newKeySet();
 
@@ -624,6 +643,7 @@ public final class ReactLoop {
             totalOut += response.getOutputTokens();
             totalCC  += response.getCacheCreationInputTokens();
             totalCR  += response.getCacheReadInputTokens();
+            cacheWrite1h += response.getCacheCreation1hInputTokens();
             lastContext = (long) response.getInputTokens() + response.getCacheCreationInputTokens()
                     + response.getCacheReadInputTokens() + response.getOutputTokens();
             listener.onTokens(runId, iterations, totalIn, totalOut);
@@ -699,6 +719,7 @@ public final class ReactLoop {
                             completionCheck, tag);
                     totalIn += checked.usage().in();   totalOut += checked.usage().out();
                     totalCC += checked.usage().cacheCreate(); totalCR += checked.usage().cacheRead();
+                    addCheckUsage(checked.usage());
                     verdict = checked.verdict().withSendBacks(checkSendBacks);
                     if (sendsBack(verdict, checkSendBacks, completionCheck)) {
                         checkSendBacks++;
@@ -763,6 +784,7 @@ public final class ReactLoop {
                             completionCheck, tag);
                     totalIn += checked.usage().in();   totalOut += checked.usage().out();
                     totalCC += checked.usage().cacheCreate(); totalCR += checked.usage().cacheRead();
+                    addCheckUsage(checked.usage());
                     verdict = checked.verdict().withSendBacks(checkSendBacks);
                     if (sendsBack(verdict, checkSendBacks, completionCheck)) {
                         checkSendBacks++;
@@ -826,6 +848,7 @@ public final class ReactLoop {
                                 completionCheck, tag);
                         totalIn += checked.usage().in();   totalOut += checked.usage().out();
                         totalCC += checked.usage().cacheCreate(); totalCR += checked.usage().cacheRead();
+                    addCheckUsage(checked.usage());
                         verdict = checked.verdict().withSendBacks(checkSendBacks);
                         if (sendsBack(verdict, checkSendBacks, completionCheck)) {
                             checkSendBacks++;

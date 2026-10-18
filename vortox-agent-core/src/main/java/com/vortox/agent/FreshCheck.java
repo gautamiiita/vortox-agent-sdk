@@ -72,7 +72,8 @@ final class FreshCheck {
 
         // One-shot: the evidence changes after every send-back, so a cache write here is never read.
         AnthropicClient.ClaudeResponse response = client.sendWithoutCache(SYSTEM_PROMPT,
-                List.of(Map.of("role", "user", "content", message)), List.of(), apiKey, model);
+                List.of(Map.of("role", "user", "content", message)), List.of(), apiKey,
+                check.model() != null ? check.model() : model);
         Usage usage = new Usage(response.getInputTokens(), response.getOutputTokens(),
                 response.getCacheCreationInputTokens(), response.getCacheReadInputTokens());
         if (response.hasError()) {

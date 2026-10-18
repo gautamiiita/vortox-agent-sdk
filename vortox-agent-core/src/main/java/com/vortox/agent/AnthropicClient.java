@@ -547,6 +547,8 @@ public final class AnthropicClient implements LlmClient {
             if (u.has("output_tokens"))               response.setOutputTokens(u.path("output_tokens").asInt());
             if (u.has("cache_creation_input_tokens")) response.setCacheCreationInputTokens(u.path("cache_creation_input_tokens").asInt());
             if (u.has("cache_read_input_tokens"))     response.setCacheReadInputTokens(u.path("cache_read_input_tokens").asInt());
+            if (u.path("cache_creation").has("ephemeral_1h_input_tokens"))
+                response.setCacheCreation1hInputTokens(u.path("cache_creation").path("ephemeral_1h_input_tokens").asInt());
         }
 
         @SuppressWarnings("unchecked")
@@ -1023,6 +1025,7 @@ public final class AnthropicClient implements LlmClient {
             r.setOutputTokens(usage.path("output_tokens").asInt());
             r.setCacheCreationInputTokens(usage.path("cache_creation_input_tokens").asInt());
             r.setCacheReadInputTokens(usage.path("cache_read_input_tokens").asInt());
+            r.setCacheCreation1hInputTokens(usage.path("cache_creation").path("ephemeral_1h_input_tokens").asInt());
             return r;
         } catch (Exception e) {
             log.error("Response parse error: {}", body, e);
@@ -1109,6 +1112,8 @@ public final class AnthropicClient implements LlmClient {
         private String id, model, stopReason, error;
         private List<ContentBlock> content;
         private int inputTokens, outputTokens, cacheCreationInputTokens, cacheReadInputTokens;
+        /** The part of {@link #cacheCreationInputTokens} written to one-hour entries, priced at 2x input rather than 1.25x. */
+        private int cacheCreation1hInputTokens;
 
         public static ClaudeResponse error(String msg) {
             ClaudeResponse r = new ClaudeResponse(); r.setError(msg); return r;
@@ -1147,6 +1152,8 @@ public final class AnthropicClient implements LlmClient {
         public void setCacheCreationInputTokens(int n){ this.cacheCreationInputTokens = n; }
         public int getCacheReadInputTokens()         { return cacheReadInputTokens; }
         public void setCacheReadInputTokens(int n)   { this.cacheReadInputTokens = n; }
+        public int getCacheCreation1hInputTokens()   { return cacheCreation1hInputTokens; }
+        public void setCacheCreation1hInputTokens(int n) { this.cacheCreation1hInputTokens = n; }
     }
 
     public static class ContentBlock {

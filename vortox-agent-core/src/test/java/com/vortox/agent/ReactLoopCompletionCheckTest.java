@@ -32,7 +32,7 @@ class ReactLoopCompletionCheckTest {
             ```""";
 
     /** Plays the agent's turns and the check's answers from two scripts, and records what each was sent. */
-    static final class ScriptedClient implements LlmClient {
+    static class ScriptedClient implements LlmClient {
         final Deque<AnthropicClient.ClaudeResponse> agentTurns = new ArrayDeque<>();
         final Deque<AnthropicClient.ClaudeResponse> checkAnswers = new ArrayDeque<>();
         final List<List<Map<String, Object>>> checkRequests = new ArrayList<>();
@@ -224,6 +224,34 @@ class ReactLoopCompletionCheckTest {
         assertEquals(AgentResult.Status.SUCCESS, r.status());
         assertTrue(client.checkRequests.isEmpty());
         assertFalse(r.completionVerdict().ran());
+    }
+
+    @Test
+    @DisplayName("a check given its own model is made with it, and its usage is kept apart for pricing")
+    void checkOnItsOwnModel() {
+        List<String> models = new ArrayList<>();
+        ScriptedClient client = new ScriptedClient() {
+            @Override
+            public AnthropicClient.ClaudeResponse send(String systemPrompt, List<Map<String, Object>> messages,
+                                                       List<Map<String, Object>> tools, String apiKey, String model) {
+                models.add((FreshCheck.SYSTEM_PROMPT.equals(systemPrompt) ? "check:" : "agent:") + model);
+                return super.send(systemPrompt, messages, tools, apiKey, model);
+            }
+        };
+        client.agentTurns.add(complete("c1", "Done."));
+        AgentConfig config = AgentConfig.builder().agentId("dev-agent-003").apiKey("k")
+                .model("claude-opus-5").maxIterations(10).build();
+        ReactLoop loop = new ReactLoop(config, client, Runnable::run);
+
+        AgentResult r = loop.run(TASK, null, "run-1", null, null, "m1", check(2).withModel("claude-sonnet-5"));
+
+        assertEquals(AgentResult.Status.SUCCESS, r.status());
+        assertEquals(List.of("agent:claude-opus-5", "check:claude-sonnet-5"), models);
+        // The check's 100 in / 10 out are in the totals, and also reported on their own.
+        assertEquals(1100, r.inputTokens());
+        assertEquals(100, loop.completionCheckUsage()[0]);
+        assertEquals(10, loop.completionCheckUsage()[1]);
+        assertNull(check(2).withModel(" ").model());
     }
 
     @Test

@@ -31,16 +31,19 @@ public final class CompletionCheck {
     private final Supplier<String> evidence;
     private final int maxSendBacks;
     private final String model;
+    private final boolean judgesAnswer;
 
     public CompletionCheck(String requirements, Supplier<String> evidence, int maxSendBacks) {
-        this(requirements, evidence, maxSendBacks, null);
+        this(requirements, evidence, maxSendBacks, null, false);
     }
 
-    private CompletionCheck(String requirements, Supplier<String> evidence, int maxSendBacks, String model) {
+    private CompletionCheck(String requirements, Supplier<String> evidence, int maxSendBacks, String model,
+                            boolean judgesAnswer) {
         this.requirements = requirements;
         this.evidence = evidence;
         this.maxSendBacks = Math.max(0, maxSendBacks);
         this.model = model == null || model.isBlank() ? null : model;
+        this.judgesAnswer = judgesAnswer;
     }
 
     public static CompletionCheck of(String requirements, Supplier<String> evidence) {
@@ -53,11 +56,24 @@ public final class CompletionCheck {
      * must be one its endpoint serves. Null or blank keeps the run's model.
      */
     public CompletionCheck withModel(String model) {
-        return new CompletionCheck(requirements, evidence, maxSendBacks, model);
+        return new CompletionCheck(requirements, evidence, maxSendBacks, model, judgesAnswer);
+    }
+
+    /**
+     * The same check, for a run whose deliverable is its final answer — a report — rather than a
+     * change. The answer is given to the check as the evidence of what was done. Without it a report
+     * was judged on a change that is empty by design: its first completion was sent back as "not
+     * done", and the agent wrote a file nobody asked for to satisfy the check (2026-10-31).
+     */
+    public CompletionCheck judgingTheAnswer() {
+        return new CompletionCheck(requirements, evidence, maxSendBacks, model, true);
     }
 
     /** The model the check is made with, or null for the run's own. */
     public String model() { return model; }
+
+    /** Whether the run's final answer is the deliverable, and so the evidence. */
+    public boolean judgesAnswer() { return judgesAnswer; }
 
     /** What the work must satisfy: the task as it was written. */
     public String requirements() { return requirements; }

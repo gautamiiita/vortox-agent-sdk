@@ -716,7 +716,7 @@ public final class ReactLoop {
                 String text = response.getTextContent();
                 if (freshCheck) {
                     FreshCheck.Outcome checked = FreshCheck.run(client, config.getApiKey(), config.getModel(),
-                            completionCheck, tag);
+                            completionCheck, tag, text);
                     totalIn += checked.usage().in();   totalOut += checked.usage().out();
                     totalCC += checked.usage().cacheCreate(); totalCR += checked.usage().cacheRead();
                     addCheckUsage(checked.usage());
@@ -781,7 +781,7 @@ public final class ReactLoop {
                 }
                 if (freshCheck) {
                     FreshCheck.Outcome checked = FreshCheck.run(client, config.getApiKey(), config.getModel(),
-                            completionCheck, tag);
+                            completionCheck, tag, reply);
                     totalIn += checked.usage().in();   totalOut += checked.usage().out();
                     totalCC += checked.usage().cacheCreate(); totalCR += checked.usage().cacheRead();
                     addCheckUsage(checked.usage());
@@ -845,7 +845,7 @@ public final class ReactLoop {
                     // check must not depend on which of the two it chose.
                     if (freshCheck) {
                         FreshCheck.Outcome checked = FreshCheck.run(client, config.getApiKey(), config.getModel(),
-                                completionCheck, tag);
+                                completionCheck, tag, str(hi, "reason", ""));
                         totalIn += checked.usage().in();   totalOut += checked.usage().out();
                         totalCC += checked.usage().cacheCreate(); totalCR += checked.usage().cacheRead();
                     addCheckUsage(checked.usage());

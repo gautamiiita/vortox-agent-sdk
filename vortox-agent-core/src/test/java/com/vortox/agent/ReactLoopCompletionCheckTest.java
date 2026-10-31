@@ -213,6 +213,37 @@ class ReactLoopCompletionCheckTest {
     }
 
     @Test
+    @DisplayName("a report is judged on its answer: the deliverable is shown to the check, even with no change")
+    void reportIsJudgedOnItsAnswer() {
+        // The spec-draft pilot (2026-10-31): judged on an empty change, the report was sent back as
+        // "not done" and the agent wrote a file nobody asked for to satisfy the check.
+        ScriptedClient client = new ScriptedClient();
+        client.agentTurns.add(complete("c1", "# secutix-ac\n\n## Purpose\nAccess control at the gate."));
+
+        AgentResult r = loop(client).run(TASK, null, "run-1", null, null, "m1",
+                new CompletionCheck(TASK, () -> "", 2).judgingTheAnswer());
+
+        assertEquals(AgentResult.Status.SUCCESS, r.status());
+        assertEquals(1, client.checkRequests.size(), "runs although the change is empty");
+        String body = String.valueOf(client.checkRequests.get(0).get(0).get("content"));
+        assertTrue(body.contains("Access control at the gate."), body);
+        assertTrue(body.contains("not a change to the repository"), body);
+    }
+
+    @Test
+    @DisplayName("a change is still judged without the agent's account")
+    void aChangeIsNotJudgedOnTheAnswer() {
+        ScriptedClient client = new ScriptedClient();
+        client.agentTurns.add(complete("c1", "all queries replaced, trust me"));
+
+        loop(client).run(TASK, null, "run-1", null, null, "m1", check(2));
+
+        String body = String.valueOf(client.checkRequests.get(0).get(0).get("content"));
+        assertFalse(body.contains("trust me"));
+        assertFalse(body.contains("## The deliverable"));
+    }
+
+    @Test
     @DisplayName("no evidence: the check does not run and the completion stands")
     void noEvidence() {
         ScriptedClient client = new ScriptedClient();

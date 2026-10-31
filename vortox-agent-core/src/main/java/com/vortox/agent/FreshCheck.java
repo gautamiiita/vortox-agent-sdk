@@ -54,6 +54,16 @@ final class FreshCheck {
     record Outcome(CompletionVerdict verdict, Usage usage) {}
 
     static Outcome run(LlmClient client, String apiKey, String model, CompletionCheck check, String tag) {
+        return run(client, apiKey, model, check, tag, null);
+    }
+
+    /**
+     * As above, with the run's final answer: for a check that {@link CompletionCheck#judgesAnswer()},
+     * the answer is the deliverable and goes in front of the evidence, and the evidence from the
+     * workspace is only background — a report changes nothing there.
+     */
+    static Outcome run(LlmClient client, String apiKey, String model, CompletionCheck check, String tag,
+                       String answer) {
         String evidence;
         try {
             evidence = check.evidence().get();
@@ -61,14 +71,28 @@ final class FreshCheck {
             log.warn("ReactLoop [{}] completion check: could not gather evidence: {}", tag, e.getMessage());
             return new Outcome(CompletionVerdict.notRun("the evidence could not be gathered: " + e.getMessage()), Usage.NONE);
         }
-        if (evidence == null || evidence.isBlank()) {
+        boolean answered = check.judgesAnswer() && answer != null && !answer.isBlank();
+        if ((evidence == null || evidence.isBlank()) && !answered) {
             return new Outcome(CompletionVerdict.notRun("there was no evidence to check"), Usage.NONE);
         }
-        if (evidence.length() > MAX_EVIDENCE_CHARS) {
+        if (evidence != null && evidence.length() > MAX_EVIDENCE_CHARS) {
             evidence = evidence.substring(0, MAX_EVIDENCE_CHARS) + "\n\n[evidence cut at " + MAX_EVIDENCE_CHARS + " characters]";
         }
-        String message = "## The task as written\n\n" + check.requirements().strip()
-                + "\n\n## Evidence of what was done\n\n" + evidence;
+        String message;
+        if (answered) {
+            String a = answer.length() > MAX_EVIDENCE_CHARS
+                    ? answer.substring(0, MAX_EVIDENCE_CHARS) + "\n\n[answer cut at " + MAX_EVIDENCE_CHARS + " characters]"
+                    : answer;
+            message = "## The task as written\n\n" + check.requirements().strip()
+                    + "\n\n## The deliverable\n\nThis task's deliverable is the final answer below, not a change to "
+                    + "the repository; the repository is meant to be unchanged. Judge the requirements against this "
+                    + "answer.\n\n" + a.strip()
+                    + (evidence == null || evidence.isBlank() ? ""
+                       : "\n\n## Background: the repository\n\n" + evidence);
+        } else {
+            message = "## The task as written\n\n" + check.requirements().strip()
+                    + "\n\n## Evidence of what was done\n\n" + evidence;
+        }
 
         // One-shot: the evidence changes after every send-back, so a cache write here is never read.
         AnthropicClient.ClaudeResponse response = client.sendWithoutCache(SYSTEM_PROMPT,

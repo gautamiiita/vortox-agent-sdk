@@ -409,6 +409,31 @@ public final class ReactLoop {
             + "file_write the first part (a few hundred lines at most) and file_append the rest "
             + "in further calls of similar size.";
 
+    static final String EMPTY_TURN_TEXT =
+            "You ended your turn without writing anything, so the user has seen no answer. Reply now "
+            + "in plain text: what you did, what you found, and anything you need from them.";
+
+    /**
+     * Asks for the answer after an empty end_turn. The empty assistant turn itself is not kept — the
+     * Messages API refuses an assistant message with no content — so the request is appended to the
+     * last user message (after its tool_results, which must come first), or added as one.
+     */
+    static void withEmptyTurnNudge(List<Map<String, Object>> messages) {
+        Map<String, Object> ask = Map.of("type", "text", "text", EMPTY_TURN_TEXT);
+        int last = messages.size() - 1;
+        if (last < 0 || !"user".equals(messages.get(last).get("role"))) {
+            messages.add(Map.of("role", "user", "content", List.of(ask)));
+            return;
+        }
+        Object content = messages.get(last).get("content");
+        List<Object> blocks = new ArrayList<>();
+        if (content instanceof List<?> list) blocks.addAll(list);
+        else if (content != null && !String.valueOf(content).isBlank())
+            blocks.add(Map.of("type", "text", "text", String.valueOf(content)));
+        blocks.add(ask);
+        messages.set(last, Map.of("role", "user", "content", blocks));
+    }
+
     static final String TRUNCATED_TEXT =
             "Your previous reply hit the output token limit and was cut off. Continue from where "
             + "it stopped, and keep each reply shorter. If you were about to write a large file, "
@@ -602,6 +627,8 @@ public final class ReactLoop {
         CompletionVerdict verdict = null;
         /** The last non-blank prose the model produced, in any turn — see chooseReply. */
         String lastAssistantText = null;
+        /** Whether an empty end_turn has already been answered with EMPTY_TURN_TEXT — see below. */
+        boolean emptyTurnNudged = false;
 
         int maxIterations = config.getMaxIterations();
         int iterations = 0;
@@ -714,6 +741,29 @@ public final class ReactLoop {
             if (!response.hasToolUse()) {
                 // LLM returned plain text — task complete
                 String text = response.getTextContent();
+                // An empty end_turn — no tool call and no prose. Claude does this now and then right
+                // after a tool result, and it used to be accepted as the answer: the chat widget then
+                // showed "I couldn't generate a response" after a run that had done real work. Ask
+                // once; if the second turn is empty too, fall back to the last prose of the run, and
+                // only when there is none end it as an error that says so.
+                if (text == null || text.isBlank()) {
+                    if (!emptyTurnNudged) {
+                        emptyTurnNudged = true;
+                        log.warn("ReactLoop [{}] empty reply on iteration {} (stop={}) — asking for the answer",
+                                tag, iterations, response.getStopReason());
+                        withEmptyTurnNudge(messages);
+                        continue;
+                    }
+                    if (lastAssistantText == null) {
+                        String why = "The model ended its turn without a reply (stop="
+                                + response.getStopReason() + ").";
+                        log.warn("ReactLoop [{}] {}", tag, why);
+                        AgentResult r = AgentResult.error(why, totalIn, totalOut);
+                        listener.onComplete(runId, r);
+                        return r;
+                    }
+                    text = lastAssistantText;
+                }
                 if (freshCheck) {
                     FreshCheck.Outcome checked = FreshCheck.run(client, config.getApiKey(), config.getModel(),
                             completionCheck, tag, text);

@@ -357,6 +357,30 @@ public class AgentController {
     }
 
     /**
+     * A person's decision on a run waiting for approval ({@code status: APPROVAL_NEEDED} on the poll):
+     * {@code {approved: true|false, note?, llmApiKey?}}. Approved runs the held call; rejected tells
+     * the agent it may not. The key is the person's own, brought again because a waiting run does not
+     * keep it. 202 when the run resumes, 404 for an unknown run, 409 for one not waiting, 400 unless
+     * {@code approved} is a JSON boolean — a decision this consequential is never inferred.
+     */
+    @PostMapping("/chat/{runId}/approval")
+    public ResponseEntity<Map<String, Object>> chatApproval(@PathVariable String runId,
+                                                            @RequestBody(required = false) Map<String, Object> body) {
+        if (body == null || !(body.get("approved") instanceof Boolean approved)) {
+            return ResponseEntity.badRequest().body(Map.of("error", "approved (true or false) is required"));
+        }
+        String note = body.get("note") instanceof String n && !n.isBlank() ? n : null;
+        String key = body.get("llmApiKey") instanceof String k && !k.isBlank() ? k : null;
+        return switch (chatRunService.decide(runId, approved, note, key)) {
+            case ACCEPTED -> ResponseEntity.accepted().body(Map.of("runId", runId, "status", "RUNNING"));
+            case NOT_FOUND -> ResponseEntity.status(HttpStatus.NOT_FOUND)
+                    .body(Map.of("status", "NOT_FOUND", "error", "Unknown or expired run"));
+            case NOT_WAITING -> ResponseEntity.status(HttpStatus.CONFLICT)
+                    .body(Map.of("error", "This run is not waiting for an approval."));
+        };
+    }
+
+    /**
      * Live progress stream for {@link #chat} — emits {@code iteration}/{@code tool_call}/
      * {@code tool_result}/{@code error} events as the ReAct loop runs, then a signal-only
      * {@code done} event. Coexists with {@link #chatStatus}, which remains the source of truth

@@ -175,6 +175,8 @@ public final class ReactLoop {
     private final LlmClient client;
     private final ObjectMapper objectMapper;
     private final Executor executor;
+    /** Calls run by {@link #resumeDecided} before the loop resumed; folded into the run's record. */
+    private final List<AgentResult.ToolCall> decidedCalls = new ArrayList<>();
 
     /** The tools of this run declared deferred, and those load_tools has asked for since the last turn. See ToolLoading. */
     private volatile Set<String> deferredTools = Set.of();
@@ -314,6 +316,87 @@ public final class ReactLoop {
         messages.add(Map.of("role", "user", "content",
                 approvalToolResults(assistantContent, toolUseId, decisionMessage)));
 
+        return runInternal(null, null, runId, null, messages, runLabel, null);
+    }
+
+    /**
+     * Resume after a person DECIDED on a held call — and act on the decision.
+     *
+     * <p>{@link #resumeAfterApproval} hands the decision text back as the held call's result, so the
+     * call never runs: an approved call has to be issued again, and a host {@link ToolGate} that held
+     * it once holds it again. Here an approved call is run exactly once, without consulting the gate
+     * (the approval is the gate's answer), and its real output — or its failure — is the result. A
+     * rejected call is never run; the model is told so, with the person's note, as an error result.
+     * Every other call in the paused turn is answered as not executed, as on the older path.
+     *
+     * @param approved whether the person approved the held call
+     * @param note     optional words from the person, passed to the model either way
+     */
+    public AgentResult resumeDecided(String runId,
+                                     List<Map<String, Object>> conversationSnapshot,
+                                     List<Map<String, Object>> assistantContent,
+                                     String toolUseId,
+                                     boolean approved,
+                                     String note,
+                                     String runLabel) {
+        String tag = runTag(runId, runLabel);
+        Map<String, Object> held = null;
+        if (assistantContent != null && toolUseId != null) {
+            for (Map<String, Object> block : assistantContent) {
+                if (block != null && "tool_use".equals(block.get("type")) && toolUseId.equals(block.get("id"))) {
+                    held = block;
+                }
+            }
+        }
+        String extra = note == null || note.isBlank() ? "" : "\n\nNote from the user: " + note.trim();
+        String content;
+        boolean isError;
+        if (!approved || held == null) {
+            log.info("ReactLoop [{}] held call {} {}", tag, toolUseId, approved ? "not found" : "rejected");
+            content = (approved
+                    ? "The approved call could not be found in the paused turn, so it was not run."
+                    : "The user rejected this call, so it was not run. Do not try to get around the "
+                      + "refusal; continue without it or ask the user what to do instead.") + extra;
+            isError = true;
+        } else {
+            String name = String.valueOf(held.get("name"));
+            @SuppressWarnings("unchecked")
+            Map<String, Object> input = held.get("input") instanceof Map<?, ?> m
+                    ? (Map<String, Object>) m : Map.of();
+            ActivityListener listener = config.getActivityListener();
+            listener.onToolCall(runId, name, input);
+            long t0 = System.currentTimeMillis();
+            boolean ok;
+            try {
+                content = dispatchTool(AnthropicClient.ContentBlock.toolUse(toolUseId, name, input),
+                        runId, config.getMemoryStore());
+                ok = true;
+            } catch (ToolExecutor.ToolExecutionException e) {
+                content = e.getMessage();
+                ok = false;
+            } catch (Exception e) {
+                content = "Tool execution failed: " + e.getMessage();
+                ok = false;
+            }
+            long dur = System.currentTimeMillis() - t0;
+            listener.onToolResult(runId, name, ok, dur);
+            log.info("ReactLoop [{}] approved call {} ran: success={}", tag, name, ok);
+            decidedCalls.add(new AgentResult.ToolCall(name, input, content, ok, dur));
+            content = content + extra;
+            isError = !ok;
+        }
+
+        List<Map<String, Object>> messages = new ArrayList<>(sanitizeMessages(conversationSnapshot));
+        messages.add(Map.of("role", "assistant", "content", assistantContent));
+        List<Map<String, Object>> results = new ArrayList<>();
+        for (Map<String, Object> r : approvalToolResults(assistantContent, toolUseId, content)) {
+            Map<String, Object> copy = new HashMap<>(r);
+            if (isError && toolUseId != null && toolUseId.equals(copy.get("tool_use_id"))) {
+                copy.put("is_error", true);
+            }
+            results.add(copy);
+        }
+        messages.add(Map.of("role", "user", "content", results));
         return runInternal(null, null, runId, null, messages, runLabel, null);
     }
 
@@ -617,6 +700,10 @@ public final class ReactLoop {
         final long[] counted = {0, 0};
 
         List<AgentResult.ToolCall> toolCalls = new ArrayList<>();
+        // A call a person approved before this stretch began ran in resumeDecided; it belongs to the
+        // run's record like any other (artifacts are read from here).
+        toolCalls.addAll(decidedCalls);
+        decidedCalls.clear();
         RepeatedFailureGuard repeats = new RepeatedFailureGuard();
         int totalIn = 0, totalOut = 0, totalCC = 0, totalCR = 0;
         boolean outcomeCheckDone = false;

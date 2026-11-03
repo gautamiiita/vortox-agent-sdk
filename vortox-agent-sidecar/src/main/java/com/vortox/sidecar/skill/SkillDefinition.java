@@ -14,8 +14,23 @@ public record SkillDefinition(
         Map<String, Object> inputSchema,
         String implementation,
         String rawContent,
-        ProducesArtifact producesArtifact
+        ProducesArtifact producesArtifact,
+        /*
+         * Declares that a call of this tool waits for a person's approval, and what they read:
+         * {@code requires_approval: "Declare on your behalf: {resource}"} — each {@code {field}} is
+         * filled from the call's input. {@code true} asks with a default text (stored as ""), and
+         * null — absent or {@code false} — means the tool runs without asking. Never sent to the LLM.
+         */
+        String requiresApproval
 ) {
+
+    /** The shape before approvals existed: a tool that never asks. */
+    public SkillDefinition(String name, String description, String language, int timeoutSeconds,
+                           Map<String, Object> inputSchema, String implementation, String rawContent,
+                           ProducesArtifact producesArtifact) {
+        this(name, description, language, timeoutSeconds, inputSchema, implementation, rawContent,
+                producesArtifact, null);
+    }
 
     /**
      * Declares that a successful call of this skill writes a file worth offering the caller as a

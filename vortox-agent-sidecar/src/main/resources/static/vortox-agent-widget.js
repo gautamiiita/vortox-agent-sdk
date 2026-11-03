@@ -118,6 +118,10 @@
   var buildStreamUrl = typeof cfg.buildStreamUrl === 'function' ? cfg.buildStreamUrl : function (runId) {
     return ENDPOINT + '/' + encodeURIComponent(runId) + '/stream';
   };
+  // Where a person's decision on a run waiting for approval is posted (see showApproval).
+  var buildApprovalUrl = typeof cfg.buildApprovalUrl === 'function' ? cfg.buildApprovalUrl : function (runId) {
+    return ENDPOINT + '/' + encodeURIComponent(runId) + '/approval';
+  };
 
   // Friendly labels for known skills in the live step trace (see showThinking/addStep below).
   // Host pages can extend/override via cfg.toolLabels; unknown tool names fall back to a
@@ -386,6 +390,7 @@
     '.vx-state-muted{color:#94a3b8;font-weight:600;}',
     '.vx-actions-note{padding:7px 10px;font-size:11.5px;line-height:1.45;}',
     '.vx-actions-note-stop{background:#fef2f2;color:#b91c1c;}',
+    '.vx-approval-text{white-space:pre-wrap;color:#0f172a;}',
     '.vx-actions-foot{display:flex;align-items:center;gap:7px;padding:8px 10px;',
     'border-top:1px solid #e2e8f0;}',
     '.vx-action-btn{font-family:inherit;font-size:12px;font-weight:600;padding:5px 12px;',
@@ -1681,9 +1686,75 @@
           return;
         }
         if (data.status === 'ERROR') { finishWithError(data.error || 'The agent hit an error.'); return; }
+        if (data.status === 'APPROVAL_NEEDED') { showApproval(runId, data.approval); return; }
         finishWithReply(data.reply || 'No response from agent.', data.artifacts);
       });
     });
+  }
+
+  // ── A run waiting for a person ──────────────────────────────────────────────────
+  // The agent reached a tool that must not run without the user's say-so. The run is paused on the
+  // server; this card shows exactly what is asked (the tool's own declared text, filled from this
+  // call's arguments — rendered as text, never HTML, since the values come from the model) and posts
+  // the decision. Nothing runs until Approve is clicked; Reject tells the agent it may not.
+
+  /** The decision's request body. A host that authenticates per request extends this. */
+  function approvalBody(approved) {
+    return { approved: approved };
+  }
+
+  function showApproval(runId, text) {
+    setThinkingHeader('Waiting for your approval…');
+    var card = document.createElement('div');
+    card.className = 'vx-actions vx-approval';
+    var head = document.createElement('div');
+    head.className = 'vx-actions-head';
+    head.textContent = 'Approval needed';
+    var body = document.createElement('div');
+    body.className = 'vx-actions-note vx-approval-text';
+    body.textContent = text || 'The agent wants to run a step that needs your approval.';
+    var foot = document.createElement('div');
+    foot.className = 'vx-actions-foot';
+    var approve = document.createElement('button');
+    approve.type = 'button';
+    approve.className = 'vx-action-btn vx-action-btn-primary';
+    approve.textContent = 'Approve';
+    var reject = document.createElement('button');
+    reject.type = 'button';
+    reject.className = 'vx-action-btn';
+    reject.textContent = 'Reject';
+    var runAs = document.createElement('span');
+    runAs.className = 'vx-actions-runas';
+    runAs.textContent = 'runs as you';
+    foot.appendChild(approve); foot.appendChild(reject); foot.appendChild(runAs);
+    card.appendChild(head); card.appendChild(body); card.appendChild(foot);
+    messagesEl.appendChild(card);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+
+    function decide(approved) {
+      approve.disabled = true;
+      reject.disabled = true;
+      postJson(buildApprovalUrl(runId), approvalBody(approved), function (err, data) {
+        if (err || !data || data.error) {
+          approve.disabled = false;
+          reject.disabled = false;
+          head.textContent = 'Could not send your decision';
+          runAs.textContent = (data && data.error) || err || 'Try again.';
+          if (data && data.status === 'NOT_FOUND') {
+            if (foot.parentNode) foot.parentNode.removeChild(foot);
+            finishWithError('This request expired (the assistant may have restarted). Please ask again.');
+          }
+          return;
+        }
+        if (foot.parentNode) foot.parentNode.removeChild(foot);
+        head.textContent = approved ? 'Approved' : 'Rejected';
+        setThinkingHeader('Working…');
+        // A fresh wait budget: the time the person took to decide is not the agent's.
+        pollRun(runId, Date.now());
+      });
+    }
+    approve.addEventListener('click', function () { decide(true); });
+    reject.addEventListener('click', function () { decide(false); });
   }
 
   // ── Poll for completion ─────────────────────────────────────────────────────────
@@ -1712,6 +1783,11 @@
       }
       if (data.status === 'ERROR') {
         finishWithError(data.error || 'The agent hit an error.');
+        return;
+      }
+      if (data.status === 'APPROVAL_NEEDED') {
+        // Not a reply and not a timeout: the run waits, without limit, for the person.
+        showApproval(runId, data.approval);
         return;
       }
       finishWithReply(data.reply || 'No response from agent.', data.artifacts);

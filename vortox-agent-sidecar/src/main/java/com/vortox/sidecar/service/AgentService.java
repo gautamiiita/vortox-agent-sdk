@@ -109,6 +109,24 @@ public class AgentService {
     @Autowired(required = false)
     private AnthropicKeyRefreshService anthropicKeyRefreshService;
 
+    /**
+     * Gates the host application supplies for tools it builds in code, consulted after what the
+     * run's skills declare themselves (see {@link ToolApprovalGate}).
+     */
+    @Autowired(required = false)
+    private List<com.vortox.agent.spi.ToolGate> hostGates = List.of();
+
+    /** How long a run waits for a person's decision before the request expires. */
+    @Value("${sidecar.approval-ttl-minutes:30}")
+    private long approvalTtlMinutes = 30;
+
+    private PendingApprovals pendingApprovals = new PendingApprovals(30 * 60 * 1000L);
+
+    @jakarta.annotation.PostConstruct
+    void initApprovals() {
+        pendingApprovals = new PendingApprovals(approvalTtlMinutes * 60 * 1000L);
+    }
+
     public AgentService(SkillRegistry skillRegistry, ScriptToolExecutor scriptToolExecutor) {
         this.skillRegistry      = skillRegistry;
         this.scriptToolExecutor = scriptToolExecutor;
@@ -125,6 +143,66 @@ public class AgentService {
      * stream registry keyed by that runId receive them.
      */
     public AgentRunResponse run(AgentRunRequest request, String runId, ActivityListener listener) {
+        Prepared p = prepare(request, runId, listener, true);
+        if (p.refusal() != null) return p.refusal();
+        AgentResult result = new ReactLoop(p.config())
+                .run(request.task(), runId, null, null, request.task());
+        return finish(p, request, runId, result);
+    }
+
+    /**
+     * Continues a run that stopped on a tool waiting for a person, with their decision: approved runs
+     * the held call (once) and carries on; rejected tells the model it may not. The run is rebuilt
+     * from the request it started with — same tenant, tools, gate and model — and the key the
+     * decision brings, since the waiting run did not keep one.
+     *
+     * <p>A decision for a run with nothing waiting, or one that waited past
+     * {@code sidecar.approval-ttl-minutes}, is refused (FAILED) and runs nothing.
+     */
+    public AgentRunResponse resume(String runId, boolean approved, String note, String apiKey,
+                                   ActivityListener listener) {
+        PendingApprovals.Taken taken = pendingApprovals.take(runId);
+        if (taken instanceof PendingApprovals.Expired) {
+            return errorResponse(runId, "The approval request expired before it was answered, so nothing "
+                    + "was run. Ask again to start over.");
+        }
+        if (!(taken instanceof PendingApprovals.Found found)) {
+            return errorResponse(runId, "No approval is waiting for this run.");
+        }
+        PendingApprovals.Pending pending = found.pending();
+        AgentRunRequest request = withApiKey(pending.request(), apiKey);
+        Prepared p = prepare(request, runId, listener, false);
+        if (p.refusal() != null) return p.refusal();
+        log.info("Agent run {} — resuming after the person {} the held call", runId,
+                approved ? "approved" : "rejected");
+        AgentResult result = new ReactLoop(p.config()).resumeDecided(runId, pending.snapshot(),
+                pending.assistantContent(), pending.toolUseId(), approved, note, request.task());
+        return finish(p, request, runId, result);
+    }
+
+    /** The waiting runs — package-private for tests. */
+    PendingApprovals pendingApprovals() {
+        return pendingApprovals;
+    }
+
+    /** Drops approvals nobody answered in time. */
+    @org.springframework.scheduling.annotation.Scheduled(fixedDelay = 5 * 60 * 1000L)
+    public void evictExpiredApprovals() {
+        pendingApprovals.evictExpired();
+    }
+
+    /** A run's loop configuration, or the response refusing to start it. */
+    private record Prepared(AgentConfig config, String tenantCode, AgentRunResponse refusal) {
+        static Prepared refused(AgentRunResponse r) { return new Prepared(null, null, r); }
+    }
+
+    /**
+     * Everything a run needs before the loop starts — shared by {@link #run} and {@link #resume}, so a
+     * resumed run cannot differ from the one that paused in tenant, tools, gate or model.
+     *
+     * @param announce whether to record a new run with Vortox (false when resuming one)
+     */
+    private Prepared prepare(AgentRunRequest request, String runId, ActivityListener listener, boolean announce) {
         // Agent config from Vortox provides defaults, resolved for THIS run's tenant. A pooled
         // sidecar serves several institutions, and model, system prompt, availableSkills and the
         // agent's own API key all differ per tenant — taking another's would run the wrong agent
@@ -164,7 +242,7 @@ public class AgentService {
             String hint = isLocalLlm
                     ? "No API key provided for local LLM. Set it on the linked agent in Vortox or pass apiKey in the request."
                     : "No API key provided. Set ANTHROPIC_API_KEY, configure the platform key in Vortox, or link an agent to this SDK app.";
-            return errorResponse(runId, hint);
+            return Prepared.refused(errorResponse(runId, hint));
         }
 
         // Skills: prefer explicit request list; fall back to agent's availableSkills from vortox.
@@ -183,8 +261,8 @@ public class AgentService {
             // nobody, so it silently disappears from usage, quotas and the per-customer switch.
             // Refusing is louder than a number that quietly under-reports.
             log.warn("Run {} refused: no customer code, and sidecar.require-tenant-code is on", runId);
-            return errorResponse(runId, "No customer code was supplied. This assistant is configured "
-                    + "to require one so every run can be attributed to a customer.");
+            return Prepared.refused(errorResponse(runId, "No customer code was supplied. This assistant is configured "
+                    + "to require one so every run can be attributed to a customer."));
         }
         if (emptyToNull(tenantCode) == null && vortoxGateway != null) {
             // With a pooled SDK key Vortox refuses every untenanted call, so the run will execute but
@@ -224,7 +302,7 @@ public class AgentService {
         String reportedAgentId = agentConfig != null && agentConfig.get("agentId") instanceof String a
                 ? a : "sidecar-agent";
 
-        if (vortoxGateway != null) {
+        if (announce && vortoxGateway != null) {
             vortoxGateway.createRun(runId, reportedAgentId, truncate(request.task(), 500), model,
                     emptyToNull(tenantCode));
         }
@@ -237,6 +315,9 @@ public class AgentService {
                 .systemPrompt(systemPrompt)
                 .tools(toolDefs)
                 .toolExecutor(activeExecutor)
+                // What the run's tools declare (requires_approval — wherever they were configured,
+                // Vortox included), then the host's own gates for tools it builds in code.
+                .toolGate(ToolApprovalGate.of(activeSkills, hostGates))
                 .enableExecuteCommand(enableExecuteCommand)
                 .activityListener(listener);
 
@@ -248,13 +329,23 @@ public class AgentService {
         if (gatewayMemoryStore != null) {
             configBuilder.memoryStore(gatewayMemoryStore);
         }
+        return new Prepared(configBuilder.build(), tenantCode, null);
+    }
 
-        AgentResult result = new ReactLoop(configBuilder.build())
-                .run(request.task(), runId, null, null, request.task());
+    /** Records the outcome and shapes the response; a run waiting for a person is kept to resume. */
+    private AgentRunResponse finish(Prepared p, AgentRunRequest request, String runId, AgentResult result) {
+        String tenantCode = p.tenantCode();
+        if (result.needsApproval()) {
+            pendingApprovals.put(runId, new PendingApprovals.Pending(withApiKey(request, null),
+                    result.approvalRequest(), result.conversationHistory(), result.approvalAssistantContent(),
+                    result.approvalToolUseId(), System.currentTimeMillis()));
+            log.info("Agent run {} — waiting for a person to approve a held call", runId);
+        }
 
         if (vortoxGateway != null) {
             vortoxGateway.updateRun(runId, result.status().name(),
-                    result.response() != null ? result.response() : result.error(),
+                    result.needsApproval() ? result.approvalRequest()
+                            : result.response() != null ? result.response() : result.error(),
                     result.inputTokens(), result.outputTokens(), emptyToNull(tenantCode));
         }
 
@@ -268,12 +359,19 @@ public class AgentService {
         return new AgentRunResponse(
                 runId,
                 result.status().name(),
-                result.response() != null ? result.response() : result.error(),
+                result.needsApproval() ? result.approvalRequest()
+                        : result.response() != null ? result.response() : result.error(),
                 calls,
                 result.inputTokens(),
                 result.outputTokens(),
                 artifacts
         );
+    }
+
+    /** The same request with a different (or no) API key. */
+    static AgentRunRequest withApiKey(AgentRunRequest r, String apiKey) {
+        return new AgentRunRequest(r.task(), r.skills(), r.systemPrompt(), r.model(), r.maxIterations(),
+                apiKey, r.llmProvider(), r.llmBaseUrl(), r.tenantCode(), r.surface(), r.runtimeInstructions());
     }
 
     /**
@@ -475,7 +573,7 @@ public class AgentService {
     }
 
     /** Returns an LlmClient when provider is "local", null otherwise (ReactLoop uses AnthropicClient). */
-    private LlmClient resolveLlmClient(String llmProvider, String llmBaseUrl) {
+    LlmClient resolveLlmClient(String llmProvider, String llmBaseUrl) {
         if ("local".equalsIgnoreCase(llmProvider) && llmBaseUrl != null && !llmBaseUrl.isBlank()) {
             return new OpenAiCompatibleLlmClient(objectMapper, defaultMaxTokens, llmBaseUrl);
         }

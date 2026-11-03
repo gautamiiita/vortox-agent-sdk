@@ -38,10 +38,22 @@ public class ChatRunService {
     /** Safety net for a RUNNING entry that never got a completion callback (e.g. a bug). */
     private static final long TTL_RUNNING_MS = 2 * 60 * 60 * 1000L;
 
-    public enum Status { RUNNING, DONE, ERROR }
+    /**
+     * APPROVAL_NEEDED: the run stopped on a tool that waits for a person; {@code approval} says what
+     * is asked, and {@link #decide} continues it.
+     */
+    public enum Status { RUNNING, APPROVAL_NEEDED, DONE, ERROR }
+
+    /** What {@link #decide} did. */
+    public enum Decision { ACCEPTED, NOT_FOUND, NOT_WAITING }
 
     private record RunState(Status status, String reply, List<AgentRunResponse.ArtifactDto> artifacts,
-                             String error, long updatedAtMs) {}
+                             String error, long updatedAtMs, String approval) {
+        RunState(Status status, String reply, List<AgentRunResponse.ArtifactDto> artifacts,
+                 String error, long updatedAtMs) {
+            this(status, reply, artifacts, error, updatedAtMs, null);
+        }
+    }
 
     private final Map<String, RunState> runs = new ConcurrentHashMap<>();
 
@@ -68,30 +80,72 @@ public class ChatRunService {
         // the queue buffers events regardless of whether a stream consumer has connected yet.
         ActivityListener listener = streamRegistry.listenerFor(runId);
 
-        executor.submit(() -> {
-            try {
-                AgentRunResponse response = agentService.run(runRequest, runId, listener);
-                String reply = (response.result() != null && !response.result().isBlank())
-                        ? response.result()
-                        : "I couldn't generate a response. Please try again.";
-                List<AgentRunResponse.ArtifactDto> artifacts =
-                        response.artifacts() != null ? response.artifacts() : List.of();
-
-                runs.put(runId, new RunState(Status.DONE, reply, artifacts, null, System.currentTimeMillis()));
-                log.info("Chat run {} completed — status={} inputTokens={} outputTokens={} artifacts={}",
-                        runId, response.status(), response.inputTokens(), response.outputTokens(), artifacts.size());
-            } catch (Exception e) {
-                log.error("Chat run {} failed: {}", runId, e.getMessage(), e);
-                runs.put(runId, new RunState(Status.ERROR, null, null,
-                        "Internal error: " + e.getMessage(), System.currentTimeMillis()));
-            } finally {
-                // Always releases a blocked stream reader, including when agentService.run(...)
-                // throws before ReactLoop ever reaches a callback that would signal completion.
-                streamRegistry.complete(runId);
-            }
-        });
+        executor.submit(() -> settle(runId, () -> agentService.run(runRequest, runId, listener)));
 
         return runId;
+    }
+
+    /**
+     * Answers a run waiting for approval and resumes it in the background: approved runs the held
+     * call, rejected tells the agent it may not. Exactly one decision is taken per wait — a second
+     * click, or a decision for a run that is not waiting, changes nothing.
+     *
+     * @param apiKey the person's model key, brought again: a waiting run does not keep it
+     */
+    public Decision decide(String runId, boolean approved, String note, String apiKey) {
+        RunState current = runId == null ? null : runs.get(runId);
+        if (current == null) return Decision.NOT_FOUND;
+        if (current.status() != Status.APPROVAL_NEEDED) return Decision.NOT_WAITING;
+        RunState resumed = new RunState(Status.RUNNING, null, null, null, System.currentTimeMillis());
+        // Compare-and-set on the exact state read: two decisions racing cannot both resume the run.
+        if (!runs.replace(runId, current, resumed)) return Decision.NOT_WAITING;
+
+        ActivityListener listener = streamRegistry.listenerFor(runId);
+        executor.submit(() -> settle(runId, () -> agentService.resume(runId, approved, note, apiKey, listener)));
+        log.info("Chat run {} {} by the user — resuming", runId, approved ? "approved" : "rejected");
+        return Decision.ACCEPTED;
+    }
+
+    /**
+     * Runs one stretch of the agent and records where it ended: waiting for a person, done, or
+     * failed. FAILED (refused before the loop — no key, an expired approval) and ERROR (the loop
+     * failed) are errors, not replies, so the widget can react instead of printing the failure as if
+     * the agent had said it.
+     */
+    private void settle(String runId, java.util.function.Supplier<AgentRunResponse> stretch) {
+        try {
+            AgentRunResponse response = stretch.get();
+            long now = System.currentTimeMillis();
+            if ("APPROVAL_NEEDED".equals(response.status())) {
+                runs.put(runId, new RunState(Status.APPROVAL_NEEDED, null, null, null, now, response.result()));
+                log.info("Chat run {} waiting for approval", runId);
+                return;
+            }
+            if ("FAILED".equals(response.status()) || "ERROR".equals(response.status())) {
+                String why = response.result() != null && !response.result().isBlank()
+                        ? response.result() : "The agent run failed.";
+                runs.put(runId, new RunState(Status.ERROR, null, null, why, now));
+                log.info("Chat run {} failed: {}", runId, why);
+                return;
+            }
+            String reply = (response.result() != null && !response.result().isBlank())
+                    ? response.result()
+                    : "I couldn't generate a response. Please try again.";
+            List<AgentRunResponse.ArtifactDto> artifacts =
+                    response.artifacts() != null ? response.artifacts() : List.of();
+
+            runs.put(runId, new RunState(Status.DONE, reply, artifacts, null, now));
+            log.info("Chat run {} completed — status={} inputTokens={} outputTokens={} artifacts={}",
+                    runId, response.status(), response.inputTokens(), response.outputTokens(), artifacts.size());
+        } catch (Exception e) {
+            log.error("Chat run {} failed: {}", runId, e.getMessage(), e);
+            runs.put(runId, new RunState(Status.ERROR, null, null,
+                    "Internal error: " + e.getMessage(), System.currentTimeMillis()));
+        } finally {
+            // Always releases a blocked stream reader, including when the agent throws before
+            // ReactLoop ever reaches a callback that would signal completion.
+            streamRegistry.complete(runId);
+        }
     }
 
     /** Returns the current status/result payload for a run, or empty if unknown/expired. */
@@ -105,6 +159,7 @@ public class ChatRunService {
         if (s.reply() != null)     body.put("reply", s.reply());
         if (s.artifacts() != null) body.put("artifacts", s.artifacts());
         if (s.error() != null)     body.put("error", s.error());
+        if (s.approval() != null)  body.put("approval", s.approval());
         return Optional.of(body);
     }
 
@@ -114,7 +169,7 @@ public class ChatRunService {
         long now = System.currentTimeMillis();
         int before = runs.size();
         runs.values().removeIf(s -> {
-            long ttl = s.status() == Status.RUNNING ? TTL_RUNNING_MS : TTL_DONE_MS;
+            long ttl = s.status() == Status.DONE || s.status() == Status.ERROR ? TTL_DONE_MS : TTL_RUNNING_MS;
             return now - s.updatedAtMs() > ttl;
         });
         int removed = before - runs.size();

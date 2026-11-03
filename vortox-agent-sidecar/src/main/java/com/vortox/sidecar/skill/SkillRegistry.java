@@ -184,7 +184,7 @@ public class SkillRegistry {
 
             target.put(p.name(), new SkillDefinition(
                     p.name(), p.description(), p.language(), p.timeoutSeconds(), p.inputSchema(),
-                    p.implementation(), content, p.producesArtifact()));
+                    p.implementation(), content, p.producesArtifact(), p.requiresApproval()));
 
             // Restore provenance from disk. Keyed by the parsed name rather than the directory name
             // because that is what the registry and isUsable() key on — the two can differ, and the
@@ -201,7 +201,7 @@ public class SkillRegistry {
     /** Parsed-but-not-yet-registered view of a SKILL.md — lets save() validate before writing anything. */
     private record ParsedSkill(String name, String description, String language, int timeoutSeconds,
                                 Map<String, Object> inputSchema, String implementation,
-                                SkillDefinition.ProducesArtifact producesArtifact) {}
+                                SkillDefinition.ProducesArtifact producesArtifact, String requiresApproval) {}
 
     @SuppressWarnings("unchecked")
     private ParsedSkill parse(String content) {
@@ -218,7 +218,19 @@ public class SkillRegistry {
         SkillDefinition.ProducesArtifact producesArtifact = parseProducesArtifact(
                 (Map<String, Object>) parsed.get("produces_artifact"));
 
-        return new ParsedSkill(name, description, language, timeout, schema, implementation, producesArtifact);
+        return new ParsedSkill(name, description, language, timeout, schema, implementation, producesArtifact,
+                parseRequiresApproval(parsed.get("requires_approval")));
+    }
+
+    /**
+     * Reads the optional {@code requires_approval} declaration: a text (with {@code {field}}
+     * placeholders) to show a person before the call runs, {@code true} for a default text (""), or
+     * absent / {@code false} / anything else for a tool that runs without asking.
+     */
+    static String parseRequiresApproval(Object raw) {
+        if (raw instanceof String s) return s.trim();
+        if (Boolean.TRUE.equals(raw)) return "";
+        return null;
     }
 
     /** Reads the optional {@code produces_artifact: {path_field, source}} declaration off a SKILL.md. */
@@ -404,7 +416,7 @@ public class SkillRegistry {
 
         SkillDefinition saved = new SkillDefinition(
                 p.name(), p.description(), p.language(), p.timeoutSeconds(), p.inputSchema(),
-                p.implementation(), content, p.producesArtifact());
+                p.implementation(), content, p.producesArtifact(), p.requiresApproval());
         targetMap(tenantId).put(p.name(), saved);
         log.info("Saved skill: {} ({})", name, tenantId == null ? "shared" : "tenant " + tenantId);
         return saved;
@@ -524,7 +536,7 @@ public class SkillRegistry {
                     tenantId, name, e.getMessage());
         }
         return new SkillDefinition(p.name(), p.description(), p.language(), p.timeoutSeconds(),
-                p.inputSchema(), p.implementation(), content, p.producesArtifact());
+                p.inputSchema(), p.implementation(), content, p.producesArtifact(), p.requiresApproval());
     }
 
     /** Removes a skill's directory without touching the in-memory tier. */

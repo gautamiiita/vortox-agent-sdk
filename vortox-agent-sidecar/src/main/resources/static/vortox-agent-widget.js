@@ -18,6 +18,13 @@
   var MODELS = (Array.isArray(cfg.models) ? cfg.models : [])
     .filter(function (m) { return m && typeof m.id === 'string' && m.id; });
   var MODEL_STORAGE = cfg.modelStorageKey || 'vx_model';
+  // The accent: launcher, the person's own messages, Send, focus ring, chips, links. A host sets its
+  // brand colour; only a plain colour value is accepted, so a page cannot inject CSS through it.
+  function cssColor(v, fallback) {
+    return typeof v === 'string' && /^(#[0-9a-fA-F]{3,8}|rgba?\([0-9.,%\s]+\))$/.test(v.trim()) ? v.trim() : fallback;
+  }
+  var ACCENT       = cssColor(cfg.accentColor, '#2563eb');
+  var ACCENT_HOVER = cssColor(cfg.accentHoverColor, cssColor(cfg.accentColor, null) ? ACCENT : '#1d4ed8');
   // Which tenant's skills and secrets the run should use. A real host does NOT set this: its relay
   // derives it from the authenticated session and discards whatever the page sent, because it
   // decides which customer's credentials get injected (TnamChatContextEnricher does exactly that).
@@ -171,10 +178,11 @@
   var style = document.createElement('style');
   style.textContent = [
     /* FAB */
-    '#vx-fab{position:fixed;bottom:24px;right:24px;width:48px;height:48px;background:#2563eb;',
+    '#vx-fab,#vx-panel{--vx-accent:' + ACCENT + ';--vx-accent-hover:' + ACCENT_HOVER + ';}',
+    '#vx-fab{position:fixed;bottom:24px;right:24px;width:48px;height:48px;background:var(--vx-accent);',
     'border:none;border-radius:50%;cursor:pointer;display:flex;align-items:center;justify-content:center;',
-    'box-shadow:0 4px 14px rgba(37,99,235,0.4);z-index:9998;transition:background 0.15s,box-shadow 0.15s;}',
-    '#vx-fab:hover{background:#1d4ed8;box-shadow:0 6px 18px rgba(37,99,235,0.5);}',
+    'box-shadow:0 4px 14px color-mix(in srgb,var(--vx-accent) 40%,transparent);z-index:9998;transition:background 0.15s,box-shadow 0.15s;}',
+    '#vx-fab:hover{background:var(--vx-accent-hover);box-shadow:0 6px 18px color-mix(in srgb,var(--vx-accent) 50%,transparent);}',
     '#vx-fab svg{width:22px;height:22px;fill:none;stroke:#ffffff;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;}',
 
     /* Panel */
@@ -231,7 +239,7 @@
     /* User bubble */
     '.vx-msg-user{align-self:flex-end;max-width:82%;color:#ffffff;',
     'font-family:' + VX_FONT + ';font-size:13px;line-height:1.5;',
-    'background:#2563eb;padding:10px 14px;border-radius:14px 14px 4px 14px;word-break:break-word;}',
+    'background:var(--vx-accent);padding:10px 14px;border-radius:14px 14px 4px 14px;word-break:break-word;}',
 
     /* Markdown: paragraphs */
     '.vx-msg-agent .vx-p{margin:0 0 8px;}',
@@ -314,14 +322,14 @@
     '-webkit-line-clamp:2;-webkit-box-orient:vertical;word-break:break-word;}',
     '.vx-step-more{align-self:flex-start;background:none;border:none;padding:2px 0 4px 22px;',
     'color:#64748b;font-family:' + VX_FONT + ';font-size:11px;cursor:pointer;text-align:left;}',
-    '.vx-step-more:hover{color:#2563eb;text-decoration:underline;}',
+    '.vx-step-more:hover{color:var(--vx-accent);text-decoration:underline;}',
 
     /* Collapsed step summary — rendered above the final reply once the run completes;
        click to expand/collapse the full trace (Claude Desktop's "Thought for Xs" pattern) */
     '.vx-summary{align-self:flex-start;display:inline-flex;align-items:center;gap:6px;',
     'padding:5px 10px;background:#f8faff;border:1px solid #e2e8f0;border-radius:20px;cursor:pointer;',
     'color:#64748b;font-family:' + VX_FONT + ';font-size:11px;font-weight:600;transition:background .15s;}',
-    '.vx-summary:hover{background:#eff6ff;}',
+    '.vx-summary:hover{background:color-mix(in srgb,var(--vx-accent) 8%,#fff);}',
     '.vx-summary-chevron{display:inline-block;transition:transform .15s;font-size:9px;}',
     '.vx-summary.vx-summary-open .vx-summary-chevron{transform:rotate(90deg);}',
     '.vx-summary-detail{display:none;align-self:flex-start;max-width:100%;background:#f8faff;',
@@ -348,7 +356,7 @@
     '.vx-chip{background:#ffffff;border:1px solid #e2e8f0;color:#475569;',
     'font-family:' + VX_FONT + ';font-size:12px;padding:5px 11px;border-radius:20px;cursor:pointer;',
     'white-space:nowrap;transition:border-color .15s,background .15s,color .15s;}',
-    '.vx-chip:hover{border-color:#2563eb;color:#2563eb;background:#eff6ff;}',
+    '.vx-chip:hover{border-color:var(--vx-accent);color:var(--vx-accent);background:color-mix(in srgb,var(--vx-accent) 8%,#fff);}',
 
     /* Input row */
     '#vx-form{padding:10px 14px 14px;border-top:1px solid #e2e8f0;display:flex;align-items:flex-end;gap:8px;flex-shrink:0;background:#ffffff;',
@@ -357,12 +365,14 @@
     'color:#1e293b !important;font-family:' + VX_FONT + ' !important;font-size:13px;padding:9px 13px;outline:none;',
     'transition:border-color .15s,box-shadow .15s;box-shadow:none !important;',
     'resize:none;overflow:hidden;min-height:38px;max-height:120px;line-height:1.5;display:block;}',
-    '#vx-input:focus{border-color:#2563eb !important;box-shadow:0 0 0 3px rgba(37,99,235,0.1) !important;}',
+    '#vx-input:focus{border-color:var(--vx-accent) !important;box-shadow:0 0 0 3px color-mix(in srgb,var(--vx-accent) 10%,transparent) !important;}',
     '#vx-input::placeholder{color:#94a3b8 !important;}',
-    '#vx-send{background:#2563eb;border:none;border-radius:10px;color:#ffffff;',
+    '.vx-msg-agent a{color:var(--vx-accent);text-decoration:underline;text-underline-offset:2px;}',
+    '.vx-msg-agent a:hover{color:var(--vx-accent-hover);}',
+    '#vx-send{background:var(--vx-accent);border:none;border-radius:10px;color:#ffffff;',
     'cursor:pointer;padding:9px 18px;font-family:' + VX_FONT + ';font-size:13px;font-weight:600;',
     'transition:background .15s;white-space:nowrap;}',
-    '#vx-send:hover:not(:disabled){background:#1d4ed8;}',
+    '#vx-send:hover:not(:disabled){background:var(--vx-accent-hover);}',
     '#vx-send:disabled{opacity:.45;cursor:default;}',
 
     /* Page-script execution feedback */
@@ -375,11 +385,11 @@
 
     /* Downloadable artifact chip (files the agent generated, e.g. reports) */
     '.vx-artifact{display:inline-flex;align-items:center;gap:6px;margin:8px 6px 0 0;padding:6px 10px;',
-    'background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;cursor:pointer;',
-    'color:#1d4ed8;font-family:' + VX_FONT + ';font-size:12px;font-weight:600;',
+    'background:color-mix(in srgb,var(--vx-accent) 8%,#fff);border:1px solid #bfdbfe;border-radius:8px;cursor:pointer;',
+    'color:var(--vx-accent-hover);font-family:' + VX_FONT + ';font-size:12px;font-weight:600;',
     'transition:background .15s,border-color .15s;}',
     '.vx-artifact:hover{background:#dbeafe;border-color:#93c5fd;}',
-    '.vx-artifact svg{stroke:#1d4ed8;flex-shrink:0;}',
+    '.vx-artifact svg{stroke:var(--vx-accent-hover);flex-shrink:0;}',
     '.vx-artifact-size{color:#64748b;font-weight:400;margin-left:2px;}',
 
     /* Page actions — what the agent asked the page to do, and what actually happened */
@@ -390,7 +400,7 @@
     '.vx-actions-list{padding:3px 0;}',
     '.vx-action-row{display:flex;align-items:baseline;gap:7px;padding:5px 10px;font-size:12px;}',
     '.vx-action-name{font-family:ui-monospace,monospace;font-size:11.5px;font-weight:600;',
-    'color:#be1250;flex:0 0 auto;}',
+    'color:var(--vx-accent);flex:0 0 auto;}',
     '.vx-action-args{font-family:ui-monospace,monospace;font-size:11px;color:#64748b;',
     'overflow-wrap:anywhere;min-width:0;}',
     '.vx-action-state{margin-left:auto;flex:0 0 auto;font-size:10.5px;font-weight:700;}',
@@ -409,12 +419,12 @@
     '.vx-action-btn{font-family:inherit;font-size:12px;font-weight:600;padding:5px 12px;',
     'border-radius:6px;border:1px solid #e2e8f0;background:#fff;color:#334155;cursor:pointer;}',
     '.vx-action-btn:hover{background:#f8fafc;}',
-    '.vx-action-btn-primary{background:#be1250;border-color:#be1250;color:#fff;}',
-    '.vx-action-btn-primary:hover{background:#a30f45;}',
+    '.vx-action-btn-primary{background:var(--vx-accent);border-color:var(--vx-accent);color:#fff;}',
+    '.vx-action-btn-primary:hover{background:var(--vx-accent-hover);}',
     '.vx-actions-runas{margin-left:auto;font-size:10.5px;color:#94a3b8;}',
     /* Applied to the host page, so it is namespaced and deliberately unobtrusive —
        an outline rather than a background, which would fight the application\'s own styling. */
-    '.vx-action-highlight{outline:2px solid #be1250 !important;outline-offset:1px !important;',
+    '.vx-action-highlight{outline:2px solid var(--vx-accent) !important;outline-offset:1px !important;',
     'transition:outline-color .2s;}'
   ].join('');
   document.head.appendChild(style);

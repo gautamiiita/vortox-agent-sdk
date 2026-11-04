@@ -47,6 +47,33 @@ public class AgentController {
     @Autowired(required = false)
     private AnthropicKeyRefreshService anthropicKeyRefreshService;
 
+    /**
+     * Whether chat runs are told how to write their reply (see {@link #REPLY_FORMAT}). On by
+     * default; a host whose page shows replies as plain text turns it off.
+     */
+    @org.springframework.beans.factory.annotation.Value("${sidecar.chat.reply-format:true}")
+    private boolean chatReplyFormat = true;
+
+    /**
+     * How a chat reply is written. The widget renders Markdown (headings, bold, italic, inline code,
+     * links, bullet and numbered lists, tables, rules, code blocks); told nothing, models answered
+     * in one dense paragraph and often described their answer ("Gave a side-by-side summary")
+     * instead of giving it. A host's own instructions may say more, and win where they differ.
+     */
+    static final String REPLY_FORMAT = """
+
+            ## How to reply
+            The person reads only your final message, in a chat window that renders Markdown.
+            - Make it the answer itself: the data, the comparison, the result. Never a description of
+              the answer ("Gave a summary", "Listed the tables"). If you finish with task_complete, its
+              summary is shown as your reply, so it must be that same full answer.
+            - Open with one **bold** sentence that answers the question; then the detail.
+            - Use a table to compare things, a bullet list for anything that is a list (one level only),
+              and a `###` heading per part only when there are several parts.
+            - Put identifiers, codes and names of fields in `backticks`.
+            - Keep paragraphs short, with a blank line between them. No HTML.
+            - End with a line starting **Next step:** when there is one thing the person should do now.""";
+
     public AgentController(AgentService agentService, SkillRegistry skillRegistry,
                             ChatRunService chatRunService, AgentStreamRegistry streamRegistry) {
         this.agentService   = agentService;
@@ -245,6 +272,10 @@ public class AgentController {
         }
 
         appendPageActionInstructions(systemPrompt, request);
+
+        // How to write the reply: runtime instructions, never the persona, so a linked agent's own
+        // prompt is untouched; last, so it is the final word on form before the task.
+        if (chatReplyFormat) systemPrompt.append(REPLY_FORMAT);
 
         // ── Task: context + history + message ────────────────────────────────
         StringBuilder task = new StringBuilder();

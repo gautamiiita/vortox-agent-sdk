@@ -25,14 +25,20 @@ import static org.mockito.Mockito.when;
  */
 class AgentControllerChatPromptTest {
 
-    private final ChatRunService chatRunService = mock(ChatRunService.class);
 
     private AgentRunRequest runStartedBy(AgentChatRequest request) {
+        return runStartedBy(request, true);
+    }
+
+    private AgentRunRequest runStartedBy(AgentChatRequest request, boolean replyFormat) {
+        // A fresh mock per chat, so a test may start several and read each one's own run.
+        ChatRunService chatRunService = mock(ChatRunService.class);
         when(chatRunService.start(any())).thenReturn("run-1");
 
         AgentController controller = new AgentController(
                 mock(AgentService.class), mock(SkillRegistry.class),
                 chatRunService, mock(AgentStreamRegistry.class));
+        org.springframework.test.util.ReflectionTestUtils.setField(controller, "chatReplyFormat", replyFormat);
         controller.chat(request);
 
         ArgumentCaptor<AgentRunRequest> captor = ArgumentCaptor.forClass(AgentRunRequest.class);
@@ -55,10 +61,37 @@ class AgentControllerChatPromptTest {
 
     @Test
     void aRequestWithNeitherPersonaNorActionsLeavesBothFieldsEmpty() {
-        AgentRunRequest run = runStartedBy(chat(null, null, null));
+        AgentRunRequest run = runStartedBy(chat(null, null, null), false);
 
         assertThat(run.systemPrompt()).isNull();
         assertThat(run.runtimeInstructions()).isNull();
+    }
+
+    /**
+     * A chat reply is read in the widget, which renders Markdown. Told nothing, models answered in
+     * one dense paragraph, and often described their answer ("Gave a side-by-side summary") instead
+     * of giving it.
+     */
+    @Test
+    void everyChatRunIsToldHowToReply() {
+        AgentRunRequest run = runStartedBy(chat(null, null, null));
+
+        assertThat(run.runtimeInstructions())
+                .contains("## How to reply")
+                .contains("Markdown")
+                .contains("the answer itself")
+                .contains("task_complete");
+        assertThat(run.systemPrompt()).as("never in the persona: a linked agent's prompt is not ours to replace")
+                .isNull();
+    }
+
+    @Test
+    void theReplyFormatComesAfterPageActionsAndCanBeTurnedOff() {
+        String withActions = runStartedBy(chat(null, List.of("highlight"), null)).runtimeInstructions();
+        assertThat(withActions.indexOf("## How to reply")).isGreaterThan(withActions.indexOf("## Page Actions"));
+
+        String off = runStartedBy(chat(null, List.of("highlight"), null), false).runtimeInstructions();
+        assertThat(off).contains("## Page Actions").doesNotContain("## How to reply");
     }
 
     /**

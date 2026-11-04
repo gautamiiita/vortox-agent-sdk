@@ -332,6 +332,18 @@ public class AgentService {
         return new Prepared(configBuilder.build(), tenantCode, null);
     }
 
+    /**
+     * The text a run hands back. A run that stops to ask the person something carries its question in
+     * {@code clarificationQuestion()}, not in {@code response()}: reading only response/error dropped it,
+     * and the chat widget showed "I couldn't generate a response" where the agent had asked, say, which
+     * institution it meant. The question IS the reply — the person answers it in their next message.
+     */
+    static String replyOf(AgentResult result) {
+        if (result.needsApproval()) return result.approvalRequest();
+        if (result.needsClarification()) return result.clarificationQuestion();
+        return result.response() != null ? result.response() : result.error();
+    }
+
     /** Records the outcome and shapes the response; a run waiting for a person is kept to resume. */
     private AgentRunResponse finish(Prepared p, AgentRunRequest request, String runId, AgentResult result) {
         String tenantCode = p.tenantCode();
@@ -344,8 +356,7 @@ public class AgentService {
 
         if (vortoxGateway != null) {
             vortoxGateway.updateRun(runId, result.status().name(),
-                    result.needsApproval() ? result.approvalRequest()
-                            : result.response() != null ? result.response() : result.error(),
+                    replyOf(result),
                     result.inputTokens(), result.outputTokens(), emptyToNull(tenantCode));
         }
 
@@ -359,8 +370,7 @@ public class AgentService {
         return new AgentRunResponse(
                 runId,
                 result.status().name(),
-                result.needsApproval() ? result.approvalRequest()
-                        : result.response() != null ? result.response() : result.error(),
+                replyOf(result),
                 calls,
                 result.inputTokens(),
                 result.outputTokens(),

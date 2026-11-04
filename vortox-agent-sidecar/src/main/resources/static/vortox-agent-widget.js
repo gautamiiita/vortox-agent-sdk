@@ -390,6 +390,9 @@
     '.vx-state-muted{color:#94a3b8;font-weight:600;}',
     '.vx-actions-note{padding:7px 10px;font-size:11.5px;line-height:1.45;}',
     '.vx-actions-note-stop{background:#fef2f2;color:#b91c1c;}',
+    /* A direct child of the scrolling message column, unlike page-action cards (inside a message):
+       with overflow:hidden it would otherwise shrink to zero height once the conversation scrolls. */
+    '.vx-approval{flex:none;}',
     '.vx-approval-text{white-space:pre-wrap;color:#0f172a;}',
     '.vx-actions-foot{display:flex;align-items:center;gap:7px;padding:8px 10px;',
     'border-top:1px solid #e2e8f0;}',

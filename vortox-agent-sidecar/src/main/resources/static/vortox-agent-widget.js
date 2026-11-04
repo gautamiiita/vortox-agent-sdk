@@ -11,6 +11,13 @@
   // the surfaces registered for this application; anything unrecognised falls back to the
   // application default, so a typo degrades rather than breaks.
   var SURFACE              = cfg.surface              || '';
+  // Models the person may choose between: [{ id, label, default? }]. With two or more, the header
+  // shows a selector and each message carries the chosen id as `model`; with fewer, nothing is
+  // shown or sent and the sidecar's default applies. The choice is remembered in this browser.
+  // A host relay should still accept only the ids it offers: the page is not the authority.
+  var MODELS = (Array.isArray(cfg.models) ? cfg.models : [])
+    .filter(function (m) { return m && typeof m.id === 'string' && m.id; });
+  var MODEL_STORAGE = cfg.modelStorageKey || 'vx_model';
   // Which tenant's skills and secrets the run should use. A real host does NOT set this: its relay
   // derives it from the authenticated session and discards whatever the page sent, because it
   // decides which customer's credentials get injected (TnamChatContextEnricher does exactly that).
@@ -197,6 +204,9 @@
     'box-shadow:0 0 0 2px rgba(34,197,94,0.25);animation:vx-pulse 2.4s ease-in-out infinite;}',
     '@keyframes vx-pulse{0%,100%{opacity:1}50%{opacity:.5}}',
     '#vx-header-actions{display:flex;align-items:center;gap:2px;}',
+    '.vx-model{font-family:' + VX_FONT + ';font-size:12px;color:#334155;background:#fff;',
+    'border:1px solid #e2e8f0;border-radius:6px;padding:3px 6px;margin-right:6px;max-width:160px;cursor:pointer;}',
+    '.vx-model:focus-visible{outline:2px solid #94a3b8;outline-offset:1px;}',
     '.vx-header-btn{background:none;border:none;color:#94a3b8;cursor:pointer;',
     'display:flex;align-items:center;justify-content:center;padding:4px;border-radius:6px;',
     'transition:color .15s,background .15s;}',
@@ -1186,6 +1196,37 @@
     '<line x1="14" y1="4" x2="14" y2="20"/></svg>';
   var RESTORE_ICON  = '<svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>';
 
+  // ── Model choice ────────────────────────────────────────────────────────────────
+
+  /** The model to use: the one remembered here if it is still offered, else the one marked
+   *  default, else the first. Null when nothing is offered. */
+  function pickModel(models, remembered) {
+    if (!models.length) return null;
+    for (var i = 0; i < models.length; i++) if (models[i].id === remembered) return models[i].id;
+    for (var j = 0; j < models.length; j++) if (models[j]['default']) return models[j].id;
+    return models[0].id;
+  }
+
+  function readModel() {
+    try { return localStorage.getItem(MODEL_STORAGE); } catch (e) { return null; }
+  }
+
+  function writeModel(id) {
+    try { localStorage.setItem(MODEL_STORAGE, id); } catch (e) { /* not remembered; still used */ }
+  }
+
+  var currentModel = pickModel(MODELS, readModel());
+
+  function modelSelectHtml() {
+    if (MODELS.length < 2) return '';
+    return '<select id="vx-model" class="vx-model" aria-label="Model" title="Model for your next message">' +
+      MODELS.map(function (m) {
+        return '<option value="' + esc(m.id) + '"' + (m.id === currentModel ? ' selected' : '') + '>' +
+          esc(m.label || m.id) + '</option>';
+      }).join('') +
+      '</select>';
+  }
+
   panel.innerHTML =
     '<div id="vx-header">' +
       '<div style="display:flex;align-items:center">' +
@@ -1193,6 +1234,7 @@
         '<span id="vx-header-title">' + esc(TITLE) + '</span>' +
       '</div>' +
       '<div id="vx-header-actions">' +
+        modelSelectHtml() +
         '<button id="vx-minimize" class="vx-header-btn" aria-label="Minimize" title="Minimize">&minus;</button>' +
         '<button id="vx-maximize" class="vx-header-btn" aria-label="Expand to side panel" title="Expand to side panel">' +
           MAXIMIZE_ICON +
@@ -1270,6 +1312,13 @@
   var inputEl       = document.getElementById('vx-input');
   var sendBtn       = document.getElementById('vx-send');
   var maximizeBtn   = document.getElementById('vx-maximize');
+  var modelSelect   = document.getElementById('vx-model');
+  if (modelSelect) {
+    modelSelect.addEventListener('change', function () {
+      currentModel = modelSelect.value;
+      writeModel(currentModel);
+    });
+  }
 
   // ── Suggestions ───────────────────────────────────────────────────────────────
 
@@ -1553,6 +1602,7 @@
     // not a description: the prose about the page already travels in `context`. Omitted entirely
     // when the host has not named its screens, which reads as "the application default".
     if (SURFACE) { payload.surface = SURFACE; }
+    if (currentModel) { payload.model = currentModel; }
     if (TENANT_CODE) { payload.tenantCode = TENANT_CODE; }
 
     // One place builds the snapshot, whichever capability wanted it. It used to be assembled

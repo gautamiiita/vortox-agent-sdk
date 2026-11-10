@@ -82,6 +82,15 @@ public final class AgentConfig {
      */
     private final int compactAtTokens;
 
+    /**
+     * Which tools may run at the same time as others in one reply. A tool it answers false for runs on
+     * its own, after the calls before it have finished, so two writes or a write and a command never
+     * overlap. Null keeps the old behaviour: every call of a reply runs in parallel.
+     */
+    private final java.util.function.Predicate<String> concurrentTool;
+    /** The run's spending cap; {@link BudgetGuard#NONE} when there is none. */
+    private final BudgetGuard budgetGuard;
+
     /** Where compaction starts by default: close to, and safely under, a 1M-token context window. */
     public static final int DEFAULT_COMPACT_AT_TOKENS = 800_000;
 
@@ -109,6 +118,8 @@ public final class AgentConfig {
         this.toolGate            = b.toolGate != null ? b.toolGate : ToolGate.OPEN;
         this.toolWaitSeconds     = Map.copyOf(b.toolWaitSeconds);
         this.compactAtTokens     = b.compactAtTokens;
+        this.concurrentTool      = b.concurrentTool;
+        this.budgetGuard         = b.budgetGuard != null ? b.budgetGuard : BudgetGuard.NONE;
     }
 
     public static Builder builder() { return new Builder(); }
@@ -137,6 +148,9 @@ public final class AgentConfig {
     public TaskSpawner getTaskSpawner()    { return taskSpawner; }
     public ToolGate getToolGate()          { return toolGate; }
     public int getCompactAtTokens()        { return compactAtTokens; }
+    /** See {@link Builder#concurrentTools}; null when every call may run in parallel. */
+    public java.util.function.Predicate<String> getConcurrentTool() { return concurrentTool; }
+    public BudgetGuard getBudgetGuard()    { return budgetGuard; }
     /** The wait declared for {@code toolName} with {@link Builder#toolWait}, or null for the default. */
     public Integer getToolWaitSeconds(String toolName) {
         return toolName == null ? null : toolWaitSeconds.get(toolName);
@@ -170,6 +184,17 @@ public final class AgentConfig {
         private ToolGate toolGate            = ToolGate.OPEN;
         private final Map<String, Integer> toolWaitSeconds = new java.util.HashMap<>();
         private int compactAtTokens          = DEFAULT_COMPACT_AT_TOKENS;
+        private java.util.function.Predicate<String> concurrentTool = null;
+        private BudgetGuard budgetGuard      = BudgetGuard.NONE;
+
+        /**
+         * Which tools may run alongside others in one reply (true for reads). The rest run one at a
+         * time, in the order the model asked for them. Unset, every call runs in parallel.
+         */
+        public Builder concurrentTools(java.util.function.Predicate<String> mayRunAlongside) { this.concurrentTool = mayRunAlongside; return this; }
+
+        /** A spending cap checked after every reply; see {@link BudgetGuard}. Null means none. */
+        public Builder budgetGuard(BudgetGuard guard)          { this.budgetGuard = guard; return this; }
 
         /** See {@link AgentConfig#getCompactAtTokens()}. 0 turns compaction off. */
         public Builder compactAtTokens(int tokens)             { this.compactAtTokens = Math.max(0, tokens); return this; }

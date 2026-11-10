@@ -485,6 +485,9 @@ public final class ReactLoop {
     /** The stop reason for a reply that ran out of output tokens (OpenAI's "length" maps to it). */
     static final String MAX_TOKENS_STOP = "max_tokens";
 
+    /** How a run stopped at its spending cap begins its reply; the host recognises it by this. */
+    public static final String SPENDING_CAP_REPLY = "Task incomplete — spending cap reached: ";
+
     static final String TRUNCATED_TOOL_CALL =
             "Not executed — your reply hit the output token limit and was cut off while writing "
             + "this call, so its arguments are incomplete. Do not repeat it at the same size: it "
@@ -773,6 +776,19 @@ public final class ReactLoop {
                     response.getCacheCreationInputTokens(), response.getCacheReadInputTokens(),
                     callMs, counted[0], (int) thinking[0], thinking[1]));
 
+            // The spending cap, checked once the reply's cost is known and before anything in it runs:
+            // over it, the run stops here as PARTIAL with its conversation, as at the iteration limit.
+            String over = overBudget(tag, totalIn, totalOut, totalCC, totalCR);
+            if (over != null) {
+                log.warn("ReactLoop [{}] stopped at the spending cap on iteration {}: {}", tag, iterations, over);
+                listener.onError(runId, "Spending cap reached: " + over);
+                AgentResult r = AgentResult.partial(SPENDING_CAP_REPLY + over,
+                        iterations, toolCalls, resumableHistory(messages),
+                        totalIn, totalOut, totalCC, totalCR).withCompletionVerdict(verdict);
+                listener.onComplete(runId, r);
+                return r;
+            }
+
             // What actually went over the wire this turn. Tagged like every other line, so a reader
             // can follow one agent's conversation about one task through a log holding many.
             log.debug("ReactLoop [{}] LLM turn {} — model={} sent {} message(s), {} tool(s); "
@@ -1051,16 +1067,24 @@ public final class ReactLoop {
             // ── Persist full assistant turn ───────────────────────────────────
             messages.add(Map.of("role", "assistant", "content", toContentList(response)));
 
-            // ── Execute all tools in parallel ─────────────────────────────────
+            // ── Execute the reply's tools ─────────────────────────────────────
+            // Reads run side by side. A tool the host does not mark as safe to overlap — a write, a
+            // command — runs on its own once the calls before it are done, in the order the model
+            // asked for them, the way Claude Code runs Edit/Write/Bash: two edits of one file, or an
+            // install beside a test run, used to race. Without a host rule every call of the reply
+            // runs in one parallel batch, as it always has.
             record ToolOutcome(String result, boolean success, long durationMs) {}
             record IndexedOutcome(AnthropicClient.ContentBlock toolUse,
                                    Future<ToolOutcome> future) {}
 
+            List<Map<String, Object>> toolResults = new ArrayList<>();
+            for (List<AnthropicClient.ContentBlock> batch
+                    : batches(uses, AnthropicClient.ContentBlock::getToolName, config.getConcurrentTool())) {
             // One clock for the whole batch: each tool's wait is measured from when the batch was
             // dispatched, not from when the previous get() returned — two hung tools used to cost
             // twice the timeout. And a FutureTask, so cancelling a timed-out tool interrupts it.
             final long dispatchedAt = System.currentTimeMillis();
-            List<IndexedOutcome> futures = uses.stream().map(toolUse -> {
+            List<IndexedOutcome> futures = batch.stream().map(toolUse -> {
                 FutureTask<ToolOutcome> f = new FutureTask<>(() -> {
                     long t0 = System.currentTimeMillis();
                     listener.onToolCall(runId, toolUse.getToolName(), toolUse.getToolInput());
@@ -1084,7 +1108,6 @@ public final class ReactLoop {
                 return new IndexedOutcome(toolUse, f);
             }).toList();
 
-            List<Map<String, Object>> toolResults = new ArrayList<>();
             for (IndexedOutcome indexed : futures) {
                 AnthropicClient.ContentBlock toolUse = indexed.toolUse();
                 ToolOutcome outcome;
@@ -1121,6 +1144,7 @@ public final class ReactLoop {
                 if (!outcome.success()) tr.put("is_error", true);
                 toolResults.add(tr);
             }
+            }
 
             messages.add(Map.of("role", "user", "content", toolResults));
             // Tools load_tools asked for this turn, surfaced for the next one — appended, so the cache holds.
@@ -1154,6 +1178,49 @@ public final class ReactLoop {
                 totalIn, totalOut, totalCC, totalCR).withCompletionVerdict(verdict);
         listener.onComplete(runId, r);
         return r;
+    }
+
+    /**
+     * A reply's tool calls in the batches they run in, in order. Consecutive calls the host marks as
+     * safe to overlap share a batch; any other call is a batch of its own. A null rule is one batch —
+     * every call in parallel. A rule that throws for a name counts it as unsafe: running it alone is
+     * slower, never wrong.
+     */
+    static <T> List<List<T>> batches(List<T> uses, java.util.function.Function<T, String> nameOf,
+                                     java.util.function.Predicate<String> mayRunAlongside) {
+        if (uses == null || uses.isEmpty()) return List.of();
+        if (mayRunAlongside == null) return List.of(uses);
+        List<List<T>> out = new ArrayList<>();
+        List<T> open = null;
+        for (T use : uses) {
+            boolean alongside;
+            try {
+                alongside = mayRunAlongside.test(nameOf.apply(use));
+            } catch (RuntimeException e) {
+                alongside = false;
+            }
+            if (alongside) {
+                if (open == null) { open = new ArrayList<>(); out.add(open); }
+                open.add(use);
+            } else {
+                open = null;
+                out.add(List.of(use));
+            }
+        }
+        return out;
+    }
+
+    /** The host's verdict on the spend so far, or null; a guard that fails is no cap, never a stop. */
+    private String overBudget(String tag, long in, long out, long cacheWrite, long cacheRead) {
+        BudgetGuard guard = config.getBudgetGuard();
+        if (guard == null || guard == BudgetGuard.NONE) return null;
+        try {
+            return guard.overBudget(new BudgetGuard.Spend(in, out, cacheWrite, cacheWrite1h, cacheRead,
+                    completionCheckUsage()));
+        } catch (RuntimeException e) {
+            log.warn("ReactLoop [{}] spending cap could not be checked — carrying on: {}", tag, e.getMessage());
+            return null;
+        }
     }
 
     // ── Compaction ────────────────────────────────────────────────────────────

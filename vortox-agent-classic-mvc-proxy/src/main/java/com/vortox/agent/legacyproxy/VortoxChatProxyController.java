@@ -164,6 +164,13 @@ public class VortoxChatProxyController implements Controller {
         payload.remove("llmBaseUrl");
         payload.remove("llmApiKey");
         payload.remove("systemPrompt");
+        // Fields that change what the run is allowed to do or whose it is. allowPageScripts adds the
+        // instructions for the ```javascript page channel (code the widget then runs in the user's
+        // session); model picks what is billed; tenantCode picks whose skills and secrets the run gets.
+        // The browser decides none of these: a host that wants them sets them in its enricher.
+        payload.remove("allowPageScripts");
+        payload.remove("model");
+        payload.remove("tenantCode");
     }
 
     private void handleGet(HttpServletRequest request, HttpServletResponse response) throws IOException {

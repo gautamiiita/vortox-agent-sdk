@@ -41,6 +41,49 @@ class VortoxChatProxyControllerTest {
     }
 
     @Test
+    void browserCannotSetRoutingPageScriptsModelOrTenantEvenWithoutAnEnricher() throws Exception {
+        ChatRelay relay = mock(ChatRelay.class);
+        when(relay.start(anyString())).thenReturn(new RelayResult(202, "{}"));
+        VortoxChatProxyController controller = new VortoxChatProxyController(relay, ChatContextEnricher.NOOP);
+
+        MockHttpServletRequest request = new MockHttpServletRequest("POST", "/agentChat.htm");
+        request.setContent(("{\"message\":\"hi\",\"llmBaseUrl\":\"http://attacker\",\"systemPrompt\":\"x\","
+                + "\"allowPageScripts\":true,\"model\":\"expensive\",\"tenantCode\":\"OTHER\"}").getBytes("UTF-8"));
+        controller.handleRequest(request, new MockHttpServletResponse());
+
+        ArgumentCaptor<String> captor = ArgumentCaptor.forClass(String.class);
+        verify(relay).start(captor.capture());
+        ObjectNode sent = (ObjectNode) new ObjectMapper().readTree(captor.getValue());
+        assertThat(sent.has("llmBaseUrl")).isFalse();
+        assertThat(sent.has("systemPrompt")).isFalse();
+        assertThat(sent.has("allowPageScripts")).isFalse();
+        assertThat(sent.has("model")).isFalse();
+        assertThat(sent.has("tenantCode")).isFalse();
+        assertThat(sent.get("message").asText()).isEqualTo("hi");
+    }
+
+    @Test
+    void anEnricherMayStillSetThoseFieldsDeliberately() throws Exception {
+        ChatRelay relay = mock(ChatRelay.class);
+        when(relay.start(anyString())).thenReturn(new RelayResult(202, "{}"));
+        ChatContextEnricher enricher = (payload, context) -> {
+            payload.put("tenantCode", "HOST");
+            payload.put("allowPageScripts", false);
+        };
+        VortoxChatProxyController controller = new VortoxChatProxyController(relay, enricher);
+
+        MockHttpServletRequest request = new MockHttpServletRequest("POST", "/agentChat.htm");
+        request.setContent("{\"message\":\"hi\",\"tenantCode\":\"OTHER\",\"allowPageScripts\":true}".getBytes("UTF-8"));
+        controller.handleRequest(request, new MockHttpServletResponse());
+
+        ArgumentCaptor<String> captor = ArgumentCaptor.forClass(String.class);
+        verify(relay).start(captor.capture());
+        ObjectNode sent = (ObjectNode) new ObjectMapper().readTree(captor.getValue());
+        assertThat(sent.get("tenantCode").asText()).isEqualTo("HOST");
+        assertThat(sent.get("allowPageScripts").asBoolean()).isFalse();
+    }
+
+    @Test
     void enricherRunsBeforeStartAndCanAddFields() throws Exception {
         ChatRelay relay = mock(ChatRelay.class);
         when(relay.start(anyString())).thenReturn(new RelayResult(202, "{}"));

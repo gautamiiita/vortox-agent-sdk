@@ -668,12 +668,9 @@ public class AgentService {
     static String completionsUrl(String provider, String baseUrl, String completionsPath) {
         boolean openAi = "openai".equalsIgnoreCase(provider == null ? null : provider.trim());
         if (!isNotBlank(baseUrl)) return openAi ? OPENAI_COMPLETIONS_URL : null;
-        String root = baseUrl.trim();
-        while (root.endsWith("/")) root = root.substring(0, root.length() - 1);
-        if (root.endsWith("/chat/completions")) return root;
-        String path = isNotBlank(completionsPath) ? completionsPath.trim()
+        String path = isNotBlank(completionsPath) ? completionsPath
                 : openAi ? "/v1/chat/completions" : "/api/chat/completions";
-        return root + (path.startsWith("/") ? path : "/" + path);
+        return OpenAiCompatibleLlmClient.resolveCompletionsUrl(baseUrl, path);
     }
 
     private static String truncate(String s, int max) {

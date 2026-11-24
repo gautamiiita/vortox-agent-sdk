@@ -26,7 +26,8 @@ import java.util.*;
  *
  * <p>The endpoint is {@code baseUrl + completionsPath}: {@code /api/chat/completions} for the ELCA
  * AI gateway (the 3-argument constructor's default), {@code /v1/chat/completions} for OpenAI,
- * Ollama, vLLM, LM Studio and most other servers. {@link #forEndpoint} takes the full URL instead.</p>
+ * Ollama, vLLM, LM Studio and most other servers. A base URL that already ends in
+ * {@code /chat/completions} is used as it is (see {@link #resolveCompletionsUrl}).</p>
  *
  * <p>The key goes out as {@code Authorization: Bearer <key>}. A blank key sends no
  * {@code Authorization} header, for local servers that need no credential.</p>
@@ -68,8 +69,21 @@ public final class OpenAiCompatibleLlmClient implements LlmClient {
                                       String baseUrl, String completionsPath) {
         this.objectMapper   = objectMapper;
         this.maxTokens      = maxTokens;
-        String root = baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl;
-        this.completionsUrl = root + completionsPath;
+        this.completionsUrl = resolveCompletionsUrl(baseUrl, completionsPath);
+    }
+
+    /**
+     * {@code baseUrl + completionsPath}, except that a base URL already ending in
+     * {@code /chat/completions} is the full endpoint and is kept as it is. That lets one setting —
+     * an agent's base URL — name any server ({@code http://ollama:11434/v1/chat/completions}) without
+     * a separate path field, while a bare root keeps getting the default path.
+     */
+    public static String resolveCompletionsUrl(String baseUrl, String completionsPath) {
+        String root = baseUrl.trim();
+        while (root.endsWith("/")) root = root.substring(0, root.length() - 1);
+        if (root.endsWith("/chat/completions")) return root;
+        String path = completionsPath == null ? "" : completionsPath.trim();
+        return path.isEmpty() || path.startsWith("/") ? root + path : root + "/" + path;
     }
 
     /** Convenience constructor using the ELCA gateway path {@code /api/chat/completions}. */

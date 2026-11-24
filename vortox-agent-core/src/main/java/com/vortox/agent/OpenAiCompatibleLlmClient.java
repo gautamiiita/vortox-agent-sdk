@@ -86,9 +86,30 @@ public final class OpenAiCompatibleLlmClient implements LlmClient {
         return path.isEmpty() || path.startsWith("/") ? root + path : root + "/" + path;
     }
 
+    /** The ELCA gateway's path, which the 3-argument constructor appends to a bare base URL. */
+    public static final String DEFAULT_COMPLETIONS_PATH = "/api/chat/completions";
+
+    /**
+     * The model-list endpoint beside the chat-completions one: {@code …/v1/chat/completions} gives
+     * {@code …/v1/models}, {@code …/api/chat/completions} (the default) gives {@code …/api/models}.
+     * A blank {@code completionsPath} means {@link #DEFAULT_COMPLETIONS_PATH}.
+     */
+    public static String modelsUrl(String baseUrl, String completionsPath) {
+        String path = completionsPath == null || completionsPath.isBlank() ? DEFAULT_COMPLETIONS_PATH : completionsPath;
+        String completions = resolveCompletionsUrl(baseUrl, path);
+        String suffix = "/chat/completions";
+        if (completions.endsWith(suffix)) {
+            return completions.substring(0, completions.length() - suffix.length()) + "/models";
+        }
+        // An unusual completions path we cannot mirror: the historical guess.
+        String root = baseUrl.trim();
+        while (root.endsWith("/")) root = root.substring(0, root.length() - 1);
+        return root + "/api/models";
+    }
+
     /** Convenience constructor using the ELCA gateway path {@code /api/chat/completions}. */
     public OpenAiCompatibleLlmClient(ObjectMapper objectMapper, int maxTokens, String baseUrl) {
-        this(objectMapper, maxTokens, baseUrl, "/api/chat/completions");
+        this(objectMapper, maxTokens, baseUrl, DEFAULT_COMPLETIONS_PATH);
     }
 
     /** A client for a complete chat-completions URL, e.g. {@code http://ollama:11434/v1/chat/completions}. */

@@ -38,6 +38,16 @@ class LlmEndpointConfigTest {
     }
 
     @Test
+    void modelsUrlSitsBesideTheCompletionsUrl() {
+        assertEquals("https://ai.svc.elca.ch/api/models", OpenAiCompatibleLlmClient.modelsUrl("https://ai.svc.elca.ch/", null));
+        assertEquals("http://ollama:11434/v1/models",
+                OpenAiCompatibleLlmClient.modelsUrl("http://ollama:11434/v1/chat/completions", null));
+        assertEquals("http://vllm:8000/v1/models",
+                OpenAiCompatibleLlmClient.modelsUrl("http://vllm:8000", "/v1/chat/completions"));
+        assertEquals("http://odd/api/models", OpenAiCompatibleLlmClient.modelsUrl("http://odd", "/generate"));
+    }
+
+    @Test
     void aSuppliedClientNeedsNoKeyTheDefaultOneDoes() {
         LlmClient keyless = OpenAiCompatibleLlmClient.forEndpoint(new ObjectMapper(), 100, "http://x/v1/chat/completions");
         AgentConfig config = AgentConfig.builder().llmClient(keyless).build();

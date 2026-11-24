@@ -242,7 +242,9 @@ public final class AgentConfig {
         public Builder llmClient(LlmClient client)     { this.llmClient = client; return this; }
 
         public AgentConfig build() {
-            if (apiKey == null || apiKey.isBlank()) {
+            // The default client is Anthropic's, which always needs a key. A supplied client decides
+            // for itself: a local OpenAI-compatible server (Ollama, LM Studio) often needs none.
+            if (llmClient == null && (apiKey == null || apiKey.isBlank())) {
                 throw new IllegalStateException("apiKey is required");
             }
             return new AgentConfig(this);

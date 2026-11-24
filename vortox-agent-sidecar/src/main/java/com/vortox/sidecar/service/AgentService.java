@@ -2,6 +2,7 @@ package com.vortox.sidecar.service;
 
 import com.vortox.agent.AgentConfig;
 import com.vortox.agent.AgentResult;
+import com.vortox.agent.AnthropicClient;
 import com.vortox.agent.LlmClient;
 import com.vortox.agent.OpenAiCompatibleLlmClient;
 import com.vortox.agent.ReactLoop;
@@ -54,6 +55,43 @@ public class AgentService {
 
     @Value("${sidecar.max-tokens:4096}")
     private int defaultMaxTokens;
+
+    /**
+     * Which model backend a run uses when neither the request nor a linked Vortox agent names one:
+     * {@code anthropic} (also blank or {@code claude}), or an OpenAI-compatible server —
+     * {@code local}, {@code openai} or {@code openai-compatible}. Vortox always sends the provider
+     * for a linked agent, so these {@code sidecar.llm.*} defaults matter for runs without one.
+     */
+    @Value("${sidecar.llm.provider:}")
+    private String defaultLlmProvider;
+
+    /** OpenAI-compatible endpoint when neither the request nor the agent gives one. See {@link #completionsUrl}. */
+    @Value("${sidecar.llm.base-url:}")
+    private String defaultLlmBaseUrl;
+
+    /**
+     * Path appended to an OpenAI-compatible base URL that does not already end in
+     * {@code /chat/completions}. Blank keeps the defaults: {@code /v1/chat/completions} for
+     * {@code openai}, {@code /api/chat/completions} (the ELCA gateway) for {@code local}.
+     */
+    @Value("${sidecar.llm.completions-path:}")
+    private String llmCompletionsPath;
+
+    /**
+     * Key for the OpenAI-compatible endpoint when neither the request nor the agent gives one. Kept
+     * apart from {@code ANTHROPIC_API_KEY} so an Anthropic credential is never sent to another host.
+     */
+    @Value("${sidecar.llm.api-key:}")
+    private String defaultLlmApiKey;
+
+    /**
+     * Messages API base URL replacing {@code https://api.anthropic.com}, for a gateway or proxy;
+     * blank keeps Anthropic. {@code /v1/messages} is appended unless already there.
+     */
+    @Value("${sidecar.anthropic-base-url:}")
+    private String anthropicBaseUrl;
+
+    private static final String OPENAI_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions";
 
     /**
      * ReactLoop's built-in {@code execute_command} runs an arbitrary shell command in this
@@ -210,10 +248,11 @@ public class AgentService {
         java.util.Map<String, Object> agentConfig = anthropicKeyRefreshService != null
                 ? anthropicKeyRefreshService.getAgentConfig(emptyToNull(request.tenantCode())) : null;
 
-        String llmProvider = firstNonBlank(request.llmProvider(),
-                agentConfig != null ? (String) agentConfig.get("provider") : null);
+        String agentProvider = agentConfig != null ? (String) agentConfig.get("provider") : null;
+        String llmProvider = firstNonBlank(request.llmProvider(), agentProvider, defaultLlmProvider);
         String llmBaseUrl = firstNonBlank(request.llmBaseUrl(),
-                agentConfig != null ? (String) agentConfig.get("llmBaseUrl") : null);
+                agentConfig != null ? (String) agentConfig.get("llmBaseUrl") : null,
+                defaultLlmBaseUrl);
         String model = firstNonBlank(request.model(),
                 agentConfig != null ? (String) agentConfig.get("model") : null,
                 defaultModel);
@@ -227,22 +266,29 @@ public class AgentService {
         }
         if (maxIterations == null) maxIterations = 75;
 
-        boolean isLocalLlm = "local".equalsIgnoreCase(llmProvider);
+        boolean openAiCompatible = isOpenAiCompatible(llmProvider);
         String apiKey;
-        if (isLocalLlm) {
-            apiKey = firstNonBlank(request.apiKey(),
-                    agentConfig != null ? (String) agentConfig.get("apiKey") : null);
+        if (openAiCompatible) {
+            if (completionsUrl(llmProvider, llmBaseUrl, llmCompletionsPath) == null) {
+                // Used to fall through to Anthropic, sending the local key there.
+                return Prepared.refused(errorResponse(runId, "No endpoint configured for the '"
+                        + llmProvider + "' provider. Set the base URL on the linked agent in Vortox, "
+                        + "or sidecar.llm.base-url (LLM_BASE_URL)."));
+            }
+            // The agent's key only when the agent itself is OpenAI-compatible: a request switching an
+            // Anthropic agent to another provider must not carry that agent's Anthropic key along.
+            String agentKey = agentConfig != null && isOpenAiCompatible(agentProvider)
+                    ? (String) agentConfig.get("apiKey") : null;
+            // May be blank: a local server (Ollama, LM Studio) often needs no credential.
+            apiKey = firstNonBlank(request.apiKey(), agentKey, defaultLlmApiKey);
         } else {
             apiKey = firstNonBlank(request.apiKey(),
                     agentConfig != null ? (String) agentConfig.get("apiKey") : null,
                     resolveApiKey(null));
-        }
-
-        if (apiKey == null || apiKey.isBlank()) {
-            String hint = isLocalLlm
-                    ? "No API key provided for local LLM. Set it on the linked agent in Vortox or pass apiKey in the request."
-                    : "No API key provided. Set ANTHROPIC_API_KEY, configure the platform key in Vortox, or link an agent to this SDK app.";
-            return Prepared.refused(errorResponse(runId, hint));
+            if (apiKey == null || apiKey.isBlank()) {
+                return Prepared.refused(errorResponse(runId, "No API key provided. Set ANTHROPIC_API_KEY, "
+                        + "configure the platform key in Vortox, or link an agent to this SDK app."));
+            }
         }
 
         // Skills: prefer explicit request list; fall back to agent's availableSkills from vortox.
@@ -582,12 +628,52 @@ public class AgentService {
         return null;
     }
 
-    /** Returns an LlmClient when provider is "local", null otherwise (ReactLoop uses AnthropicClient). */
+    /**
+     * The client for a run: OpenAI-compatible for those providers, Anthropic at
+     * {@code sidecar.anthropic-base-url} when that is set, otherwise null (ReactLoop then uses the
+     * stock AnthropicClient against api.anthropic.com).
+     */
     LlmClient resolveLlmClient(String llmProvider, String llmBaseUrl) {
-        if ("local".equalsIgnoreCase(llmProvider) && llmBaseUrl != null && !llmBaseUrl.isBlank()) {
-            return new OpenAiCompatibleLlmClient(objectMapper, defaultMaxTokens, llmBaseUrl);
+        if (isOpenAiCompatible(llmProvider)) {
+            String url = completionsUrl(llmProvider, llmBaseUrl, llmCompletionsPath);
+            return url == null ? null : OpenAiCompatibleLlmClient.forEndpoint(objectMapper, defaultMaxTokens, url);
+        }
+        if (isNotBlank(anthropicBaseUrl)) {
+            return new AnthropicClient(objectMapper, defaultModel, defaultMaxTokens,
+                    AnthropicClient.messagesUrl(anthropicBaseUrl));
         }
         return null;
+    }
+
+    /** {@code local} (Vortox's word for an OpenAI-compatible agent), {@code openai} or {@code openai-compatible}. */
+    static boolean isOpenAiCompatible(String provider) {
+        if (provider == null) return false;
+        String p = provider.trim().toLowerCase(java.util.Locale.ROOT);
+        return p.equals("local") || p.equals("openai") || p.equals("openai-compatible");
+    }
+
+    /**
+     * The chat-completions URL for an OpenAI-compatible run, or null when there is none to use.
+     *
+     * <ul>
+     *   <li>A base URL already ending in {@code /chat/completions} is used as it is, so one agent can
+     *       point at {@code http://ollama:11434/v1/chat/completions} and another at the ELCA gateway
+     *       without a sidecar-wide setting.</li>
+     *   <li>Otherwise {@code completionsPath} is appended, or when blank {@code /v1/chat/completions}
+     *       for {@code openai} and {@code /api/chat/completions} (the ELCA gateway, the historical
+     *       default) for anything else.</li>
+     *   <li>No base URL: OpenAI's own endpoint for {@code openai}, null otherwise.</li>
+     * </ul>
+     */
+    static String completionsUrl(String provider, String baseUrl, String completionsPath) {
+        boolean openAi = "openai".equalsIgnoreCase(provider == null ? null : provider.trim());
+        if (!isNotBlank(baseUrl)) return openAi ? OPENAI_COMPLETIONS_URL : null;
+        String root = baseUrl.trim();
+        while (root.endsWith("/")) root = root.substring(0, root.length() - 1);
+        if (root.endsWith("/chat/completions")) return root;
+        String path = isNotBlank(completionsPath) ? completionsPath.trim()
+                : openAi ? "/v1/chat/completions" : "/api/chat/completions";
+        return root + (path.startsWith("/") ? path : "/" + path);
     }
 
     private static String truncate(String s, int max) {

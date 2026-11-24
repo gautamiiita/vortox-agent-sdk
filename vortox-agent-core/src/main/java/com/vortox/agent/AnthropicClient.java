@@ -128,6 +128,31 @@ public final class AnthropicClient implements LlmClient {
         this(objectMapper, defaultModel, defaultMaxTokens, API_URL, DEFAULT_IDLE_TIMEOUT_MS);
     }
 
+    /**
+     * A client posting to {@code apiUrl} instead of {@code api.anthropic.com}: a gateway or proxy
+     * that speaks the Messages API. {@link #messagesUrl} turns a base URL into one.
+     */
+    public AnthropicClient(ObjectMapper objectMapper, String defaultModel, int defaultMaxTokens,
+                           String apiUrl) {
+        this(objectMapper, defaultModel, defaultMaxTokens, apiUrl, DEFAULT_IDLE_TIMEOUT_MS);
+    }
+
+    /**
+     * The Messages endpoint for a base URL, following the Anthropic SDKs' {@code ANTHROPIC_BASE_URL}
+     * convention: {@code https://gw.example.com} becomes {@code https://gw.example.com/v1/messages}.
+     * A URL already ending in {@code /v1/messages} is kept as it is.
+     */
+    public static String messagesUrl(String baseUrl) {
+        String root = baseUrl.trim();
+        while (root.endsWith("/")) root = root.substring(0, root.length() - 1);
+        return root.endsWith("/v1/messages") ? root : root + "/v1/messages";
+    }
+
+    /** The URL every request is posted to. */
+    public String apiUrl() {
+        return apiUrl;
+    }
+
     /** The endpoint and idle window are injectable for tests; 0 ms means buffered, not streamed. */
     AnthropicClient(ObjectMapper objectMapper, String defaultModel, int defaultMaxTokens,
                     String apiUrl, long idleTimeoutMs) {

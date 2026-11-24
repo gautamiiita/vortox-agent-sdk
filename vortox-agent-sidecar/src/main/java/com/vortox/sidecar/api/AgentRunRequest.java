@@ -12,8 +12,8 @@ public record AgentRunRequest(
         String model,              // optional, defaults to configured default
         Integer maxIterations,     // optional, defaults to 100
         String apiKey,             // optional, falls back to env var
-        String llmProvider,        // optional: "anthropic" (default) or "local"
-        String llmBaseUrl,         // optional: base URL for local LLM (e.g. https://ai.svc.elca.ch)
+        String llmProvider,        // optional: "anthropic" (default), or "local" / "openai" / "openai-compatible"
+        String llmBaseUrl,         // optional: OpenAI-compatible base URL (https://ai.svc.elca.ch) or full .../chat/completions URL
 
         /**
          * The host application's own tenant code for this run (TNAM sends its institution code).

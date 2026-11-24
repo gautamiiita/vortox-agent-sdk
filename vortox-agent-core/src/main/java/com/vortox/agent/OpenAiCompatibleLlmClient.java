@@ -24,9 +24,12 @@ import java.util.*;
  * produces into OpenAI chat-completions format, calls the remote endpoint, and converts
  * the response back to {@link AnthropicClient.ClaudeResponse}.</p>
  *
- * <p>Supported endpoints: {@code POST /api/chat/completions} (ELCA AI gateway style) or
- * {@code POST /v1/chat/completions} (standard OpenAI style) — detected automatically via
- * the {@code completionsPath} constructor argument.</p>
+ * <p>The endpoint is {@code baseUrl + completionsPath}: {@code /api/chat/completions} for the ELCA
+ * AI gateway (the 3-argument constructor's default), {@code /v1/chat/completions} for OpenAI,
+ * Ollama, vLLM, LM Studio and most other servers. {@link #forEndpoint} takes the full URL instead.</p>
+ *
+ * <p>The key goes out as {@code Authorization: Bearer <key>}. A blank key sends no
+ * {@code Authorization} header, for local servers that need no credential.</p>
  */
 public final class OpenAiCompatibleLlmClient implements LlmClient {
 
@@ -74,6 +77,17 @@ public final class OpenAiCompatibleLlmClient implements LlmClient {
         this(objectMapper, maxTokens, baseUrl, "/api/chat/completions");
     }
 
+    /** A client for a complete chat-completions URL, e.g. {@code http://ollama:11434/v1/chat/completions}. */
+    public static OpenAiCompatibleLlmClient forEndpoint(ObjectMapper objectMapper, int maxTokens,
+                                                        String completionsUrl) {
+        return new OpenAiCompatibleLlmClient(objectMapper, maxTokens, completionsUrl, "");
+    }
+
+    /** The URL every request is posted to. */
+    public String completionsUrl() {
+        return completionsUrl;
+    }
+
     // ── LlmClient ─────────────────────────────────────────────────────────────
 
     @Override
@@ -82,10 +96,6 @@ public final class OpenAiCompatibleLlmClient implements LlmClient {
                                                 List<Map<String, Object>> tools,
                                                 String apiKey,
                                                 String model) {
-        if (apiKey == null || apiKey.isBlank()) {
-            return AnthropicClient.ClaudeResponse.error("API key not configured for local LLM");
-        }
-
         try {
             List<Map<String, Object>> oaiMessages = buildOaiMessages(systemPrompt, messages);
 
@@ -101,15 +111,15 @@ public final class OpenAiCompatibleLlmClient implements LlmClient {
             String json = objectMapper.writeValueAsString(body);
             log.debug("OpenAI-compat API — url={} model={} messages={}", completionsUrl, model, oaiMessages.size());
 
-            HttpResponse<String> res = HTTP.send(
-                    HttpRequest.newBuilder()
-                            .uri(URI.create(completionsUrl))
-                            .timeout(Duration.ofSeconds(AnthropicClient.requestTimeoutSeconds(maxTokens)))
-                            .POST(HttpRequest.BodyPublishers.ofString(json))
-                            .headers("Content-Type", "application/json",
-                                     "Authorization", "Bearer " + apiKey)
-                            .build(),
-                    HttpResponse.BodyHandlers.ofString());
+            HttpRequest.Builder req = HttpRequest.newBuilder()
+                    .uri(URI.create(completionsUrl))
+                    .timeout(Duration.ofSeconds(AnthropicClient.requestTimeoutSeconds(maxTokens)))
+                    .POST(HttpRequest.BodyPublishers.ofString(json))
+                    .header("Content-Type", "application/json");
+            if (apiKey != null && !apiKey.isBlank()) {
+                req.header("Authorization", "Bearer " + apiKey);
+            }
+            HttpResponse<String> res = HTTP.send(req.build(), HttpResponse.BodyHandlers.ofString());
 
             if (res.statusCode() != 200) {
                 return AnthropicClient.ClaudeResponse.error(

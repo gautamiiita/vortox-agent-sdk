@@ -3,7 +3,23 @@ server:
 
 sidecar:
   skills-path: /app/skills
-  default-model: claude-sonnet-4-6
+  # Used when neither the request nor a linked agent names a model, whatever the provider: set it
+  # to e.g. gpt-4.1 or llama3.1 when sidecar.llm.provider points at a non-Anthropic backend.
+  default-model: ${SIDECAR_DEFAULT_MODEL:claude-sonnet-4-6}
+  # Model backend for runs with no linked Vortox agent (a linked agent always brings its own
+  # provider, URL and key, which win). Blank = Anthropic. local | openai | openai-compatible =
+  # an OpenAI chat-completions server.
+  llm:
+    provider: ${LLM_PROVIDER:}
+    # A URL ending in /chat/completions is used as is; otherwise completions-path is appended
+    # (blank: /v1/chat/completions for openai, /api/chat/completions — the ELCA gateway — for local).
+    # openai with no base URL means https://api.openai.com/v1/chat/completions.
+    base-url: ${LLM_BASE_URL:}
+    completions-path: ${LLM_COMPLETIONS_PATH:}
+    # May stay blank for a local server that needs no key. Never falls back to ANTHROPIC_API_KEY.
+    api-key: ${LLM_API_KEY:}
+  # Messages API gateway/proxy instead of https://api.anthropic.com (/v1/messages is appended).
+  anthropic-base-url: ${ANTHROPIC_BASE_URL:}
   # Shared secret required on every /agent/** call (header: X-Sidecar-Key). Unset = all agent
   # routes refused, because /agent/skills/upload + /agent/run is arbitrary code execution.
   api-key: ${SIDECAR_API_KEY:}
